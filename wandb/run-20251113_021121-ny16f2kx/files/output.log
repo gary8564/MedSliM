@@ -1,0 +1,66 @@
+Creating model...
+2025-11-13 02:11:25 - feat_dataset.py - [32mINFO[0m : [32mSelected slice encoder models: ['dinov2', 'rad-dino', 'medsiglip', 'biomedclip', 'ark'][0m
+2025-11-13 02:11:25 - feat_dataset.py - [32mINFO[0m : [32mSelected view planes: ['sagittal'][0m
+/rwthfs/rz/cluster/home/qj474765/master_thesis/MedSliM/.venv/lib/python3.12/site-packages/torch/utils/data/dataloader.py:624: UserWarning: This DataLoader will create 8 worker processes in total. Our suggested max number of worker in current system is 4, which is smaller than what this DataLoader is going to create. Please be aware that excessive worker creation might get DataLoader running slow or even freeze, lower the worker number to avoid potential slowness/freeze if necessary.
+  warnings.warn(                             
+MedSliM Pre-training...:   0%|       /rwthfs/rz/cluster/home/qj474765/master_thesis/MedSliM/.venv/lib/python3.12/site-packages/torch/utils/data/dataloader.py:624: UserWarning: This DataLoader will create 8 worker processes in total. Our suggested max number of worker in current system is 4, which is smaller than what this DataLoader is going to create. Please be aware that excessive worker creation might get DataLoader running slow or even freeze, lower the worker number to avoid potential slowness/freeze if necessary.
+batch_size_per_device=128
+  warnings.warn( 0/8 [00:00<?, ?it/s]         
+Epoch 1; loss: 3.8966; lr: 0.00000
+MedSliM Pre-training...:   6%|▌         | 31/500 [03:43<14:38,  1.87s/it]   
+                                             
+Epoch 2; loss: 3.8847; lr: 0.00001
+Epoch 3; loss: 3.8773; lr: 0.00001
+Epoch 4; loss: 3.8399; lr: 0.00002
+Epoch 5; loss: 3.7965; lr: 0.00002
+Epoch 6; loss: 3.7556; lr: 0.00003
+Epoch 7; loss: 3.7100; lr: 0.00003
+Epoch 8; loss: 3.6824; lr: 0.00004
+Epoch 9; loss: 3.6264; lr: 0.00004
+Epoch 10; loss: 3.5682; lr: 0.00005
+Epoch 11; loss: 3.5377; lr: 0.00005
+Epoch 12; loss: 3.4926; lr: 0.00006
+Epoch 13; loss: 3.4863; lr: 0.00006
+Epoch 14; loss: 3.4199; lr: 0.00007
+Epoch 15; loss: 3.3539; lr: 0.00007
+Epoch 16; loss: 3.3368; lr: 0.00008
+Epoch 17; loss: 3.2602; lr: 0.00008
+Epoch 18; loss: 3.1979; lr: 0.00009
+Epoch 19; loss: 3.1444; lr: 0.00009
+Epoch 20; loss: 3.0952; lr: 0.00010
+Epoch 21; loss: 3.0611; lr: 0.00010
+Epoch 22; loss: 3.0169; lr: 0.00011
+Epoch 23; loss: 2.8973; lr: 0.00011
+Epoch 24; loss: 2.8940; lr: 0.00012
+Epoch 25; loss: 2.8701; lr: 0.00012
+Epoch 26; loss: 2.7665; lr: 0.00013
+Epoch 27; loss: 2.7445; lr: 0.00013
+Epoch 28; loss: 2.7029; lr: 0.00014
+Epoch 29; loss: 2.6744; lr: 0.00014
+Epoch 30; loss: 2.6038; lr: 0.00015
+Epoch 31; loss: 2.5946; lr: 0.00015
+Epoch 32; loss: 2.5441; lr: 0.00016
+Epoch 33; loss: 2.4830; lr: 0.00016
+Epoch 34; loss: 2.4866; lr: 0.00017
+Epoch 35; loss: 2.4688; lr: 0.00017
+Epoch 36; loss: 2.4406; lr: 0.00018
+Epoch 37; loss: 2.3741; lr: 0.00018
+Epoch 38; loss: 2.3918; lr: 0.00019
+Epoch 39; loss: 2.3951; lr: 0.00019
+Epoch 40; loss: 2.3795; lr: 0.00020
+Epoch 41; loss: 2.3337; lr: 0.00020
+Epoch 42; loss: 2.2900; lr: 0.00021
+Epoch 43; loss: 2.2844; lr: 0.00021
+Epoch 44; loss: 2.2830; lr: 0.00022
+Epoch 45; loss: 2.2301; lr: 0.00022
+Epoch 46; loss: 2.2745; lr: 0.00023
+Epoch 47; loss: 2.2494; lr: 0.00023
+Epoch 48; loss: 2.2090; lr: 0.00024
+Epoch 49; loss: 2.1742; lr: 0.00024
+Epoch 50; loss: 2.1467; lr: 0.00025
+  File "/rwthfs/rz/cluster/home/qj474765/master_thesis/MedSliM/./med_slim/train/train.py", line 217, in <module>
+    main(args, cfg)
+  File "/rwthfs/rz/cluster/home/qj474765/master_thesis/MedSliM/./med_slim/train/train.py", line 158, in main
+    cfg["general"]["paths"]["chkpt_dir"],
+    ~~~^^^^^^^^^^^
+KeyError: 'general'

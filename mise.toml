@@ -1,0 +1,26 @@
+[env]
+# Use the project name derived from the current directory
+PROJECT_NAME = "{{ config_root | basename }}"
+# Automatic virtualenv activation
+_.python.venv = { path = ".venv" }
+_.file = { path = ".env" }
+
+[tools]
+python = "3.12"
+ruff = "latest"
+uv = 'latest'
+
+[tasks.test]
+description = "Run tests"
+run = "pytest tests/"
+
+[tasks.lint]
+description = "Lint the code"
+run = "ruff src/"
+
+[tasks.info]
+description = "Print project information"
+run = '''
+echo "Project: $PROJECT_NAME"
+echo "Virtual Environment: $ "
+'''

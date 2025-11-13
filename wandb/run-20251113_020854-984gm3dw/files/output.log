@@ -1,0 +1,8 @@
+Creating model...
+Traceback (most recent call last):
+  File "/rwthfs/rz/cluster/home/qj474765/master_thesis/MedSliM/./med_slim/train/train.py", line 217, in <module>
+    main(args, cfg)
+  File "/rwthfs/rz/cluster/home/qj474765/master_thesis/MedSliM/./med_slim/train/train.py", line 71, in main
+    optimizer = torch.optim.AdamW(model.parameters(), lr=scaled_lr, weight_decay=cfg["train"]["weight_decay"])
+                                                                                 ~~~^^^^^^^^^
+KeyError: 'train'
