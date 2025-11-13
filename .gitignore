@@ -3,5 +3,6 @@ logs
 __pycache__
 stdout_*.txt
 .venv
-.pytest_cache.
+.pytest_cache
 .DS_Store
+wandb
