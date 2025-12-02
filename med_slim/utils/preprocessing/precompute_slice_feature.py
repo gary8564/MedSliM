@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="Number of studies per batch")
     args = parser.parse_args()
 
-    out_dir = Path(args.save_dir) / args.model_name / args.split / args.plane
+    out_dir = Path(args.save_dir) / f"slices_{args.num_slices}" / args.model_name / args.split / args.plane
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda")

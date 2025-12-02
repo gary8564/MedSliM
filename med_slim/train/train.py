@@ -56,7 +56,7 @@ def main(args, cfg):
         input_dims=cfg["model"]["cobra"]["input_dims"],
         num_heads=cfg["model"]["cobra"]["num_heads"],
         num_mamba_layers=cfg["model"]["cobra"]["num_mamba_layers"],
-        T=cfg["pretrain"]["temperature"],
+        T=cfg["train"]["temperature"],
         dropout=cfg["model"]["cobra"]["dropout"],
         att_dim=cfg["model"]["cobra"]["attn_dim"],
         d_state=cfg["model"]["cobra"]["mamba_d_state"],
@@ -65,18 +65,18 @@ def main(args, cfg):
     model_params = sum(p.numel() for p in model.parameters())
 
     # Learning rate scaling rule 
-    base_lr = float(cfg["pretrain"]["learning_rate"])
-    global_batch_size = cfg["pretrain"]["batch_size"]
+    base_lr = float(cfg["train"]["learning_rate"])
+    global_batch_size = cfg["train"]["batch_size"]
     scaled_lr = base_lr * (global_batch_size / 256.0)
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=scaled_lr, weight_decay=cfg["pretrain"]["weight_decay"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=scaled_lr, weight_decay=cfg["train"]["weight_decay"])
 
     max_feature_dim = max(cfg["model"]["cobra"]["input_dims"])
     feat_cfg = cfg["feat_dataset"]
     feat_dirs = feat_cfg["datasets"]
     slice_encoder_models = feat_cfg["model_name"]
-    view_planes = feat_cfg["plane"]
+    view_planes = args.planes if args.planes else feat_cfg["plane"]
     dataset = PrecomputedFeatPairDataset(
         feat_dirs=feat_dirs,
         slice_encoder_models=slice_encoder_models,
@@ -96,7 +96,7 @@ def main(args, cfg):
         dataset,
         batch_size=per_device_batch_size,
         shuffle=True,
-        num_workers=cfg["pretrain"]["num_workers"],
+        num_workers=cfg["train"]["num_workers"],
         drop_last=True,
         pin_memory=True,
     )
@@ -119,7 +119,7 @@ def main(args, cfg):
 
     model.train()
     iters_per_epoch = len(loader)
-    for e in tqdm(range(start_epoch, cfg["pretrain"]["num_epochs"]), desc="MedSliM Pre-training...", disable=not accelerator.is_main_process):
+    for e in tqdm(range(start_epoch, cfg["train"]["num_epochs"]), desc="MedSliM Pre-training...", disable=not accelerator.is_main_process):
         total_loss = 0.0
 
         for i, batch in enumerate(tqdm(loader, leave=False, disable=not accelerator.is_main_process)):
@@ -157,19 +157,20 @@ def main(args, cfg):
                 torch.save(
                     state,
                     os.path.join(
-                        cfg["pretrain"]["save_ckpt_path"],
-                        f"medslim_test_run_MRNet-{CURR_TIME}-{e+1}.pth.tar",
+                        cfg["train"]["save_ckpt_path"],
+                        CURR_TIME,
+                        f"medslim_test_run_MRNet-epoch{e+1}.pth.tar",
                     ),
                 )
 
 
 def adjust_learning_rate(optimizer, epoch, scaled_base_lr, cfg):
     """Decays the learning rate with half-cycle cosine after warmup"""
-    if epoch < cfg["pretrain"]["warmup_epochs"]:
-        lr = scaled_base_lr * epoch / cfg["pretrain"]["warmup_epochs"]
+    if epoch < cfg["train"]["warmup_epochs"]:
+        lr = scaled_base_lr * epoch / cfg["train"]["warmup_epochs"]
     else:
         lr = scaled_base_lr * 0.5 * (
-            1.0 + math.cos(math.pi * (epoch - cfg["pretrain"]["warmup_epochs"]) / (cfg["pretrain"]["num_epochs"] - cfg["pretrain"]["warmup_epochs"]))
+            1.0 + math.cos(math.pi * (epoch - cfg["train"]["warmup_epochs"]) / (cfg["train"]["num_epochs"] - cfg["train"]["warmup_epochs"]))
         )
         
     for param_group in optimizer.param_groups:
@@ -179,8 +180,8 @@ def adjust_learning_rate(optimizer, epoch, scaled_base_lr, cfg):
 
 def adjust_moco_momentum(epoch, cfg):
     """Adjust moco momentum based on current epoch"""
-    m = 1.0 - 0.5 * (1.0 + math.cos(math.pi * epoch / cfg["pretrain"]["num_epochs"])) * (
-        1.0 - cfg["pretrain"]["momentum"]
+    m = 1.0 - 0.5 * (1.0 + math.cos(math.pi * epoch / cfg["train"]["num_epochs"])) * (
+        1.0 - cfg["train"]["momentum"]
     )
     return m
 
@@ -188,7 +189,13 @@ def adjust_moco_momentum(epoch, cfg):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MedSliM-pretraining.")
     parser.add_argument(
-        "-c", "--config", type=str, default="../configs/config.yaml", help="Path to the config file"
+        "-c", "--config", type=str, default="../configs/pretrain.yaml", help="Path to the config file"
+    )
+    parser.add_argument(
+        "--planes", 
+        nargs='*',  
+        type=str,   
+        help='A list of planes to preprocess.',
     )
     parser.add_argument(
         "--resume",
@@ -210,8 +217,8 @@ if __name__ == "__main__":
     template = template_env.from_string(str(cfg_data))
     # Render the template with the values from the config_data
     cfg = yaml.safe_load(template.render(**cfg_data))
-    save_dir = cfg["pretrain"]["save_ckpt_path"]
+    save_dir = f"{cfg['train']['save_ckpt_path']}/{CURR_TIME}" 
     Path(save_dir).mkdir(parents=True, exist_ok=True)
-    with open(os.path.join(save_dir, f"config-{CURR_TIME}.yaml"), "w") as f:
+    with open(os.path.join(save_dir, f"config.yaml"), "w") as f:
         yaml.dump(cfg, f, sort_keys=False, default_flow_style=False)
     main(args, cfg)

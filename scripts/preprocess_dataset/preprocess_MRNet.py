@@ -26,7 +26,11 @@ def setup_logging(verbose: bool) -> None:
 def npy2nifti(path_file, save_dir, data_dir):
     # Read
     data = np.load(path_file)
-
+    
+    # In torchio.ScalarImage, the tensor shape should be [C, W, H, D]. But the data shape is [D, H, W].
+    # So we need to swap the dimension.
+    data = np.swapaxes(data, 0, -1)
+    
     # Convert to Nifti 
     img = tio.ScalarImage(tensor=data[None])
 
@@ -54,9 +58,9 @@ def main():
 
     setup_logging(args.verbose)
     
-    # logger.info("================================================")
-    # logger.info("Step 1: Image preprocessing:Convert NPY to NIfTI")
-    # logger.info("================================================") 
+    logger.info("================================================")
+    logger.info("Step 1: Image preprocessing:Convert NPY to NIfTI")
+    logger.info("================================================") 
        
     # Convert save_dir to Path and create if needed
     data_dir = Path(args.data_dir)

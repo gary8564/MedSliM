@@ -1,9 +1,10 @@
 import numpy as np
+import pandas as pd
 import torch
 import random
 import os
 import logging
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from torch.utils.data import Dataset
 from glob import glob
 from tqdm import tqdm
@@ -13,6 +14,35 @@ from collections import defaultdict
 from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
+
+
+def linear_classifier_collate_fn(batch):
+    """
+    Custom collate function to handle list of variable-length feature embeddings from different slice encoders.
+    """
+    targets_list = [item["label"] for item in batch]
+    targets = torch.tensor(targets_list, dtype=batch[0]["label"].dtype)
+    sample_ids_list = [item["sample_id"] for item in batch]
+    
+    all_feats_list = [item["feature_embeds"] for item in batch]
+    K = len(all_feats_list[0]) # K = number of foundation models
+    # Create a list to store the K collated feature batches
+    collated_feats_list = []
+    for k in range(K):
+        # Gather the k-th feature tensor from all N samples in the batch
+        kth_feature_tensors = [sample_feats[k] for sample_feats in all_feats_list]
+
+        # Stack these N tensors along a new batch dimension (dimension 0),
+        # resulting in a batch tensor of shape [N, num_slices, embed_dim]
+        kth_feature_batch = torch.stack(kth_feature_tensors, dim=0)
+        collated_feats_list.append(kth_feature_batch)
+    
+    return {
+        "feature_embeds": collated_feats_list,
+        "labels": targets,
+        "sample_ids": sample_ids_list,
+    }
+
 
 class PrecomputedFeatPairDataset(Dataset):
     """
@@ -97,3 +127,113 @@ class PrecomputedFeatPairDataset(Dataset):
         assert feats1.shape == feats2.shape, f"Expected shapes to be equal, but got {feats1.shape} and {feats2.shape}!"
         
         return feats1, torch.as_tensor(orig_embed_dim1), feats2, torch.as_tensor(orig_embed_dim2)
+
+
+class FeatClassificationDataset(Dataset):
+    """
+    Dataset for downstream classification tasks using precomputed slice features.
+    This dataset loads precomputed features and their corresponding labels for 
+    linear probing evaluation of the SSL model.
+    
+    When multiple slice_encoder_models are provided, returns features from all encoders.
+    """
+    def __init__(self,
+                 feat_dir: str,
+                 slice_encoder_models: List[str],
+                 view_plane: str,
+                 split: str,
+                 annotations_path: str,
+                 task: str,
+                 target_columns: List[str]):
+        """
+        Args:
+            feat_dir: Directory containing precomputed features organized as:
+                      feat_dir/{model_name}/{split}/{plane}/*.safetensors
+            slice_encoder_models: List of slice encoder model names (e.g., ["dinov2", "rad-dino"])
+                                  If single model, pass as ["dinov2"]
+            view_plane: Which view plane to use (e.g., "sagittal", "axial", "coronal")
+            split: Data split ("train" or "test")
+            annotations_path: Path to the annotation CSV file with columns: ID, target1, target2, ...
+            task: Classification task type ("binary", "multiclass", or "multilabel")
+            target_columns: List of column names to use as classification targets
+                           For binary/multiclass: single column.
+                           For multilabel: multiple columns.
+        """
+        # Validate task
+        if task not in ["binary", "multiclass", "multilabel"]:
+            raise ValueError(f"`task` must be 'binary', 'multiclass', or 'multilabel', got '{task}'")
+        if task in ["binary", "multiclass"] and len(target_columns) != 1: # multiclass in medical domain is usually ordinal data --> integer encoding
+            raise ValueError(f"For {task} classification, `target_columns` must have exactly 1 element")
+        
+        self.task = task
+        self.target_columns = target_columns
+        self.feat_dir = feat_dir
+        self.slice_encoder_models = slice_encoder_models
+        self.view_plane = view_plane
+        self.split = split
+        
+        # Load labels
+        self.df_labels = pd.read_csv(annotations_path)
+        self.df_labels.set_index("ID", inplace=True)
+        self.sample_ids = list(self.df_labels.index.astype(int))
+        
+        # Build feature paths for all encoders and verify consistency
+        self.feat_paths = {}
+        self.id_filename_map = {}
+        
+        for model_name in self.slice_encoder_models:
+            feat_path = os.path.join(feat_dir, model_name, split, view_plane)
+            if not os.path.exists(feat_path):
+                raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
+            self.feat_paths[model_name] = feat_path
+            
+            feat_files = glob(os.path.join(feat_path, '*.safetensors'))
+            if len(feat_files) != len(self.sample_ids):
+                raise ValueError(f"Expected {len(self.sample_ids)} feature files for {model_name}, but got {len(feat_files)}!")
+            
+            # Build id->filename mapping from first encoder (filenames should match across encoders)
+            if not self.id_filename_map:
+                for f in feat_files:
+                    fname = os.path.basename(f)
+                    fid = int(fname.split(".")[0])
+                    self.id_filename_map[fid] = fname
+        
+    def __len__(self):
+        return len(self.sample_ids)
+    
+    def _load_feat(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
+        with safe_open(feat_path, framework="pt", device="cpu") as f:
+            feat = f.get_tensor("feats")
+            metadata = f.metadata()
+        return feat, metadata
+    
+    def _get_label(self, sample_id: int) -> torch.Tensor:
+        """Get label(s) for a sample based on task type."""
+        if self.task == "multilabel":
+            labels = self.df_labels.loc[sample_id, self.target_columns].values.astype(np.float32)
+            return torch.tensor(labels, dtype=torch.float32)
+        else:
+            label = self.df_labels.loc[sample_id, self.target_columns[0]]
+            return torch.tensor(label, dtype=torch.long)
+    
+    def __getitem__(self, idx):
+        sample_id = self.sample_ids[idx]
+        label = self._get_label(sample_id)
+        filename = self.id_filename_map[sample_id]
+        
+        feat_embeds = []
+        for encoder in self.slice_encoder_models:
+            feat_file = os.path.join(self.feat_paths[encoder], filename)
+            feat, _ = self._load_feat(feat_file)
+            feat_embeds.append(feat)
+        
+        return {"feature_embeds": feat_embeds, "label": label, "sample_id": sample_id}
+
+#TODO: multi-view dataset for linear probing
+class MultiViewFeatClassificationDataset(Dataset):
+    """
+    Dataset for multi-view downstream classification tasks.
+    Loads precomputed features from multiple view planes (axial, sagittal, coronal)
+    for each exam, similar to get_pat_embs in COBRA for multi-slide patients.
+    """
+    pass

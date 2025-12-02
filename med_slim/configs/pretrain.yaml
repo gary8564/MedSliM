@@ -1,13 +1,9 @@
 feat_dataset:
   datasets:
     - name: mrnet
-      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32"
   model_name: 
     - "dinov2"
-    - "rad-dino"
-    - "medsiglip"
-    - "biomedclip"
-    - "ark"
   plane: # "axial", "sagittal", "coronal"
     - "sagittal"
 
@@ -52,17 +48,16 @@ model:
     mamba_d_state: 128
     dropout: 0.25
     attn_dim: 256
-    
 
-pretrain:
+train:
   momentum: 0.99
   temperature: 0.2
-  batch_size: 128
-  num_epochs: 500
+  batch_size: 256
+  num_epochs: 2000
   learning_rate: 5e-4
   warmup_epochs: 50
   weight_decay: 0.1
-  num_workers: 8
+  num_workers: 4
   early_stopping: 
     patience: 10
   save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet"

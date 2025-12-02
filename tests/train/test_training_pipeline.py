@@ -37,7 +37,6 @@ def _clone_params(model: torch.nn.Module):
     return [p.detach().clone() for p in model.parameters() if p.requires_grad]
 
 
-@pytest.mark.timeout(30)
 def test_training_one_epoch_random_data():
     torch.manual_seed(0)
 

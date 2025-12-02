@@ -1,0 +1,38 @@
+# Path to pretrained MedSliM checkpoint
+checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet/2025-12-02-04:15/medslim_test_run_MRNet-epoch2000.pth.tar"
+encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
+
+feat_dataset:
+  dataset_name: "MRNet"
+  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32"
+  model_name: 
+    - "dinov2"
+    # - "rad-dino"
+    # - "medsiglip"
+    # - "biomedclip"
+    # - "ark"
+  plane: "sagittal" # "axial", "sagittal", "coronal"
+
+train_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/train.csv"
+test_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/test.csv"
+output_dir: "/hpcwork/rwth1833/experiments/MedSliM-linear-probing"
+
+# Classification task settings
+task: "binary" # "binary", "multiclass", "multilabel"
+target_labels:
+  - "meniscus"
+
+# Cross-validation settings
+n_folds: 5
+
+# Hyperparameters
+hyperparams:
+  batch_size: 16
+  hidden_dim: 1024
+  dropout: 0.1
+  lr: 1e-5
+  warmup_ratio: 0.1  
+  max_epochs: 200
+  patience: 10
+  num_workers: 4
+

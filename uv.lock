@@ -294,14 +294,13 @@ wheels = [
 
 [[package]]
 name = "causal-conv1d"
-version = "1.5.3.post1"
-source = { registry = "https://pypi.org/simple" }
+version = "1.5.0.post8"
+source = { git = "https://github.com/KatherLab/causal-conv1d.git?rev=b73d1ca0e0726ba6520c38d342bd411bb5850064#b73d1ca0e0726ba6520c38d342bd411bb5850064" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/64/cb/104778c728dc3d5ea3bf65a484e3a4cdbe894bdaa2586320e2f61d007b8c/causal_conv1d-1.5.3.post1.tar.gz", hash = "sha256:aba1b717484472d0b2f2e40520a1c03f35fe5155555bd753d1c324afc56ba468", size = 24198, upload-time = "2025-10-10T10:16:23.921Z" }
 
 [[package]]
 name = "certifi"
@@ -1694,8 +1693,8 @@ sdist = { url = "https://files.pythonhosted.org/packages/bf/6e/1e58a25454d74c059
 
 [[package]]
 name = "mamba-ssm"
-version = "2.2.6.post3"
-source = { registry = "https://pypi.org/simple" }
+version = "2.2.4"
+source = { git = "https://github.com/KatherLab/mamba.git?rev=d0d4192621889b26f9669ea4a8e6fe79cc84e8d9#d0d4192621889b26f9669ea4a8e6fe79cc84e8d9" }
 dependencies = [
     { name = "einops" },
     { name = "ninja" },
@@ -1705,7 +1704,6 @@ dependencies = [
     { name = "transformers" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b6/0c/9373a469ff7a33bdd0644e55fa45165ba3900274dcf7fe9f10ccc232aef9/mamba_ssm-2.2.6.post3.tar.gz", hash = "sha256:826a3cdb651959f191dac64502f8a29627d9116fe6bb7c57e4f562da1aea7bf3", size = 113913, upload-time = "2025-10-10T06:00:44.939Z" }
 
 [[package]]
 name = "markdown-it-py"
@@ -1927,10 +1925,15 @@ dependencies = [
     { name = "wandb" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "ipykernel" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = "==1.9.0" },
-    { name = "causal-conv1d", specifier = ">=1.4.0" },
+    { name = "causal-conv1d", git = "https://github.com/KatherLab/causal-conv1d.git?rev=b73d1ca0e0726ba6520c38d342bd411bb5850064" },
     { name = "datasets", specifier = "==3.3.2" },
     { name = "einops", specifier = "==0.8.1" },
     { name = "grad-cam", specifier = "==1.5.5" },
@@ -1940,7 +1943,7 @@ requires-dist = [
     { name = "iterative-stratification", specifier = "==0.1.9" },
     { name = "kaggle", specifier = "==1.7.4" },
     { name = "lxt", specifier = "==2.1" },
-    { name = "mamba-ssm" },
+    { name = "mamba-ssm", git = "https://github.com/KatherLab/mamba.git?rev=d0d4192621889b26f9669ea4a8e6fe79cc84e8d9" },
     { name = "matplotlib", specifier = "==3.10.0" },
     { name = "matplotlib-inline", specifier = "==0.1.7" },
     { name = "numpy", specifier = "==2.2.5" },
@@ -1972,6 +1975,9 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.51.3" },
     { name = "wandb", specifier = "==0.19.6" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "ipykernel", specifier = ">=7.1.0" }]
 
 [[package]]
 name = "mpmath"

@@ -64,3 +64,8 @@ allow-direct-references = true
 # Include all files/directories that start with 'med_slim'
 include = ["med_slim*"]
 
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+]
+

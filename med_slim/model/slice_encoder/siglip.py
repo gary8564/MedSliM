@@ -25,7 +25,7 @@ class SigLipFeatureExtractor(nn.Module):
         Forward pass through the MedSigLIP model.
         
         Args:
-            pixel_values: Input tensor, has shape [B, C, H, W]
+            pixel_values: Input tensor, has shape [B, C, W, H, D]
             
         Returns:
             features: Features representation from the MedSigLIP model
