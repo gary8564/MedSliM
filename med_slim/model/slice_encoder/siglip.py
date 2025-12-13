@@ -3,22 +3,27 @@ import torch
 import logging
 from transformers import AutoModel
 from einops import rearrange
-
+from pathlib import Path
 from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
 
 class SigLipFeatureExtractor(nn.Module):
     def __init__(self, 
-                 model_repo: str):
+                 model_repo: str,
+                 local_cache_dir: str = None):
         """
         Initialize the MedSigLIP    .
         
         Args:
             model_repo: Pre-trained MedSigLIP model repository on Hugging Face (e.g., "google/medsiglip-448")
+            local_cache_dir: Local cache directory to store the model. If None, the model will be cached in the default Hugging Face cache directory.
         """
         super().__init__()
-        self.model = AutoModel.from_pretrained(model_repo)
+        if local_cache_dir is not None:
+            local_cache_dir = Path(local_cache_dir)
+            local_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.model = AutoModel.from_pretrained(model_repo, cache_dir=local_cache_dir)
       
     def forward(self, pixel_values):
         """

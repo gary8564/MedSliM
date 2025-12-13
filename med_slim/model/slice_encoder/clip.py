@@ -5,6 +5,7 @@ import logging
 from typing import Callable, Optional
 from open_clip import create_model_from_pretrained
 from einops import rearrange
+from pathlib import Path
 
 from med_slim.logging.setup import init_logging
 init_logging()
@@ -12,16 +13,21 @@ logger = logging.getLogger(__name__)
 
 class CLIPFeatureExtractor(nn.Module):
     def __init__(self, 
-                 model_repo: str):
+                 model_repo: str,
+                 local_cache_dir: str = None):
         """
         Initialize the BiomedCLIP model.
 
         Args:
             model_repo: Pre-trained BiomedCLIP model repository on Hugging Face (e.g., "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224")
+            local_cache_dir: Local cache directory to store the model. If None, the model will be cached in the default Hugging Face cache directory.
         """
         super().__init__()
+        if local_cache_dir is not None:
+            local_cache_dir = Path(local_cache_dir)
+            local_cache_dir.mkdir(parents=True, exist_ok=True)
         # Load BiomedCLIP model from Hugging Face hub using open_clip
-        self.model, _ = create_model_from_pretrained(f'hf-hub:{model_repo}')
+        self.model, _ = create_model_from_pretrained(f'hf-hub:{model_repo}', cache_dir=local_cache_dir)
         
     def forward(self, pixel_values):
         """

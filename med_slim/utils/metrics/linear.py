@@ -1,4 +1,5 @@
 import torch
+import pandas as pd
 from torchmetrics import Accuracy, AUROC, AveragePrecision, F1Score
 from typing import List, Optional
 
@@ -22,14 +23,30 @@ def get_num_classes(task: str, target_columns: List[str], dataset=None) -> int:
         if dataset is None:
             raise ValueError("Dataset required for multiclass task to determine num_classes")
         return len(dataset.df_labels[target_columns[0]].unique())
-
-
-def get_loss_criterion(task: str):
+    
+def compute_class_weights_for_weighted_loss(annots_path: str, labels: List[str], task: str,device: torch.device) -> torch.Tensor:
+    df_labels = pd.read_csv(annots_path)
+    if task == "multiclass":
+        weights = []
+        total_samples = len(df_labels)
+        cls_counts = df_labels[labels].value_counts().sort_index()
+        for cls_label, cls_count in cls_counts.items():
+            weight = torch.tensor([total_samples / cls_count])
+            weights.append(weight)
+    else:
+        weights = []
+        for label in labels:
+            neg_count, pos_count = df_labels[label].value_counts().sort_index()
+            weight = torch.tensor([neg_count / pos_count])
+            weights.append(weight)
+    return torch.stack(weights).squeeze().to(device)
+    
+def get_loss_criterion(task: str, weights: Optional[torch.Tensor] = None):
     """Get appropriate loss function based on task type."""
     criterion_map = {
-        "multiclass": torch.nn.CrossEntropyLoss(),
-        "multilabel": torch.nn.BCEWithLogitsLoss(),
-        "binary": torch.nn.BCEWithLogitsLoss(),
+        "multiclass": torch.nn.CrossEntropyLoss(weight=weights),
+        "multilabel": torch.nn.BCEWithLogitsLoss(pos_weight=weights),
+        "binary": torch.nn.BCEWithLogitsLoss(pos_weight=weights),
         "regression": torch.nn.MSELoss()
     }
     if task not in criterion_map:

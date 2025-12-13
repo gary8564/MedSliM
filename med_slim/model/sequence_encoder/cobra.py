@@ -46,7 +46,7 @@ class Cobra(nn.Module):
     def __init__(self,
                  embed_dim=768,
                  contrast_dim=256,
-                 input_dims=[512, 768, 1024, 1152, 1376],
+                 input_dims=[512, 768, 1024, 1152, 1376, 1536],
                  num_heads=8,
                  layer=2,
                  dropout=0.25,
@@ -112,7 +112,25 @@ class Cobra(nn.Module):
                                    for _ in range(self.num_heads)
                                   ])
 
-    def forward(self, x, input_feature_dims=None, get_attention=False):
+    def _build_mask(self, seq_lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+        """
+        Build a boolean mask from sequence lengths.
+        
+        Args:
+            seq_lengths: Tensor of shape [batch_size] containing the actual sequence lengths.
+            max_len: Maximum sequence length (total padded length).
+            
+        Returns:
+            mask: Boolean tensor of shape [batch_size, max_len] where True indicates valid positions and False indicates padded positions.
+        """
+        batch_size = seq_lengths.size(0)
+        # create position indices [0, 1, 2, ..., max_len-1] with shape [batch_size, max_len]
+        positions = torch.arange(max_len, device=seq_lengths.device).unsqueeze(0).expand(batch_size, -1)
+        # mask[b, t] = True if t < seq_lengths[b], else False
+        mask = positions < seq_lengths.unsqueeze(1)
+        return mask
+
+    def forward(self, x, input_feature_dims=None, seq_lengths=None, get_attention=False):
         """
         Forward pass through the Cobra network.
         Args:
@@ -121,6 +139,10 @@ class Cobra(nn.Module):
                 Each tensor should have a feature_dim corresponding to the respective key in the embedding module.
             input_feature_dims (Tensor, optional):
                 Tensor of shape [batch_size] containing the feature dimensions of the input.
+                Default is None.
+            seq_lengths (Tensor, optional):
+                Tensor of shape [batch_size] containing the actual sequence lengths (number of raw slices before subsampling/zero-padding)
+                If provided, padded positions will be masked out in attention.
                 Default is None.
             get_attention (bool, optional):
                 If True, the method returns the computed attention matrix rather than the aggregated features.
@@ -153,6 +175,12 @@ class Cobra(nn.Module):
             else:
                 logits = self.embed[str(x.shape[-1])](x) # [B, num_slices, embed_dim]
 
+        # Build attention mask if seq_lengths is provided
+        mask = None
+        if seq_lengths is not None:
+            max_len = logits.shape[1]  
+            mask = self._build_mask(seq_lengths, max_len)  # [B, num_slices]
+
         # Mamba encoder + LayerNorm
         h = self.norm(self.mamba_enc(logits)) # [B, num_slices, embed_dim]
 
@@ -168,14 +196,14 @@ class Cobra(nn.Module):
 
             attentions = []
             for i, attn_net in enumerate(self.attn):
-                _, raw_attention = attn_net(h_heads[:, :, :, i], return_raw_attention = True) # [B, num_slices, 1]
+                _, raw_attention = attn_net(h_heads[:, :, :, i], mask=mask, return_raw_attention = True) # [B, num_slices, 1]
                 attentions.append(raw_attention)
             A = torch.stack(attentions, dim=-1) # [B, num_slices, 1, num_heads]
             A = rearrange(A, 'b t e c -> b t (e c)',c=self.num_heads).mean(-1).unsqueeze(-1) # [B, num_slices, 1]
             A = torch.transpose(A, 2, 1) # [B, 1, num_slices]
             A = F.softmax(A, dim=-1) # [B, 1, num_slices]
         else:
-            A = self.attn[0](h)
+            A = self.attn[0](h, mask=mask) 
             A = torch.transpose(A, 2, 1) # [B, 1, num_slices]
 
         if get_attention:

@@ -1,40 +1,10 @@
 import torchio as tio 
-import yaml
-from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Optional
 
-from med_slim.utils.preprocessing import CropOrPad, ZNormalization, ImageOrSubjectToTensor
-
-def get_model_config(model_name: str) -> Dict[str, Any]:
-    """
-    Get model configurations from the YAML file.
-    
-    Args:
-        model_name: Name of the pretrained model
-        
-    Returns:
-        Dict containing model-specific configuration
-    """
-    current_dir = Path(__file__).parent
-    configs_dir = current_dir.parent.parent / "configs"
-    model_config_path = configs_dir / "model_config.yaml"
-    
-    if not model_config_path.exists():
-        raise FileNotFoundError(f"Model configuration file not found: {model_config_path}")
-    
-    try:
-        with open(model_config_path, 'r') as file:
-            model_configs = yaml.safe_load(file)
-        if "dinov2" in model_name: 
-            model_name = "dinov2"
-        return model_configs[model_name].copy()
-    except yaml.YAMLError as e:
-        raise ValueError(f"Error parsing model configuration file: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Error loading model configuration file: {e}")
+from med_slim.utils.preprocessing import CropOrPad, CropOrPad2D, ZNormalization, ImageOrSubjectToTensor, get_model_config
 
 def get_transforms(model_name: str,
-                   num_slices: int = 32,
+                   num_slices: Optional[int] = None,
                    resample: Optional[float] = None,
                    random_rotate: bool = False,
                    random_center: bool = False,
@@ -68,7 +38,7 @@ def get_transforms(model_name: str,
     train_transform = tio.Compose([
                 tio.ToCanonical(),
                 tio.Resample(resample) if resample is not None else tio.Lambda(lambda x: x),
-                CropOrPad((W_crop, H_crop, D), random_center=random_center, padding_mode='minimum'), 
+                CropOrPad((W_crop, H_crop, D), random_center=random_center, padding_mode='minimum') if D is not None else CropOrPad2D((W_crop, H_crop), random_center=random_center, padding_mode='minimum'), 
                 ZNormalization(per_channel=True, channelwise_precomputed_means=means, channelwise_precomputed_stds=stds, masking_method=lambda x: (x > x.min()) & (x < x.max())),
                 tio.OneOf({
                     tio.RandomAffine(scales=(0.9, 1.2), degrees=(-15, 15, -15, 15, 0, 90), translation=0, isotropic=True, default_pad_value='minimum'): 0.8,
@@ -83,7 +53,7 @@ def get_transforms(model_name: str,
     val_transform = tio.Compose([
                 tio.ToCanonical(),
                 tio.Resample(resample) if resample is not None else tio.Lambda(lambda x: x),
-                CropOrPad((W_crop, H_crop, D), random_center=random_center, padding_mode='minimum'), 
+                CropOrPad((W_crop, H_crop, D), random_center=random_center, padding_mode='minimum') if D is not None else CropOrPad2D((W_crop, H_crop), random_center=random_center, padding_mode='minimum'), 
                 ZNormalization(per_channel=True, channelwise_precomputed_means=means, channelwise_precomputed_stds=stds, masking_method=lambda x: (x > x.min()) & (x < x.max())),
                 ImageOrSubjectToTensor() if to_tensor else tio.Lambda(lambda x: x),
             ])

@@ -126,17 +126,21 @@ def main(args, cfg):
             curr_lr = adjust_learning_rate(optimizer, e + i / iters_per_epoch, scaled_lr, cfg)
             curr_m = adjust_moco_momentum(e + i / iters_per_epoch, cfg)
 
-            x1, sizes1, x2, sizes2 = batch
+            x1, sizes1, seq_len1, x2, sizes2, seq_len2 = batch
             x1 = x1.to(dtype=torch.float32)
             x2 = x2.to(dtype=torch.float32)
             sizes1 = sizes1.to(dtype=torch.long)
             sizes2 = sizes2.to(dtype=torch.long)
+            seq_len1 = seq_len1.to(dtype=torch.long)
+            seq_len2 = seq_len2.to(dtype=torch.long)
             
             with accelerator.autocast():
-                loss = model(x1, x2, input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, m=curr_m)
-                
+                loss = model(x1, x2, input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
+                           seq_lengths_1=seq_len1, seq_lengths_2=seq_len2, m=curr_m)
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
+            # Gradient clipping to prevent exploding gradients
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             total_loss += loss.detach().item()
 
@@ -189,7 +193,7 @@ def adjust_moco_momentum(epoch, cfg):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MedSliM-pretraining.")
     parser.add_argument(
-        "-c", "--config", type=str, default="../configs/pretrain.yaml", help="Path to the config file"
+        "-c", "--config", type=str, default="../configs/pretrain.yml", help="Path to the config file"
     )
     parser.add_argument(
         "--planes", 

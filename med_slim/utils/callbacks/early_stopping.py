@@ -54,7 +54,7 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-            return self.early_stop, None
+            return self.early_stop, self.best_score
         else:
             self.best_score = score
             self._save_checkpoint(model, optimizer, scheduler, epoch, score)
@@ -86,22 +86,6 @@ class EarlyStopping:
                 "scheduler_state": scheduler.state_dict() if scheduler else None,
                 "best_metric": best_metric,
             }
-            
-            # Add multi-view configuration if applicable
-            if hasattr(model, 'multi_view') and model.multi_view:
-                checkpoint_data.update({
-                    "num_views": model.num_views,
-                    "view_fusion_type": model.view_fusion_type,
-                    "adapter_dim": getattr(model, 'adapter_dim', None),
-                    "view_fusion_hidden_dim": getattr(model, 'view_fusion_hidden_dim', None),
-                })
-            
-            # Add Ark-specific configuration if applicable
-            if hasattr(model, 'use_backbone_projector'):
-                checkpoint_data.update({
-                    "use_backbone_projector": model.use_backbone_projector,
-                })
-            
             torch.save(checkpoint_data, self.ckpt_path)
             logger.info(f"New best validation metric = {best_metric:.4f} at epoch {epoch+1}, saved best.pt")
         except Exception as e:

@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=16G 
 #SBATCH --time=24:00:00                 
-#SBATCH --job-name=pretrain_MRNet_all_planes
-#SBATCH --output=stdout_pretrain_MRNet_all_planes.txt    
+#SBATCH --job-name=pretrain_MRNet_sagittal
+#SBATCH --output=stdout_pretrain_MRNet_sagittal.txt    
 #SBATCH --account=rwth1833    
 
 ### Setup

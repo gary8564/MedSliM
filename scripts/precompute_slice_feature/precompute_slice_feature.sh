@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G 
 #SBATCH --time=3:00:00                 
-#SBATCH --job-name=precompute_slice_feature_biomedclip_coronal
-#SBATCH --output=stdout_biomedclip_coronal.txt    
+#SBATCH --job-name=precompute_slice_feature_rad-dino_axial_train
+#SBATCH --output=stdout_rad-dino_axial_train.txt    
 #SBATCH --account=rwth1833    
 
 
@@ -21,18 +21,19 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ### Configuration
 DATA_DIR="/hpcwork/rwth1833/datasets/preprocessed/MRNet"
 SAVE_DIR="/hpcwork/rwth1833/feat_caches/MRNet"
-PLANE="coronal"
-NUM_SLICES=32
-MODEL_NAME="biomedclip"
-ARK_PATH="/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
+PLANE="axial"
+USE_RAW_SLICE_RESOLUTION=true
+MODEL_NAME="rad-dino"
 SPLIT="train"
-BATCH_SIZE=8
 EXTRA_ARGS="--amp"
 
 # Conditionally extend extra args
-if [[ "$MODEL_NAME" == "ark" ]]; then
-  BATCH_SIZE=2
-  EXTRA_ARGS+=" --ark-checkpoint $ARK_PATH"
+if [ "$USE_RAW_SLICE_RESOLUTION" = true ]; then
+  EXTRA_ARGS="$EXTRA_ARGS --use-raw-slice-resolution"
+fi
+
+if [ "$USE_RAW_SLICE_RESOLUTION" = false ]; then
+  EXTRA_ARGS="$EXTRA_ARGS --num-slices 32"
 fi
 
 # Run your program
@@ -40,8 +41,6 @@ python ./med_slim/utils/preprocessing/precompute_slice_feature.py \
     --data-dir "$DATA_DIR" \
     --save-dir "$SAVE_DIR" \
     --plane "$PLANE" \
-    --num-slices "$NUM_SLICES" \
     --model-name "$MODEL_NAME" \
     --split "$SPLIT" \
-    --batch-size "$BATCH_SIZE" \
     $EXTRA_ARGS

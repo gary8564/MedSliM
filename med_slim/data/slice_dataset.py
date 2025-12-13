@@ -23,7 +23,7 @@ class SliceDataset(data.Dataset):
             self,
             path_root: str,
             split: str,
-            transform: tio.Compose,
+            transform: Optional[tio.Compose] = None,
             plane: str = 'axial',
         ):
         super().__init__()
@@ -45,7 +45,8 @@ class SliceDataset(data.Dataset):
         sample_id = self.sample_ids[index]
         uid = int(sample_id)
         img = tio.ScalarImage(self.path_root/f'{self.split}'/f'{self.plane}'/f'{uid:04d}.nii.gz') 
-        img = self.transform(img)
+        if self.transform is not None:
+            img = self.transform(img)
         return {'uid': uid, "orientation": self.plane, 'source': img}
     
 class SliceClassificationDataset(SliceDataset):
@@ -54,7 +55,7 @@ class SliceClassificationDataset(SliceDataset):
             path_root: str,
             split: str,
             task: str,
-            transform: tio.Compose,
+            transform: Optional[tio.Compose] = None,
             labels: Optional[List[str]] = None
         ):
         super().__init__(path_root, split, transform)
@@ -71,7 +72,8 @@ class SliceClassificationDataset(SliceDataset):
         sample_id = self.sample_ids[index]
         uid = int(sample_id)
         img = tio.ScalarImage(self.path_root/f'{self.split}'/f'{self.plane}'/f'{uid:04d}.nii.gz') 
-        img = self.transform(img)
+        if self.transform is not None:
+            img = self.transform(img)
         if self.task == "multilabel":
             target = self.df.loc[sample_id, self.labels].to_numpy(dtype=np.float32) if self.labels is not None else self.df.loc[sample_id].to_numpy(dtype=np.float32)
             target = torch.tensor(target, dtype=torch.float32)
@@ -89,7 +91,7 @@ class SliceSegmentationDataset(SliceDataset):
             self,
             path_root: str,
             split: str,
-            transform: tio.Compose
+            transform: Optional[tio.Compose] = None
             ):
         super().__init__(path_root, split, transform)
     
@@ -99,7 +101,8 @@ class SliceSegmentationDataset(SliceDataset):
         img = tio.ScalarImage(self.path_root/f'{self.split}'/f'{self.plane}'/f'{uid:04d}.nii.gz')         
         mask = tio.LabelMap(self.path_root/f'{self.split}'/f'{self.plane}'/'mask'/ f'{uid:04d}.nii.gz')
         subject = tio.Subject(img=img, mask=mask)
-        subject = self.transform(subject)
+        if self.transform is not None:
+            subject = self.transform(subject)
         img = subject['img']
         mask = subject['mask']
         

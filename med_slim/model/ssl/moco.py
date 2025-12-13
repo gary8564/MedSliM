@@ -105,6 +105,8 @@ class MoCo(nn.Module):
                 *, 
                 input_feature_dims_1: torch.Tensor | None = None, 
                 input_feature_dims_2: torch.Tensor | None = None, 
+                seq_lengths_1: torch.Tensor | None = None,
+                seq_lengths_2: torch.Tensor | None = None,
                 m: float = 0.99):
         """
         Args:
@@ -112,20 +114,22 @@ class MoCo(nn.Module):
             x2 (Tensor): Second view of the input images.
             input_feature_dims_1 (Tensor, optional): Original feature dims per-sample for x1 (before padding).
             input_feature_dims_2 (Tensor, optional): Original feature dims per-sample for x2 (before padding).
+            seq_lengths_1 (Tensor, optional): Actual sequence lengths per-sample for x1 (before subsampling/zero-padding).
+            seq_lengths_2 (Tensor, optional): Actual sequence lengths per-sample for x2 (before subsampling/zero-padding).
             m (float, optional): Momentum parameter. Default is 0.99.
         Returns:
             Tensor: Contrastive loss.
         """
         # Compute the contrastive features 
-        q1 = self.predictor(self.base_encoder(x1, input_feature_dims=input_feature_dims_1))
-        q2 = self.predictor(self.base_encoder(x2, input_feature_dims=input_feature_dims_2))
+        q1 = self.predictor(self.base_encoder(x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths_1))
+        q2 = self.predictor(self.base_encoder(x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths_2))
        
         with torch.no_grad():  # no gradient
             self._update_momentum_encoder(m=m) # update the momentum encoder
 
             # Compute the contrastive features for the momentum encoder as targets
-            k1 = self.momentum_encoder(x1, input_feature_dims=input_feature_dims_1)
-            k2 = self.momentum_encoder(x2, input_feature_dims=input_feature_dims_2)
+            k1 = self.momentum_encoder(x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths_1)
+            k2 = self.momentum_encoder(x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths_2)
 
         return self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1) # return the contrastive loss
     

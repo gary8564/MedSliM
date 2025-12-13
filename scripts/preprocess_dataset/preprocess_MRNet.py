@@ -36,7 +36,11 @@ def npy2nifti(path_file, save_dir, data_dir):
 
     # Write
     file_stem = path_file.stem 
-    path_out_dir = save_dir / path_file.parent.relative_to(data_dir)
+    rel_path = path_file.parent.relative_to(data_dir)
+    # Replace "valid" with "test" in the output path
+    if rel_path.parts[0] == "valid":
+        rel_path = Path("test") / Path(*rel_path.parts[1:])
+    path_out_dir = save_dir / rel_path
     path_out_dir.mkdir(parents=True, exist_ok=True)
     img.save(path_out_dir / f'{file_stem}.nii.gz')
     
@@ -82,14 +86,14 @@ def main():
     df_train = combine_annotation_csv(data_dir, 'train')
     df_val = combine_annotation_csv(data_dir, 'valid')
     df_train.to_csv(save_dir/'train.csv', index=False)
-    df_val.to_csv(save_dir/'valid.csv', index=False)
+    df_val.to_csv(save_dir/'test.csv', index=False)
     
     logger.info(f"NIfTI files written: {len(list(save_dir.rglob('*.nii.gz')))}")
     logger.info(f"Annotation csv files written: {len(list(save_dir.rglob('*.csv')))}")    
-    logger.info(f"Number train.csv: {len(df_train)} of 1130, Number valid.csv: {len(df_val)} of 120")
+    logger.info(f"Number train.csv: {len(df_train)} of 1130, Number test.csv: {len(df_val)} of 120")
     for cls in ['abnormal', 'acl', 'meniscus']:
         logger.info(f"{df_train[cls].value_counts(normalize=True)} {cls} labels in train dataset.")
-        logger.info(f"{df_val[cls].value_counts(normalize=True)} {cls} labels in valid dataset.")
+        logger.info(f"{df_val[cls].value_counts(normalize=True)} {cls} labels in test dataset.")
     logger.info("================================================")
     logger.info("Preprocessing completed.")
     logger.info("================================================")

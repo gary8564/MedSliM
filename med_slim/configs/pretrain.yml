@@ -1,11 +1,15 @@
 feat_dataset:
   datasets:
     - name: mrnet
-      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw"
   model_name: 
     - "dinov2"
+    - "rad-dino"
+    - "dinov3"
   plane: # "axial", "sagittal", "coronal"
     - "sagittal"
+    - "coronal"
+    - "axial"
 
 model:
   slice_encoder_models:
@@ -14,35 +18,42 @@ model:
       image_mean: [0.485, 0.456, 0.406]
       image_std: [0.229, 0.224, 0.225]
       embed_dim: 1024
-      hf_repo: "facebook/dinov2-base"
+      repo: "facebook/dinov2-large"
+    - name: dinov3
+      img_size: [224, 224]
+      image_mean: [0.485, 0.456, 0.406]
+      image_std: [0.229, 0.224, 0.225]
+      embed_dim: 1536
+      repo: "facebook/dinov3-convnext-large-pretrain-lvd1689m"
     - name: rad-dino
       img_size: [518, 518]
       image_mean: [0.5307, 0.5307, 0.5307]
       image_std: [0.2583, 0.2583, 0.2583]
       embed_dim: 768
-      hf_repo: "microsoft/rad-dino"
+      repo: "microsoft/rad-dino"
     - name: medsiglip
       img_size: [448, 448]
       image_mean: [0.5, 0.5, 0.5]
       image_std: [0.5, 0.5, 0.5]
       embed_dim: 1152
-      hf_repo: "google/medsiglip-448"
+      repo: "google/medsiglip-448"
     - name: biomedclip
       img_size: [224, 224]
       image_mean: [0.48145466, 0.4578275, 0.40821073]
       image_std: [0.26862954, 0.26130258, 0.27577711]
       embed_dim: 512
-      hf_repo: "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+      repo: "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
     - name: ark
       img_size: [768, 768]
       image_mean: [0.485, 0.456, 0.406]
       image_std: [0.229, 0.224, 0.225]
       embed_dim: 1376
+      repo: "/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
 
   cobra:
-    embed_dim: 768
+    embed_dim: 1024
     contrast_dim: 512
-    input_dims: [512, 768, 1024, 1152, 1376]
+    input_dims: [768, 1024, 1536]
     num_heads: 8
     num_mamba_layers: 2
     mamba_d_state: 128

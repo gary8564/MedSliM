@@ -184,3 +184,45 @@ class CropOrPad(tio.CropOrPad):
             crop = tio.Crop(cropping_params, **self.get_base_args())
             subject = crop(subject)  # type: ignore[assignment]
         return subject
+
+
+class CropOrPad2D(tio.Transform):
+    """
+    Crop or pad only the first two spatial dimensions (W and H), leaving the third dimension (D) unchanged.
+    
+    Args:
+        target_shape_2d: Target shape for (W, H) dimensions
+        padding_mode: Padding mode (see tio.Pad for options)
+        random_center: If True, randomly center the crop/pad; if False, center crop/pad
+    """
+
+    def __init__(
+        self,
+        target_shape_2d: Union[int, Tuple[int, int], None] = None,
+        padding_mode: Union[str, float] = 0,
+        random_center: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.target_w, self.target_h = target_shape_2d
+        self.padding_mode = padding_mode
+        self.random_center = random_center
+
+    def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        subject.check_consistent_space()
+        
+        # Get current spatial shape (W, H, D)
+        current_shape = subject.spatial_shape
+        current_w, current_h, current_d = current_shape
+        
+        # Create target shape keeping D unchanged
+        target_shape = (self.target_w, self.target_h, current_d)
+        
+        # Use CropOrPad with the computed target shape
+        crop_or_pad = CropOrPad(
+            target_shape=target_shape,
+            padding_mode=self.padding_mode,
+            random_center=self.random_center,
+        )
+        
+        return crop_or_pad(subject)

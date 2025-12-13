@@ -41,12 +41,13 @@ def get_cobra_feats(
         for batch in tqdm(dataloader, desc="Extracting COBRA embeddings", disable=not accelerator.is_main_process):
             labels = batch["labels"]  
             sample_ids = batch["sample_ids"]
+            seq_lengths = batch["seq_lengths"].to(accelerator.device)
             
             # Get features from all encoders and cast to model dtype
             encoder_feats = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) for f in batch["feature_embeds"]]
             
             # COBRA embeds each encoder's features and average them across encoders
-            cobra_feats = cobra_model(encoder_feats) 
+            cobra_feats = cobra_model(encoder_feats, seq_lengths=seq_lengths) 
             
             # Cast to float32 for downstream eval 
             all_cobra_feats.append(cobra_feats.float())

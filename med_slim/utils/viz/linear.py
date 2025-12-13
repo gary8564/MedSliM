@@ -20,7 +20,6 @@ def visualize_binary_metrics(
     y_true: np.ndarray,
     y_pred_prob: np.ndarray,
     output_dir: str,
-    accelerator,
     label: Optional[str] = None
 ) -> Tuple[float, float]:
     """
@@ -30,16 +29,12 @@ def visualize_binary_metrics(
         y_true: Ground truth binary labels
         y_pred_prob: Predicted probabilities
         output_dir: Directory to save plots
-        accelerator: HuggingFace Accelerator instance
         label: Optional label for the plots (e.g., disease name)
 
     Returns:
         Tuple of (AUPRC, ROC_AUC)
     """
     fontdict = {'fontsize': 10, 'fontweight': 'bold'}
-
-    if not accelerator.is_main_process:
-        return None, None
 
     if label is None:
         class_label = ""
@@ -70,7 +65,7 @@ def visualize_binary_metrics(
     plt.close(fig)
 
     # ------------------------------- ROC-AUC ---------------------------------
-    fprs, tprs, _ = roc_curve(y_true, y_pred_prob)
+    fprs, tprs, thresholds = roc_curve(y_true, y_pred_prob)
     roc_auc = auc(fprs, tprs)
 
     fig, axis_roc = plt.subplots(ncols=1, nrows=1, figsize=(6, 6))
@@ -87,7 +82,12 @@ def visualize_binary_metrics(
     plt.close(fig)
 
     # -------------------------- Confusion Matrix -------------------------
-    y_pred = (y_pred_prob >= 0.5).astype(int)
+    # Youden’s J to pick a threshold
+    youden = tprs - fprs
+    best_idx = youden.argmax()
+    best_thr = thresholds[best_idx]
+    logger.info(f"Best threshold: {best_thr:.3f}")
+    y_pred = (y_pred_prob >= best_thr).astype(int)
     cm = confusion_matrix(y_true, y_pred)
     acc = accuracy_score(y_true, y_pred)
 
@@ -121,7 +121,6 @@ def visualize_multilabel_metrics(
     y_pred_prob: np.ndarray,
     class_labels: List[str],
     output_dir: str,
-    accelerator
 ) -> Dict[str, Dict[str, float]]:
     """
     Generate plots for multilabel classification (one set of plots per label).
@@ -131,7 +130,6 @@ def visualize_multilabel_metrics(
         y_pred_prob: Predicted probabilities [N, num_classes]
         class_labels: List of class names
         output_dir: Directory to save plots
-        accelerator: HuggingFace Accelerator instance
 
     Returns:
         Dictionary mapping class names to their metrics
@@ -143,14 +141,12 @@ def visualize_multilabel_metrics(
             y_true[:, i],
             y_pred_prob[:, i],
             output_dir,
-            accelerator,
             label=cls
         )
-        if accelerator.is_main_process:
-            metrics[cls] = {
-                "AUROC": float(roc_auc),
-                "AUPRC": float(auprc)
-            }
+        metrics[cls] = {
+            "AUROC": float(roc_auc),
+            "AUPRC": float(auprc)
+        }
 
     return metrics
 
@@ -160,7 +156,6 @@ def visualize_multiclass_metrics(
     y_pred_prob: np.ndarray,
     class_labels: List[str],
     output_dir: str,
-    accelerator
 ) -> Dict[str, Dict[str, float]]:
     """
     Generate plots for multiclass classification.
@@ -170,15 +165,11 @@ def visualize_multiclass_metrics(
         y_pred_prob: Predicted probabilities [N, num_classes]
         class_labels: List of class names
         output_dir: Directory to save plots
-        accelerator: HuggingFace Accelerator instance
 
     Returns:
         Dictionary with per-class and overall metrics
     """
     metrics = {}
-
-    if not accelerator.is_main_process:
-        return metrics
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -215,7 +206,6 @@ def visualize_multiclass_metrics(
             y_true_binary,
             y_pred_binary_prob,
             output_dir,
-            accelerator,
             label=cls
         )
 
@@ -235,7 +225,6 @@ def compute_and_visualize_metrics(
     task: str,
     class_labels: List[str],
     output_dir: str,
-    accelerator
 ) -> Dict:
     """
     Main entry point for computing and visualizing classification metrics.
@@ -246,14 +235,10 @@ def compute_and_visualize_metrics(
         task: Task type ('binary', 'multiclass', 'multilabel')
         class_labels: List of class labels
         output_dir: Directory to save plots
-        accelerator: HuggingFace Accelerator instance
 
     Returns:
         Dictionary containing computed metrics
     """
-    if not accelerator.is_main_process:
-        return {}
-
     logger.info(f"\nGenerating visualization plots for {task} classification...")
     logger.info(f"Saving plots to: {output_dir}")
 
@@ -263,7 +248,6 @@ def compute_and_visualize_metrics(
             y_true,
             y_pred_prob,
             output_dir,
-            accelerator,
             label=label
         )
         return {
@@ -276,7 +260,6 @@ def compute_and_visualize_metrics(
             y_pred_prob,
             class_labels,
             output_dir,
-            accelerator
         )
     elif task == "multiclass":
         return visualize_multiclass_metrics(
@@ -284,7 +267,6 @@ def compute_and_visualize_metrics(
             y_pred_prob,
             class_labels,
             output_dir,
-            accelerator
         )
     else:
         raise ValueError(f"Unsupported task type: {task}. Must be one of ['binary', 'multiclass', 'multilabel']")

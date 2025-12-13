@@ -55,21 +55,32 @@ class BatchedABMIL(nn.Module):
         # attention_W = w^T (attention_V ⊙ attention_U)
         self.attention_W = nn.Linear(hidden_dim, n_heads)
 
-    def forward(self, x, return_raw_attention=False):
+    def forward(self, x, mask=None, return_raw_attention=False):
         """
         Forward pass 
         Args:
             x (torch.Tensor): shape (bs, num_tokens, embed_dim)
+            mask (torch.Tensor, optional): Boolean mask of shape (bs, num_tokens) where True indicates 
+                                           valid (real) positions and False indicates padded positions.
+                                           If provided, padded positions will be masked out before softmax.
             return_raw_attention (bool): whether to return the raw attention weights
         Returns:
             activated_A (torch.Tensor): Activated attention weights
-            A (torch.Tensor): Raw attention weights
+            A (torch.Tensor): Raw attention weights only if return_raw_attention=True
         """
         assert len(x.shape)==3, x.shape
         a = self.attention_V(x)  # [batch_size, num_tokens, hidden_dim]
         b = self.attention_U(x)  # [batch_size, num_tokens, hidden_dim]
         A = a.mul(b)  # element-wise gated attention [batch_size, num_tokens, hidden_dim]
         A = self.attention_W(A)  # [batch_size, num_tokens, n_heads]
+
+        # Apply mask to attention scores before activation 
+        if mask is not None:
+            # mask shape: [batch_size, num_tokens] with boolean values (True = valid, False = padded)
+            # A shape: [batch_size, num_tokens, n_heads]
+            # Expand mask to match A's shape: [batch_size, num_tokens, 1]
+            mask = mask.unsqueeze(-1)  # [batch_size, num_tokens, 1]
+            A = A.masked_fill(~mask, float('-inf'))
 
         # Based on the task, we can choose different activation functions
         # Softmax: classic MIL assumption (one/few key instances drive the decision; point to the single worst slice).
