@@ -15,6 +15,40 @@ from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
 
+def ssl_collate_fn(batch):
+    """
+    Custom collate function for PrecomputedFeatPairDataset.
+    """
+    feats1_list = [item["feats1"] for item in batch]
+    orig_embed_dims1 = torch.stack([item["orig_embed_dim1"].to(dtype=torch.long) for item in batch], dim=0)
+    seq_lens1 = torch.stack([item["seq_len1"].to(dtype=torch.long) for item in batch], dim=0)
+
+    feats2_list = [item["feats2"] for item in batch]
+    orig_embed_dims2 = torch.stack([item["orig_embed_dim2"].to(dtype=torch.long) for item in batch], dim=0)
+    seq_lens2 = torch.stack([item["seq_len2"].to(dtype=torch.long) for item in batch], dim=0)
+
+    batch_size = len(batch)
+    max_seq_len = int(max(seq_lens1.max().item(), seq_lens2.max().item()))
+    max_embed_dim = feats1_list[0].shape[-1]
+
+    # Zero-padding: [B, max_seq_len, max_feat_dim]
+    feats1_padded = torch.zeros(batch_size, max_seq_len, max_embed_dim)
+    feats2_padded = torch.zeros(batch_size, max_seq_len, max_embed_dim)
+    for i, (feat1, feat2) in enumerate(zip(feats1_list, feats2_list)):
+        seq_len1 = int(seq_lens1[i].item())
+        seq_len2 = int(seq_lens2[i].item())
+        feats1_padded[i, :seq_len1, :] = feat1[:seq_len1]
+        feats2_padded[i, :seq_len2, :] = feat2[:seq_len2]
+
+    return {
+        "feats1": feats1_padded, # [B, max_seq_len, max_feat_dim]
+        "feats2": feats2_padded,
+        "orig_embed_dim1": orig_embed_dims1, # [B]
+        "orig_embed_dim2": orig_embed_dims2,
+        "seq_lens1": seq_lens1, # [B]
+        "seq_lens2": seq_lens2, # [B]
+    }
+
 
 def linear_classifier_collate_fn(batch):
     """
@@ -63,7 +97,7 @@ def linear_classifier_collate_fn(batch):
         "sample_ids": sample_ids,
     }
 
-def multiview_collate_fn(batch: List[Dict]) -> Dict:
+def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
     """
     Collate function for MultiViewFeatClassificationDataset.
     
@@ -120,8 +154,8 @@ class PrecomputedFeatPairDataset(Dataset):
     """
     Dataset of constructing precomputed feature positivepairs at the exam level, which are used for contrastive learning.
     For multi-plane views, the concept of "same-plane positives" is implemented:
-    when forming a pair, enforce both views to be from the same plane; use all planes across the dataset,
-    but don't mixed within a pair.
+    when forming a pair, enforce both views to be from the same plane; 
+    use all planes across the dataset but don't mix within a pair.
     
     """
     def __init__(self, 
@@ -129,7 +163,9 @@ class PrecomputedFeatPairDataset(Dataset):
                  slice_encoder_models: List[str], 
                  view_planes: List[str], 
                  split: str, 
-                 max_feature_dim: int):
+                 max_feature_dim: int,
+                 mri_sequences: Optional[List[str]] = None,
+                 cross_sequence_positive: bool = False):
         self.feat_dirs = feat_dirs
         self.slice_encoder_models = slice_encoder_models
         self.view_planes = view_planes
@@ -137,8 +173,11 @@ class PrecomputedFeatPairDataset(Dataset):
         self.max_feature_dim = max_feature_dim
         self.feat_path_dict = self._get_feat_path_dict_by_study_id()
         self.study_ids = list(self.feat_path_dict.keys())
+        self.mri_sequences = mri_sequences
+        self.cross_sequence_positive = cross_sequence_positive
         
     def _get_feat_path_dict_by_study_id(self):
+        # TODO: handle cross-sequence positive case
         feat_path_dict = defaultdict(lambda: defaultdict(list))
         logger.info(f'Selected slice encoder models: {self.slice_encoder_models}')
         logger.info(f'Selected view planes: {self.view_planes}')
@@ -153,22 +192,8 @@ class PrecomputedFeatPairDataset(Dataset):
                         exam_id = int(os.path.basename(feat_file).split(".")[0])
                         feat_path_dict[f"{dataset_name}_{exam_id}"][view_plane].append(feat_file)
         return feat_path_dict
-    
-    def _select_window_indices(self, num_slices: int, n_seq: int = 32) -> slice:
-        """
-        Sample the window of slices to keep, which is used for padding or subsampling the number of slices to n_seq.
-        Return a slice object describing which z-indices to keep.
-        """
-        if num_slices <= n_seq:
-            # keep all slices
-            return slice(0, num_slices)
-        else:
-            # uniform sampling along z
-            # pick start ~ Uniform(0, num_slices - n_seq), then take slices[start: start+n_seq]
-            start_idx = np.random.randint(0, num_slices - n_seq + 1)
-            return slice(start_idx, start_idx + n_seq)
 
-    def _pad_feature_dim(self, x: torch.Tensor, n_seq: int = 32) -> torch.Tensor:
+    def _pad_feature_dim(self, x: torch.Tensor) -> torch.Tensor:
         """
         Pad the embedding dimension to the largest embedding dimension in the batch by padding with zeros if it is smaller than the target dimension
         """
@@ -203,30 +228,24 @@ class PrecomputedFeatPairDataset(Dataset):
         feats2, metadata2 = self._load_feats(feat_path2)
         assert metadata1["plane"] == metadata2["plane"], \
             f"Expected plane to be equal, but got {metadata1['plane']} and {metadata2['plane']}!"
-        assert feats1.shape[0] == feats2.shape[0], \
-            f"Expected number of slices to be equal, but got {feats1.shape[0]} and {feats2.shape[0]} for study {study_id} and view plane {selected_view_plane}!"
-        # Pad or sample the number of slices to n_seq  and zero-pad number of features to the largest embedding dimension 
-        # in order to let DataLoader collate function concatenate the tensors of the same shape per batch
-        num_slices = feats1.shape[0]
-        n_seq = 32
+        slice_seq_len1 = feats1.shape[0]
+        slice_seq_len2 = feats2.shape[0]
+        # TODO: if cross_sequence_positive is True, we can allow different sequence lengths
+        assert slice_seq_len1 == slice_seq_len2, \
+            f"Expected number of slices to be equal, but got {slice_seq_len1} and {slice_seq_len2} for study {study_id} and view plane {selected_view_plane}!"
         with torch.no_grad():
-            # choose a shared window indices
-            window_slice = self._select_window_indices(num_slices, n_seq = n_seq)
-            # crop both FMs using the SAME window, preserving order
-            feats1 = feats1[window_slice]  # [S, D1], where S <= 32
-            feats2 = feats2[window_slice]  # [S, D2]
-            # zero-padding at the end of the sequence if S < n_seq
-            S = feats1.shape[0]
-            if S < n_seq:
-                pad_size = n_seq - S
-                # pad in slice dimension with zeros in feature space
-                feats1 = torch.cat([feats1, torch.zeros(pad_size, feats1.shape[1], device=feats1.device)], dim=0)
-                feats2 = torch.cat([feats2, torch.zeros(pad_size, feats2.shape[1], device=feats2.device)], dim=0)
             # pad feature dimension to max_feature_dim
-            feats1, orig_embed_dim1 = self._pad_feature_dim(feats1.clone().detach())
-            feats2, orig_embed_dim2 = self._pad_feature_dim(feats2.clone().detach()) 
+            feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
+            feats2, orig_embed_dim2 = self._pad_feature_dim(feats2) 
         assert feats1.shape == feats2.shape, f"Expected shapes to be equal, but got {feats1.shape} and {feats2.shape}!"
-        return feats1, torch.as_tensor(orig_embed_dim1), torch.as_tensor(S), feats2, torch.as_tensor(orig_embed_dim2), torch.as_tensor(S)
+        return {
+            "feats1": feats1,
+            "feats2": feats2,
+            "orig_embed_dim1": torch.as_tensor(orig_embed_dim1, dtype=torch.long),
+            "orig_embed_dim2": torch.as_tensor(orig_embed_dim2, dtype=torch.long),
+            "seq_len1": torch.as_tensor(slice_seq_len1, dtype=torch.long),
+            "seq_len2": torch.as_tensor(slice_seq_len2, dtype=torch.long),
+        }
 
 class PrecomputedFeatSupConDataset(Dataset):
     """
