@@ -25,7 +25,7 @@ from accelerate import Accelerator
 import wandb
 
 from med_slim.model.ssl import MoCo
-from med_slim.data import PrecomputedFeatPairDataset
+from med_slim.data import PrecomputedFeatPairDataset, ssl_collate_fn
 
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 
@@ -99,6 +99,7 @@ def main(args, cfg):
         num_workers=cfg["train"]["num_workers"],
         drop_last=True,
         pin_memory=True,
+        collate_fn=ssl_collate_fn,
     )
 
     # Prepare with accelerator
@@ -126,17 +127,22 @@ def main(args, cfg):
             curr_lr = adjust_learning_rate(optimizer, e + i / iters_per_epoch, scaled_lr, cfg)
             curr_m = adjust_moco_momentum(e + i / iters_per_epoch, cfg)
 
-            x1, sizes1, seq_len1, x2, sizes2, seq_len2 = batch
+            x1 = batch["feats1"]
+            x2 = batch["feats2"]
+            sizes1 = batch["orig_embed_dim1"]
+            sizes2 = batch["orig_embed_dim2"]
+            seq_lens1 = batch["seq_lens1"]
+            seq_lens2 = batch["seq_lens2"]
             x1 = x1.to(dtype=torch.float32)
             x2 = x2.to(dtype=torch.float32)
             sizes1 = sizes1.to(dtype=torch.long)
             sizes2 = sizes2.to(dtype=torch.long)
-            seq_len1 = seq_len1.to(dtype=torch.long)
-            seq_len2 = seq_len2.to(dtype=torch.long)
+            seq_lens1 = seq_lens1.to(dtype=torch.long)
+            seq_lens2 = seq_lens2.to(dtype=torch.long)
             
             with accelerator.autocast():
                 loss = model(x1, x2, input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
-                           seq_lengths_1=seq_len1, seq_lengths_2=seq_len2, m=curr_m)
+                           seq_lengths_1=seq_lens1, seq_lengths_2=seq_lens2, m=curr_m)
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
             # Gradient clipping to prevent exploding gradients
@@ -162,7 +168,6 @@ def main(args, cfg):
                     state,
                     os.path.join(
                         cfg["train"]["save_ckpt_path"],
-                        CURR_TIME,
                         f"medslim_test_run_MRNet-epoch{e+1}.pth.tar",
                     ),
                 )
@@ -221,8 +226,18 @@ if __name__ == "__main__":
     template = template_env.from_string(str(cfg_data))
     # Render the template with the values from the config_data
     cfg = yaml.safe_load(template.render(**cfg_data))
-    save_dir = f"{cfg['train']['save_ckpt_path']}/{CURR_TIME}" 
-    Path(save_dir).mkdir(parents=True, exist_ok=True)
-    with open(os.path.join(save_dir, f"config.yaml"), "w") as f:
-        yaml.dump(cfg, f, sort_keys=False, default_flow_style=False)
+    
+    # If continual training, use the same directory as the loaded checkpoint; otherwise create a new saved checkpoint folder
+    if args.resume:
+        save_dir = str(Path(args.resume).parent)
+        print(f"Resuming from checkpoint, saving to existing directory: {save_dir}")
+    else:
+        save_dir = f"{cfg['train']['save_ckpt_path']}/{CURR_TIME}"
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        with open(os.path.join(save_dir, "config.yaml"), "w") as f:
+            yaml.dump(cfg, f, sort_keys=False, default_flow_style=False)
+    
+    # Update config with the resolved save directory
+    cfg["train"]["save_ckpt_path"] = save_dir
+    
     main(args, cfg)

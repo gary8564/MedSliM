@@ -1,8 +1,8 @@
 """
 Linear Probing Evaluation for pretrained MedSliM SSL Model.
 
-- Single-view classification: Train classifier on one view plane
-- Multi-view classification: MRNet-style logistic regression ensemble
+- Single-view classification: Train linear classifier head
+- Multi-view classification: 
   1. Train independent single-view classifiers for each view plane
   2. Collect predictions from each view
   3. Fit logistic regression on stacked predictions
@@ -38,7 +38,7 @@ from med_slim.data.feat_dataset import (
     FeatClassificationDataset, 
     MultiViewFeatClassificationDataset,
     linear_classifier_collate_fn,
-    multiview_collate_fn,
+    multiview_classifier_collate_fn,
 )
 from med_slim.eval.load_cobra import load_pretrained_cobra
 from med_slim.utils.callbacks.early_stopping import EarlyStopping
@@ -449,6 +449,7 @@ def train_single_view_classifier(
     accelerator: Accelerator,
     output_dir: str,
     class_weights: Optional[torch.Tensor] = None,
+    view_prefix: Optional[str] = None,
 ) -> Dict:
     """
     Train single-view classifier.
@@ -461,6 +462,7 @@ def train_single_view_classifier(
         accelerator: HuggingFace Accelerator
         output_dir: Output directory for checkpoints
         class_weights: Optional class weights for loss
+        view_prefix: Optional prefix for wandb logging (e.g., "axial", "coronal") to separate plots in multi-view evaluation
     
     Returns:
         Dict with best_model, best_val_auroc
@@ -515,16 +517,20 @@ def train_single_view_classifier(
         # Log to wandb
         if accelerator.is_main_process:
             current_lr = scheduler.get_last_lr()[0]
+            
+            # Add view prefix for multi-view logging to separate plots
+            prefix = f"{view_prefix}/" if view_prefix else ""
+            
             log_dict = {
-                "lr": current_lr,
-                "train/loss_per_epoch": avg_train_loss,
-                "val/loss_per_epoch": avg_val_loss,
-                "epoch": epoch + 1,
+                f"{prefix}lr": current_lr,
+                f"{prefix}train/loss_per_epoch": avg_train_loss,
+                f"{prefix}val/loss_per_epoch": avg_val_loss,
+                f"{prefix}epoch": epoch + 1,
             }
             for name, value in train_metrics.items():
-                log_dict[f"train/{name}"] = value
+                log_dict[f"{prefix}train/{name}"] = value
             for name, value in val_metrics.items():
-                log_dict[f"val/{name}"] = value
+                log_dict[f"{prefix}val/{name}"] = value
             wandb.log(log_dict)
             if epoch % 10 == 0:
                 print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.4f}, val_loss={avg_val_loss:.4f}, val_auroc={val_auroc:.4f}")
@@ -747,10 +753,9 @@ def run_single_view_evaluation(
 
 
 # =============================================================================
-# Multi-View Logistic Regression Ensemble (MRNet-style)
+# Multi-View Logistic Regression Ensemble
 # =============================================================================
-
-def train_single_view_and_collect_predictions(
+def collect_predictions_per_view_classifier(
     cobra_model: Cobra,
     train_subset: Subset,
     val_subset: Subset,
@@ -760,11 +765,9 @@ def train_single_view_and_collect_predictions(
     accelerator: Accelerator,
     output_dir: str,
     class_weights: Optional[torch.Tensor] = None,
-) -> Dict[str, np.ndarray]:
+) -> Dict:
     """
-    Train a single-view classifier and collect predictions on val/test sets.
-    
-    This is used by the logistic regression ensemble to get per-view predictions.
+    Train a single-view classifier to get per-view predictions on validation and test sets for logistic regression ensemble.
     
     Returns:
         Dict with val_probs, val_labels, test_probs, test_labels, sample_ids
@@ -811,11 +814,11 @@ def train_single_view_and_collect_predictions(
     )
     
     # Create view-specific output directory
-    view_output_dir = os.path.join(output_dir, f"single_view_{view_plane}")
+    view_output_dir = os.path.join(output_dir, f"{view_plane}")
     if accelerator.is_main_process:
         os.makedirs(view_output_dir, exist_ok=True)
     
-    # Train
+    # Train with view prefix for multi-view wandb logging
     training_results = train_single_view_classifier(
         model=model,
         train_loader=train_loader,
@@ -824,6 +827,7 @@ def train_single_view_and_collect_predictions(
         accelerator=accelerator,
         output_dir=view_output_dir,
         class_weights=class_weights,
+        view_prefix=view_plane, 
     )
     
     best_model = training_results["best_model"]
@@ -889,7 +893,7 @@ def train_logistic_ensemble(
     X_train: np.ndarray,
     y_train: np.ndarray,
     task: str,
-) -> LogisticRegression:
+) -> LogisticRegression or List[LogisticRegression]:
     """
     Train logistic regression ensemble on stacked view predictions.
     
@@ -899,13 +903,41 @@ def train_logistic_ensemble(
         task: Task type (binary, multiclass, multilabel)
     
     Returns:
-        Trained LogisticRegression model
+        Trained LogisticRegression model(s)
     """
     if task == "multilabel":
-        # For multilabel, train separate logistic regression for each label
-        # This returns a list but we'll handle it specially
-        raise NotImplementedError("Multilabel logistic ensemble not yet supported. Use binary or multiclass.")
+        # For multilabel, train separate binary logistic regression for each label
+        # Each label gets probabilities from all views: [N, num_views]
+        num_labels = y_train.shape[1]
+        if X_train.shape[1] % num_labels != 0:
+            raise ValueError(f"X_train shape {X_train.shape} should be divisible by num_labels {num_labels}")
+        num_views = X_train.shape[1] // num_labels
+        ensembles = []
+        for label_idx in range(num_labels):
+            # Extract probabilities for this label from all views
+            # X_train shape: [N, num_views * num_labels] with order [view1_label1, ..., view1_labelN, view2_label1, ..., view2_labelN, view3_label1, ..., view3_labelN]
+            # We need to extract columns [label_idx, num_labels + label_idx, 2 * num_labels + label_idx]
+            X_label = np.column_stack([
+                X_train[:, view_idx * num_labels + label_idx] 
+                for view_idx in range(num_views)
+            ])
+            
+            # Binary labels for this specific label
+            y_label = y_train[:, label_idx]
+            
+            # Train binary logistic regression for this label
+            ensemble = LogisticRegression(
+                solver="lbfgs",
+                max_iter=1000,
+                random_state=42,
+                class_weight="balanced", # Handle class imbalance
+            )
+            ensemble.fit(X_label, y_label)
+            ensembles.append(ensemble)
+        
+        return ensembles
     
+    # Binary or multiclass: single logistic regression
     ensemble = LogisticRegression(
         solver="lbfgs",
         max_iter=1000,
@@ -918,7 +950,7 @@ def train_logistic_ensemble(
 
 
 def evaluate_logistic_ensemble(
-    ensemble: LogisticRegression,
+    ensemble: LogisticRegression or List[LogisticRegression],
     X: np.ndarray,
     y: np.ndarray,
     sample_ids: List,
@@ -930,13 +962,41 @@ def evaluate_logistic_ensemble(
     """
     Evaluate logistic regression ensemble and return metrics.
     
+    Args:
+        ensemble: LogisticRegression model or a list of LogisticRegression models for multilabel
+        X: Stacked predictions
+        y: Labels
+        task: Task type
+        target_labels: List of label names
+        view_planes: List of view plane names
+        output_dir: Optional output directory
+    
     Returns:
         Dict with predictions DataFrame, metrics, and ensemble weights
     """
     # Get predictions
     if task == "binary":
         y_prob = ensemble.predict_proba(X)[:, 1]
+    elif task == "multilabel":
+        # For multilabel, get predictions from each label's ensemble
+        num_labels = len(target_labels)
+        num_views = len(view_planes)
+        y_prob_list = []
+        
+        for label_idx, ensemble_label in enumerate(ensemble):
+            # Extract probabilities for this label from all views
+            X_label = np.column_stack([
+                X[:, view_idx * num_labels + label_idx] 
+                for view_idx in range(num_views)
+            ])
+            # Get probability of positive class for this label
+            y_prob_label = ensemble_label.predict_proba(X_label)[:, 1]
+            y_prob_list.append(y_prob_label)
+        
+        # Stack: [N, num_labels]
+        y_prob = np.column_stack(y_prob_list)
     else:
+        # Multiclass
         y_prob = ensemble.predict_proba(X)
     
     # Compute predictions and metrics
@@ -949,11 +1009,40 @@ def evaluate_logistic_ensemble(
         output_dir=output_dir,
     )
     
-    # Add ensemble weights (interpretability)
-    ensemble_weights = {
-        plane: float(ensemble.coef_[0][i]) for i, plane in enumerate(view_planes)
-    }
-    ensemble_weights["intercept"] = float(ensemble.intercept_[0])
+    # Add ensemble weights for interpretability
+    if task == "binary":
+        # Binary: single coefficient per view
+        ensemble_weights = {
+            plane: float(ensemble.coef_[0][i]) for i, plane in enumerate(view_planes)
+        }
+        ensemble_weights["intercept"] = float(ensemble.intercept_[0])
+    elif task == "multilabel":
+        # Multilabel: separate weights per label
+        num_labels = len(target_labels)
+        num_views = len(view_planes)
+        ensemble_weights = {}
+        
+        for label_idx, (label_name, ensemble_label) in enumerate(zip(target_labels, ensemble)):
+            label_weights = {
+                plane: float(ensemble_label.coef_[0][view_idx]) 
+                for view_idx, plane in enumerate(view_planes)
+            }
+            label_weights["intercept"] = float(ensemble_label.intercept_[0])
+            ensemble_weights[label_name] = label_weights
+    else:
+        # Multiclass: coefficients per class
+        num_classes = len(target_labels)
+        num_views = len(view_planes)
+        ensemble_weights = {}
+        for class_idx, class_name in enumerate(target_labels):
+            class_weights = {}
+            for view_idx, plane in enumerate(view_planes):
+                # For multiclass, features are concatenated: [view1_class1, view1_class2, ..., view2_class1, ...]
+                feature_idx = view_idx * num_classes + class_idx
+                class_weights[plane] = float(ensemble.coef_[class_idx][feature_idx])
+            class_weights["intercept"] = float(ensemble.intercept_[class_idx])
+            ensemble_weights[class_name] = class_weights
+    
     eval_results["ensemble_weights"] = ensemble_weights
     
     return eval_results
@@ -961,8 +1050,8 @@ def evaluate_logistic_ensemble(
 
 def run_multiview_logistic_ensemble(
     cobra_model: Cobra,
-    train_dataset: FeatClassificationDataset,
-    test_dataset: FeatClassificationDataset,
+    train_datasets: Dict[str, FeatClassificationDataset],
+    test_datasets: Dict[str, FeatClassificationDataset],
     cfg: Dict,
     accelerator: Accelerator,
     output_dir: str,
@@ -970,7 +1059,7 @@ def run_multiview_logistic_ensemble(
     class_weights: Optional[torch.Tensor] = None,
 ) -> Dict:
     """
-    Run multi-view evaluation using MRNet-style logistic regression ensemble.
+    Run multi-view evaluation using logistic regression ensemble.
     
     Pipeline:
     1. For each view plane:
@@ -980,37 +1069,38 @@ def run_multiview_logistic_ensemble(
     3. Fit LogisticRegression on validation predictions
     4. Evaluate ensemble on test set
     
-    This approach follows the MRNet paper methodology for multi-view fusion.
+    Args:
+        cobra_model: Pretrained COBRA model
+        train_datasets: Dict mapping view_plane -> FeatClassificationDataset for training
+        test_datasets: Dict mapping view_plane -> FeatClassificationDataset for testing
+        cfg: Configuration dict
+        accelerator: HuggingFace Accelerator
+        output_dir: Output directory
+        view_planes: List of view plane names
+        class_weights: Optional class weights
     """
     hyperparams = cfg["hyperparams"]
     task = cfg["task"]
     target_labels = cfg["target_labels"]
-    feat_dir = cfg["feat_dataset"]["feat_dir"]
-    
-    # Get model names from pretrain config
-    pretrain_config_path = Path(cfg["checkpoint_path"]).parent / "config.yaml"
-    with open(pretrain_config_path, "r") as f:
-        pretrain_cfg = yaml.safe_load(f)
-    model_names = pretrain_cfg["feat_dataset"]["model_name"]
     
     if accelerator.is_main_process:
         logger.info(f"\n{'='*50}")
-        logger.info("Multi-view Logistic Regression Ensemble (MRNet-style)")
+        logger.info("Multi-view Logistic Regression Ensemble")
         logger.info(f"View planes: {view_planes}")
         logger.info(f"{'='*50}")
     
     # Create consistent train/val split (same across all views)
-    all_labels = np.array([train_dataset._get_label(sid).numpy() for sid in train_dataset.sample_ids])
+    all_labels = np.array([train_datasets[view_planes[0]]._get_label(sid).numpy() for sid in train_datasets[view_planes[0]].sample_ids])
     val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
     
     if task == "multilabel":
         n_splits = max(2, int(1.0 / val_split_ratio))
         kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        splits = list(kfold.split(X=np.arange(len(train_dataset)), y=all_labels))
+        splits = list(kfold.split(X=np.arange(len(train_datasets[view_planes[0]])), y=all_labels))
         train_idx, val_idx = splits[0]
     else:
         train_idx, val_idx = train_test_split(
-            np.arange(len(train_dataset)),
+            np.arange(len(train_datasets[view_planes[0]])),
             test_size=val_split_ratio,
             stratify=all_labels,
             random_state=42,
@@ -1021,7 +1111,6 @@ def run_multiview_logistic_ensemble(
     
     # Step 1: Train single-view classifiers and collect predictions for each view
     view_predictions = {}
-    individual_aurocs = {}
     
     for plane in view_planes:
         if accelerator.is_main_process:
@@ -1029,37 +1118,19 @@ def run_multiview_logistic_ensemble(
             logger.info(f"Training single-view classifier for: {plane}")
             logger.info(f"{'='*50}")
         
-        # Create single-view datasets for this plane
-        train_dataset_plane = FeatClassificationDataset(
-            feat_dir=feat_dir,
-            slice_encoder_models=model_names,
-            view_plane=plane,
-            split="train",
-            annotations_path=cfg["train_annots"],
-            task=task,
-            target_columns=target_labels,
-        )
-        
-        test_dataset_plane = FeatClassificationDataset(
-            feat_dir=feat_dir,
-            slice_encoder_models=model_names,
-            view_plane=plane,
-            split="test",
-            annotations_path=cfg["test_annots"],
-            task=task,
-            target_columns=target_labels,
-        )
+        train_dataset_view_plane = train_datasets[plane]
+        test_dataset_view_plane = test_datasets[plane]
         
         # Use the same train/val indices for consistency
-        train_subset = Subset(train_dataset_plane, train_idx)
-        val_subset = Subset(train_dataset_plane, val_idx)
+        train_subset = Subset(train_dataset_view_plane, train_idx)
+        val_subset = Subset(train_dataset_view_plane, val_idx)
         
         # Train and collect predictions
-        predictions = train_single_view_and_collect_predictions(
+        predictions = collect_predictions_per_view_classifier(
             cobra_model=cobra_model,
             train_subset=train_subset,
             val_subset=val_subset,
-            test_dataset=test_dataset_plane,
+            test_dataset=test_dataset_view_plane,
             view_plane=plane,
             cfg=cfg,
             accelerator=accelerator,
@@ -1068,7 +1139,6 @@ def run_multiview_logistic_ensemble(
         )
         
         view_predictions[plane] = predictions
-        individual_aurocs[plane] = predictions["best_val_auroc"]
         
         if accelerator.is_main_process:
             logger.info(f"{plane} view - Val AUROC: {predictions['best_val_auroc']:.4f}")
@@ -1080,19 +1150,34 @@ def run_multiview_logistic_ensemble(
     # Step 2: Stack predictions
     # For binary: X = [prob_view1, prob_view2, prob_view3] -> shape [N, num_views]
     # For multiclass: X = [probs_view1, probs_view2, ...] -> shape [N, num_views * num_classes]
+    # For multilabel: X = [view1_label1, view1_label2, ..., view2_label1, ...] -> shape [N, num_views * num_labels]
     
     if task == "binary":
         X_val = np.column_stack([view_predictions[p]["val_probs"] for p in view_planes])
         X_test = np.column_stack([view_predictions[p]["test_probs"] for p in view_planes])
+    elif task == "multilabel":
+        # For multilabel, concatenate all probability vectors
+        # Order: [view1_label1, view1_label2, ..., view1_labelN, view2_label1, ...]
+        X_val = np.concatenate([view_predictions[p]["val_probs"] for p in view_planes], axis=1)
+        X_test = np.concatenate([view_predictions[p]["test_probs"] for p in view_planes], axis=1)
     else:
         # For multiclass, concatenate probability vectors
         X_val = np.concatenate([view_predictions[p]["val_probs"] for p in view_planes], axis=1)
         X_test = np.concatenate([view_predictions[p]["test_probs"] for p in view_planes], axis=1)
     
-    # Labels should be the same across all views
+    # Labels and sample IDs should be the same across all views - verify consistency
     y_val = view_predictions[view_planes[0]]["val_labels"]
     y_test = view_predictions[view_planes[0]]["test_labels"]
     test_sample_ids = view_predictions[view_planes[0]]["test_sample_ids"]
+    
+    # Verify consistency across views
+    for plane in view_planes[1:]:
+        assert np.array_equal(y_val, view_predictions[plane]["val_labels"]), \
+            f"Label mismatch between {view_planes[0]} and {plane} views!"
+        assert np.array_equal(y_test, view_predictions[plane]["test_labels"]), \
+            f"Test label mismatch between {view_planes[0]} and {plane} views!"
+        assert test_sample_ids == view_predictions[plane]["test_sample_ids"], \
+            f"Sample ID mismatch between {view_planes[0]} and {plane} views!"
     
     logger.info(f"\n{'='*50}")
     logger.info("Step 3: Fitting Logistic Regression Ensemble")
@@ -1103,11 +1188,26 @@ def run_multiview_logistic_ensemble(
     # Step 3: Fit logistic regression ensemble on validation predictions
     ensemble = train_logistic_ensemble(X_val, y_val, task)
     
-    # Log ensemble weights
     logger.info("\nEnsemble Weights (Logistic Regression Coefficients):")
-    for i, plane in enumerate(view_planes):
-        logger.info(f"  {plane}: {ensemble.coef_[0][i]:.4f}")
-    logger.info(f"  intercept: {ensemble.intercept_[0]:.4f}")
+    if task == "binary":
+        for i, plane in enumerate(view_planes):
+            logger.info(f"  {plane}: {ensemble.coef_[0][i]:.4f}")
+        logger.info(f"  intercept: {ensemble.intercept_[0]:.4f}")
+    elif task == "multilabel":
+        for label_idx, (label_name, ensemble_label) in enumerate(zip(target_labels, ensemble)):
+            logger.info(f"\n  Label: {label_name}")
+            for view_idx, plane in enumerate(view_planes):
+                logger.info(f"    {plane}: {ensemble_label.coef_[0][view_idx]:.4f}")
+            logger.info(f"    intercept: {ensemble_label.intercept_[0]:.4f}")
+    else:
+        num_classes = len(target_labels)
+        num_views = len(view_planes)
+        for class_idx, class_name in enumerate(target_labels):
+            logger.info(f"\n  Class: {class_name}")
+            for view_idx, plane in enumerate(view_planes):
+                feature_idx = view_idx * num_classes + class_idx
+                logger.info(f"    {plane}: {ensemble.coef_[class_idx][feature_idx]:.4f}")
+            logger.info(f"    intercept: {ensemble.intercept_[class_idx]:.4f}")
     
     # Step 4: Evaluate on test set
     logger.info(f"\n{'='*50}")
@@ -1125,9 +1225,6 @@ def run_multiview_logistic_ensemble(
         output_dir=output_dir,
     )
     
-    # Add individual view AUROCs for comparison
-    eval_results["individual_view_aurocs"] = individual_aurocs
-    
     # Save results
     table_dir = os.path.join(output_dir, "table")
     os.makedirs(table_dir, exist_ok=True)
@@ -1139,7 +1236,6 @@ def run_multiview_logistic_ensemble(
     if eval_results["metrics"]:
         save_metrics = prepare_saving_metrics(eval_results["metrics"], task)
         save_metrics["ensemble_weights"] = eval_results["ensemble_weights"]
-        save_metrics["individual_view_aurocs"] = individual_aurocs
         
         with open(os.path.join(table_dir, "metrics.json"), "w") as f:
             json.dump(save_metrics, f, indent=4)
@@ -1150,26 +1246,24 @@ def run_multiview_logistic_ensemble(
         wandb.run.summary["test_auroc"] = auroc
         wandb.run.summary["test_auprc"] = auprc
         
-        for plane in view_planes:
-            wandb.run.summary[f"ensemble_weight_{plane}"] = eval_results["ensemble_weights"][plane]
-            wandb.run.summary[f"individual_auroc_{plane}"] = individual_aurocs[plane]
-        
         logger.info(f"\nTest AUROC: {auroc:.4f}, Test AUPRC: {auprc:.4f}")
         logger.info(f"Ensemble weights: {eval_results['ensemble_weights']}")
-        logger.info(f"Individual view AUROCs: {individual_aurocs}")
     
-    # Save ensemble model
+    # Save ensemble model(s)
     ensemble_path = os.path.join(output_dir, "ckpt", "logistic_ensemble.pkl")
     os.makedirs(os.path.dirname(ensemble_path), exist_ok=True)
     with open(ensemble_path, "wb") as f:
         pickle.dump(ensemble, f)
-    logger.info(f"Ensemble model saved to: {ensemble_path}")
+    if task == "multilabel":
+        logger.info(f"Ensemble models ({len(ensemble)} labels) saved to: {ensemble_path}")
+    else:
+        logger.info(f"Ensemble model saved to: {ensemble_path}")
     
     return eval_results
 
 
 # =============================================================================
-# Legacy Multi-View Training (Attention-based - kept for reference)
+# Attention-based Multi-View Inference
 # =============================================================================
 def train_multiview_classifier(
     model: MultiViewClassifier,
@@ -1421,11 +1515,11 @@ def run_multiview_evaluation(
     
     # Create dataloaders
     train_loader = DataLoader(train_subset, batch_size=hyperparams["batch_size"], shuffle=True,
-                              collate_fn=multiview_collate_fn, num_workers=hyperparams.get("num_workers", 0))
+                              collate_fn=multiview_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
     val_loader = DataLoader(val_subset, batch_size=hyperparams["batch_size"], shuffle=False,
-                            collate_fn=multiview_collate_fn, num_workers=hyperparams.get("num_workers", 0))
+                            collate_fn=multiview_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
     test_loader = DataLoader(test_dataset, batch_size=hyperparams["batch_size"], shuffle=False,
-                             collate_fn=multiview_collate_fn, num_workers=hyperparams.get("num_workers", 0))
+                             collate_fn=multiview_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
     
     # Get dimensions
     num_classes = get_num_classes(task, cfg["target_labels"], train_dataset)
@@ -1582,37 +1676,40 @@ def main(args):
     
     # Run evaluation
     if use_multiview:
-        # Multi-view with logistic regression ensemble (MRNet-style)
+        # Multi-view with logistic regression ensemble
         if accelerator.is_main_process:
-            logger.info(f"Using multi-view logistic regression ensemble (MRNet-style)")
+            logger.info(f"Using multi-view logistic regression ensemble")
             logger.info(f"View planes: {view_planes}")
         
-        # Create a reference single-view dataset (just for getting sample IDs and labels)
-        # The actual per-view datasets are created inside run_multiview_logistic_ensemble
-        reference_train_dataset = FeatClassificationDataset(
-            feat_dir=cfg["feat_dataset"]["feat_dir"],
-            slice_encoder_models=model_names,
-            view_plane=view_planes[0],  # Use first plane as reference
-            split="train",
-            annotations_path=cfg["train_annots"],
-            task=cfg["task"],
-            target_columns=cfg["target_labels"],
-        )
+        # Create datasets for all views once
+        train_datasets = {}
+        test_datasets = {}
         
-        reference_test_dataset = FeatClassificationDataset(
-            feat_dir=cfg["feat_dataset"]["feat_dir"],
-            slice_encoder_models=model_names,
-            view_plane=view_planes[0],
-            split="test",
-            annotations_path=cfg["test_annots"],
-            task=cfg["task"],
-            target_columns=cfg["target_labels"],
-        )
+        for plane in view_planes:
+            train_datasets[plane] = FeatClassificationDataset(
+                feat_dir=cfg["feat_dataset"]["feat_dir"],
+                slice_encoder_models=model_names,
+                view_plane=plane,
+                split="train",
+                annotations_path=cfg["train_annots"],
+                task=cfg["task"],
+                target_columns=cfg["target_labels"],
+            )
+            
+            test_datasets[plane] = FeatClassificationDataset(
+                feat_dir=cfg["feat_dataset"]["feat_dir"],
+                slice_encoder_models=model_names,
+                view_plane=plane,
+                split="test",
+                annotations_path=cfg["test_annots"],
+                task=cfg["task"],
+                target_columns=cfg["target_labels"],
+            )
         
         eval_results = run_multiview_logistic_ensemble(
             cobra_model=cobra_model,
-            train_dataset=reference_train_dataset,
-            test_dataset=reference_test_dataset,
+            train_datasets=train_datasets,
+            test_datasets=test_datasets,
             cfg=cfg,
             accelerator=accelerator,
             output_dir=output_dir,

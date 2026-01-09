@@ -1,5 +1,5 @@
 # Path to pretrained MedSliM checkpoint
-checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet/2025-12-02-03:07/medslim_test_run_MRNet-epoch2000.pth.tar"
+checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-01-09-04:57/medslim_test_run_MRNet-epoch2000.pth.tar"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 
 feat_dataset:
@@ -17,7 +17,7 @@ output_dir: "/hpcwork/rwth1833/experiments/MedSliM-linear-probing"
 # Classification task settings
 task: "binary" # "binary", "multiclass", "multilabel"
 target_labels:
-  - "acl" # "acl", "meniscus"
+  - "meniscus" # "acl", "meniscus"
 
 # Hyperparameters
 hyperparams:

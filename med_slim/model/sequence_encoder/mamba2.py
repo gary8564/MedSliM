@@ -76,14 +76,13 @@ class Mamba2Enc(nn.Module):
     def forward(self, x):
         if len(x.shape) == 2:
             x = x.expand(1, -1, -1)
-        h = x  # .float()
 
-        h = self._fc1(h)
+        h = self._fc1(x)
 
         for layer in self.layers:
             h_ = h
-            h = layer[0](h)
-            h = layer[1](h)
+            h = layer[0](h) # LayerNorm
+            h = layer[1](h) # Mamba2
             h = h + h_
 
         logits = self.classifier(h)

@@ -6,3 +6,4 @@ stdout_*.txt
 .pytest_cache
 .DS_Store
 wandb
+scripts/download_dataset

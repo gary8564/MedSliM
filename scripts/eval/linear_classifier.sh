@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G 
 #SBATCH --time=4:00:00                 
-#SBATCH --job-name=lp_binary_classification_single_view_meniscus_slice32
-#SBATCH --output=stdout_lp_binary_classification_single_view_meniscus_slice32.txt    
+#SBATCH --job-name=lp_binary_classification_meniscus_slice_32
+#SBATCH --output=stdout_lp_binary_classification_meniscus_slice32_%j.txt    
 #SBATCH --account=rwth1833    
 
 ### Setup
