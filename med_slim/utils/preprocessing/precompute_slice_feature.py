@@ -1,6 +1,7 @@
 import argparse
 import os
 import glob
+import logging
 import torch
 import numpy as np
 import nibabel as nib
@@ -14,8 +15,12 @@ from med_slim.model.slice_encoder import build_slice_encoder
 from med_slim.data.slice_dataset import SliceDataset, slice_collate_fn
 from med_slim.utils.preprocessing.transforms import get_transforms
 
-def get_num_slices(data_dir: str, split: str, plane: str) -> int:
-    nifti_file_paths = glob.glob(os.path.join(data_dir, split, plane, '*.nii.gz'))
+def get_num_slices(data_dir: str, split: str, plane: str, mri_sequence: Optional[str] = None) -> int:
+    if mri_sequence:
+        pattern = os.path.join(data_dir, split, mri_sequence, plane, '*.nii.gz')
+    else:
+        pattern = os.path.join(data_dir, split, plane, '*.nii.gz')
+    nifti_file_paths = glob.glob(pattern)
     num_slices = []
     for nifti_file_path in nifti_file_paths:
         image = nib.load(nifti_file_path).get_fdata()
@@ -35,6 +40,7 @@ def main():
     parser.add_argument("--ark-checkpoint", type=str, default=None, help="Ark checkpoint path (required if --model-name ark).")
     parser.add_argument("--local-cache-dir", type=str, default=None, help="Local cache directory to store the model.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Dataset split to precompute.")
+    parser.add_argument("--mri-sequence", type=str, default=None, choices=["t2", "pd", "t2_fs", "pd_fs"], help="MRI sequence type with dataset containing multiple sequences.")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader workers")
     # parser.add_argument("--batch-size", type=int, default=8, help="Number of studies per batch")
     args = parser.parse_args()
@@ -49,10 +55,14 @@ def main():
         _, image_transforms = get_transforms(model_name=args.model_name)
     else:
         batch_size = 4
-        num_slices = args.num_slices if args.num_slices is not None else get_num_slices(args.data_dir, args.split, args.plane)
+        num_slices = args.num_slices if args.num_slices is not None else get_num_slices(args.data_dir, args.split, args.plane, args.mri_sequence)
         _, image_transforms = get_transforms(model_name=args.model_name, num_slices=num_slices)
     
-    out_dir = Path(args.save_dir) / f"slices_{num_slices}" / args.model_name / args.split / args.plane
+    # Build output directory path (with optional mri_sequence subfolder)
+    if args.mri_sequence:
+        out_dir = Path(args.save_dir) / f"slices_{num_slices}" / args.model_name / args.split / args.mri_sequence / args.plane
+    else:
+        out_dir = Path(args.save_dir) / f"slices_{num_slices}" / args.model_name / args.split / args.plane
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ds = SliceDataset(
@@ -60,6 +70,7 @@ def main():
         split=args.split,
         transform=image_transforms,
         plane=args.plane,
+        mri_sequence=args.mri_sequence,
     )
     
     data_loader = DataLoader(
@@ -81,14 +92,16 @@ def main():
 
             # Save one file per case in the batch
             for i, uid in enumerate(uids):
-                save_path = out_dir / f"{uid:04d}.safetensors"
+                save_path = out_dir / f"{uid}.safetensors"
                 tensor_dict = {"feats": feats[i].to(dtype=torch.float16)}  
                 metadata = {
-                    "uid": str(int(uid)),
+                    "uid": str(uid),
                     "plane": str(args.plane),
                     "model_name": str(args.model_name),
                     "num_slices": str(num_slices),
                 }
+                if args.mri_sequence:
+                    metadata["mri_sequence"] = str(args.mri_sequence)
                 save_file(tensor_dict, str(save_path), metadata=metadata)
 
 

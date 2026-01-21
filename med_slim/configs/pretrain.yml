@@ -1,7 +1,19 @@
 feat_dataset:
+  # Each dataset can optionally specify mri_sequences if it has sequence subfolders
+  # Directory structure without mri_sequences: {feat_dir}/{model}/{split}/{plane}/*.safetensors
+  # Directory structure with mri_sequences: {feat_dir}/{model}/{split}/{mri_sequence}/{plane}/*.safetensors
   datasets:
     - name: mrnet
-      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw"
+    - name: kneeMRI
+      feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw"
+    # - name: fastMRI
+    #   feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw"
+    #   mri_sequences:  # fastMRI has multiple MRI sequences
+    #     - "t2"
+    #     - "pd"
+    #     - "t2_fs"
+    #     - "pd_fs"
   model_name: 
     - "dinov2"
     - "rad-dino"
@@ -54,14 +66,19 @@ model:
       repo: "/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
 
   cobra:
-    embed_dim: 1536 # 768, 1024, 1536
-    contrast_dim: 1024
+    embed_dim: 1024 # 768, 1024, 1536
+    contrast_dim: 256
     input_dims: [768, 1024, 1536, 1152, 512, 1376]
     num_heads: 8
-    num_mamba_layers: 20 # 2, 6, 20
-    mamba_d_state: 128
+    num_layers: 2 # 2, 6, 20
     dropout: 0.2
-    attn_dim: 1024
+    # Mamba2-specific
+    mamba_d_state: 128
+    # Transformer-specific
+    transformer_rotary_positional_encoding: "RoPE"  # "RoPE" or "LiRE" 
+    transformer_norm_first: true  # Pre-LN transformer
+    # ABMIL-specific
+    attn_dim: 256
 
 train:
   momentum: 0.99

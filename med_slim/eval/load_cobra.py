@@ -2,7 +2,7 @@ import torch
 import logging
 import os
 from accelerate import Accelerator
-from typing import List, Dict
+from typing import Dict, Optional
 
 from med_slim.model.sequence_encoder.cobra import Cobra
 from med_slim.logging.setup import init_logging
@@ -10,21 +10,30 @@ from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
 
-def load_pretrained_cobra(checkpoint_path: str, 
-                          accelerator: Accelerator, 
-                          model_config: Dict,
-                          encoder_type: str = "momentum") -> Cobra:
+
+def load_pretrained_cobra(
+    checkpoint_path: str, 
+    accelerator: Accelerator, 
+    model_config: Dict,
+    encoder_type: str = "momentum",
+    fm_pooling: str = "mean",
+    sequence_encoder: Optional[str] = None,
+    slice_pooling: Optional[str] = None,
+) -> Cobra:
     """
     Load the COBRA model from a pretrained checkpoint.
 
     Parameters:
     - checkpoint_path (str): Path to the model checkpoint file.
     - accelerator (Accelerator): HuggingFace Accelerator.
-    - model_config (Dict): Dictionary containing the model configuration.
+    - model_config (Dict): Dictionary containing the model configuration from pretrain config.
     - encoder_type (str): Choose between "base" and "momentum" encoder for downstream tasks. Default is "momentum".
+    - fm_pooling (str): Feature aggregation method. Default is "mean".
+    - sequence_encoder (str, optional): Override sequence encoder type. If None, uses checkpoint or defaults to "mamba2".
+    - slice_pooling (str, optional): Override slice pooling type. If None, uses saved checkpoint.
 
     Returns:
-    - Cobra: The loaded COBRA model.
+    - Cobra: The loaded COBRA model in inference mode.
     
     Raises:
     - FileNotFoundError: If the checkpoint file is not found.
@@ -32,28 +41,66 @@ def load_pretrained_cobra(checkpoint_path: str,
     """
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file {checkpoint_path} not found")
+    
     state_dict = torch.load(checkpoint_path, map_location=accelerator.device, weights_only=False)
-    model = Cobra(input_dims=model_config["input_dims"], 
-                  embed_dim=model_config["embed_dim"],
-                  contrast_dim=model_config["contrast_dim"],
-                  num_heads=model_config["num_heads"],
-                  layer=model_config["num_mamba_layers"],
-                  dropout=model_config["dropout"],
-                  att_dim=model_config["attn_dim"],
-                  d_state=model_config["mamba_d_state"],
-                  mode="inference")
-    if "state_dict" in list(state_dict.keys()):
-        chkpt = state_dict["state_dict"]
-        cobra_weights = {
-            k.split(f"{encoder_type}_encoder.")[-1]: v 
-            for k, v in chkpt.items() 
-            if f"{encoder_type}_encoder" in k and f"{encoder_type}_encoder.proj" not in k
-        }
-        if len(cobra_weights) == 0:
-            raise ValueError(f"No {encoder_type} encoder weights found in checkpoint.")
+    if sequence_encoder is None:
+        sequence_encoder = state_dict["sequence_encoder"]
+    if slice_pooling is None:
+        slice_pooling = state_dict["pooling"]
+    logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}")
+    
+    # Build encoder-specific kwargs
+    encoder_kwargs = {}
+    
+    embed_dim = model_config["embed_dim"]
+    
+    if sequence_encoder == "mamba2":
+        encoder_kwargs["d_state"] = model_config.get("mamba_d_state", 128)
     else:
+        encoder_kwargs["rotary_positional_encoding"] = model_config["transformer_rotary_positional_encoding"]
+        encoder_kwargs["norm_first"] = model_config["transformer_norm_first"]
+        encoder_kwargs["dim_feedforward"] = model_config.get(
+            "transformer_dim_feedforward", 
+            4 * embed_dim
+        )
+    
+    # att_dim is needed for ABMIL slice pooling and FM attention pooling
+    if slice_pooling == "abmil" or fm_pooling == "attention":
+        encoder_kwargs["att_dim"] = model_config["attn_dim"]
+    
+    num_layers = model_config["num_layers"] if "num_layers" in model_config else model_config["num_mamba_layers"]
+    
+    # Create model in inference mode
+    model = Cobra(
+        input_dims=model_config["input_dims"], 
+        embed_dim=embed_dim,
+        contrast_dim=model_config["contrast_dim"],
+        num_heads=model_config["num_heads"],
+        num_layers=num_layers,
+        dropout=model_config["dropout"],
+        mode="inference",
+        sequence_encoder=sequence_encoder,
+        fm_pooling=fm_pooling,
+        slice_pooling=slice_pooling,
+        **encoder_kwargs,
+    )
+    
+    # Extract encoder weights from checkpoint
+    if "state_dict" not in list(state_dict.keys()):
         raise ValueError(f"`state_dict` key not found in saved model checkpoint {checkpoint_path}.")
+    
+    chkpt = state_dict["state_dict"]
+    cobra_weights = {
+        k.split(f"{encoder_type}_encoder.")[-1]: v 
+        for k, v in chkpt.items() 
+        if f"{encoder_type}_encoder" in k and f"{encoder_type}_encoder.proj" not in k
+    }
+    
+    if len(cobra_weights) == 0:
+        raise ValueError(f"No {encoder_type} encoder weights found in checkpoint.")
+    
     # strict=False: proj layer exists in pretrained model but excluded from checkpoint (not used in inference mode)
     model.load_state_dict(cobra_weights, strict=False)
     logger.info(f"{encoder_type.capitalize()} COBRA model loaded successfully.")
+    
     return model

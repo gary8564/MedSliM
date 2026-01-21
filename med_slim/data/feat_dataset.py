@@ -152,11 +152,22 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
 
 class PrecomputedFeatPairDataset(Dataset):
     """
-    Dataset of constructing precomputed feature positivepairs at the exam level, which are used for contrastive learning.
+    Dataset of constructing precomputed feature positive pairs at the exam level, which are used for contrastive learning.
     For multi-plane views, the concept of "same-plane positives" is implemented:
     when forming a pair, enforce both views to be from the same plane; 
     use all planes across the dataset but don't mix within a pair.
     
+    Supports two directory structures:
+    1. Without mri_sequences: {feat_dir}/{model}/{split}/{plane}/*.safetensors
+    2. With mri_sequences: {feat_dir}/{model}/{split}/{mri_sequence}/{plane}/*.safetensors
+    
+    When mri_sequences is provided:
+    - cross_sequence_positive=False (default): study_id = "{dataset}_{mri_seq}_{exam_id}"
+      Each sequence is treated as a separate study. Pairs are always from the same sequence.
+    - cross_sequence_positive=True: study_id = "{dataset}_{exam_id}"
+      Features from all sequences of the same exam are pooled together.
+      Pairs can be from different MRI sequences (e.g., T2 and PD of same knee).
+      This teaches the model that different sequences of the same anatomy are related.
     """
     def __init__(self, 
                  feat_dirs: List[Dict[str, str]], 
@@ -171,27 +182,84 @@ class PrecomputedFeatPairDataset(Dataset):
         self.view_planes = view_planes
         self.split = split
         self.max_feature_dim = max_feature_dim
-        self.feat_path_dict = self._get_feat_path_dict_by_study_id()
-        self.study_ids = list(self.feat_path_dict.keys())
         self.mri_sequences = mri_sequences
         self.cross_sequence_positive = cross_sequence_positive
+        self.feat_path_dict = self._get_feat_path_dict_by_study_id()
+        self.study_ids = list(self.feat_path_dict.keys())
         
     def _get_feat_path_dict_by_study_id(self):
-        # TODO: handle cross-sequence positive case
+        """
+        Build a dictionary mapping study_id -> view_plane -> list of feature file paths.
+        
+        For datasets WITHOUT mri_sequences:
+            key = "{dataset_name}_{exam_id}"
+            
+        For datasets WITH mri_sequences:
+            - cross_sequence_positive=False: key = "{dataset_name}_{mri_sequence}_{exam_id}"
+              Each sequence is treated as a separate study.
+            - cross_sequence_positive=True: key = "{dataset_name}_{exam_id}"
+              Features from all sequences are pooled under the same exam_id.
+        """
         feat_path_dict = defaultdict(lambda: defaultdict(list))
         logger.info(f'Selected slice encoder models: {self.slice_encoder_models}')
         logger.info(f'Selected view planes: {self.view_planes}')
-        for dataset in tqdm(self.feat_dirs, leave=False):
-            dataset_name, feat_dir = dataset["name"], dataset["feat_dir"]
-            for model_name in tqdm(self.slice_encoder_models, leave=False):
-                for view_plane in tqdm(self.view_planes, leave=False):
-                    feat_path = os.path.join(feat_dir, model_name, self.split, view_plane)
-                    feat_files = glob(os.path.join(feat_path, "*.safetensors"))
-                    assert len(feat_files) > 0, f"couldnt find any feat files in path {feat_path} for model {model_name} and view plane {view_plane}!"
-                    for feat_file in feat_files:
-                        exam_id = int(os.path.basename(feat_file).split(".")[0])
-                        feat_path_dict[f"{dataset_name}_{exam_id}"][view_plane].append(feat_file)
-        return feat_path_dict
+        if self.mri_sequences:
+            logger.info(f'Selected MRI sequences: {self.mri_sequences}')
+            logger.info(f'Cross-sequence positives: {self.cross_sequence_positive}')
+        
+        for dataset in tqdm(self.feat_dirs, desc="Loading precomputed feature datasets...", leave=False):
+            dataset_name = dataset["name"]
+            feat_dir = dataset["feat_dir"]
+            # Check if this dataset uses mri_sequences via config
+            dataset_mri_sequences = dataset.get("mri_sequences", self.mri_sequences)
+            
+            for model_name in tqdm(self.slice_encoder_models, desc=f"Loading {dataset_name} features from FMs...", leave=False):
+                for view_plane in self.view_planes:
+                    if dataset_mri_sequences:
+                        for mri_seq in dataset_mri_sequences:
+                            feat_path = os.path.join(feat_dir, model_name, self.split, mri_seq, view_plane)
+                            if not os.path.exists(feat_path):
+                                raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
+                            feat_files = glob(os.path.join(feat_path, "*.safetensors"))
+                            assert len(feat_files) > 0, f"Couldn't find any feat files in path {feat_path}!"
+                            for feat_file in feat_files:
+                                exam_id = os.path.basename(feat_file).split(".")[0]
+                                if self.cross_sequence_positive:
+                                    # Pool all sequences under the same exam_id
+                                    study_id = f"{dataset_name}_{exam_id}"
+                                else:
+                                    # Keep each sequence as a separate study
+                                    study_id = f"{dataset_name}_{mri_seq}_{exam_id}"
+                                feat_path_dict[study_id][view_plane].append(feat_file)
+                    else:
+                        # Dataset without MRI sequences
+                        feat_path = os.path.join(feat_dir, model_name, self.split, view_plane)
+                        if not os.path.exists(feat_path):
+                            raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
+                        feat_files = glob(os.path.join(feat_path, "*.safetensors"))
+                        assert len(feat_files) > 0, f"Couldn't find any feat files in path {feat_path}!"
+                        for feat_file in feat_files:
+                            exam_id = os.path.basename(feat_file).split(".")[0]
+                            study_id = f"{dataset_name}_{exam_id}"
+                            feat_path_dict[study_id][view_plane].append(feat_file)
+        
+        # Filter out studies that don't have valid feature files
+        valid_studies = {}
+        num_expected_files = len(self.slice_encoder_models)
+        
+        for study_id, planes_dict in feat_path_dict.items():
+            valid_planes = {
+                plane: files for plane, files in planes_dict.items()
+                if len(files) >= num_expected_files
+            }
+            # Study is valid if it has at least one valid plane
+            if valid_planes:
+                valid_studies[study_id] = valid_planes
+        
+        if len(valid_studies) == 0:
+            raise ValueError("No valid studies found!")
+
+        return valid_studies
 
     def _pad_feature_dim(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -218,26 +286,38 @@ class PrecomputedFeatPairDataset(Dataset):
 
     def __getitem__(self, idx):
         study_id = self.study_ids[idx]
-        selected_view_plane = random.choice(self.view_planes)
-        assert len(self.feat_path_dict[study_id][selected_view_plane]) == len(self.slice_encoder_models)
+        
+        # Select a random view plane from the study
+        available_planes = list(self.feat_path_dict[study_id].keys())
+        selected_view_plane = random.choice(available_planes)
+        assert len(available_planes) == len(self.slice_encoder_models)
         idx1 = np.random.randint(0, len(self.slice_encoder_models))
         idx2 = np.random.randint(0, len(self.slice_encoder_models))
         feat_path1 = self.feat_path_dict[study_id][selected_view_plane][idx1]
         feat_path2 = self.feat_path_dict[study_id][selected_view_plane][idx2]
         feats1, metadata1 = self._load_feats(feat_path1)
         feats2, metadata2 = self._load_feats(feat_path2)
+        
         assert metadata1["plane"] == metadata2["plane"], \
             f"Expected plane to be equal, but got {metadata1['plane']} and {metadata2['plane']}!"
+        
         slice_seq_len1 = feats1.shape[0]
         slice_seq_len2 = feats2.shape[0]
-        # TODO: if cross_sequence_positive is True, we can allow different sequence lengths
-        assert slice_seq_len1 == slice_seq_len2, \
-            f"Expected number of slices to be equal, but got {slice_seq_len1} and {slice_seq_len2} for study {study_id} and view plane {selected_view_plane}!"
+        
+        if not self.cross_sequence_positive:
+            assert slice_seq_len1 == slice_seq_len2, \
+                f"Expected number of slices to be equal, but got {slice_seq_len1} and {slice_seq_len2} for study {study_id} and view plane {selected_view_plane}!"
+        
         with torch.no_grad():
             # pad feature dimension to max_feature_dim
             feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
             feats2, orig_embed_dim2 = self._pad_feature_dim(feats2) 
-        assert feats1.shape == feats2.shape, f"Expected shapes to be equal, but got {feats1.shape} and {feats2.shape}!"
+        
+        # Note: 
+        # Shapes may differ in seq_len dimension when cross_sequence_positive=True, but embed_dim should be the same after padding
+        assert feats1.shape[1] == feats2.shape[1], \
+            f"Expected embed_dim to be equal, but got {feats1.shape[1]} and {feats2.shape[1]}!"
+        
         return {
             "feats1": feats1,
             "feats2": feats2,
@@ -266,6 +346,10 @@ class FeatClassificationDataset(Dataset):
     linear probing evaluation of the SSL model.
     
     When multiple slice_encoder_models are provided, returns features from all encoders.
+    
+    Supports two directory structures:
+    1. Without mri_sequence: {feat_dir}/{model_name}/{split}/{plane}/*.safetensors
+    2. With mri_sequence: {feat_dir}/{model_name}/{split}/{mri_sequence}/{plane}/*.safetensors
     """
     def __init__(self,
                  feat_dir: str,
@@ -274,11 +358,13 @@ class FeatClassificationDataset(Dataset):
                  split: str,
                  annotations_path: str,
                  task: str,
-                 target_columns: List[str]):
+                 target_columns: List[str],
+                 mri_sequence: Optional[str] = None):
         """
         Args:
             feat_dir: Directory containing precomputed features organized as:
-                      feat_dir/{model_name}/{split}/{plane}/*.safetensors
+                      feat_dir/{model_name}/{split}/{plane}/*.safetensors (without mri_sequence)
+                      feat_dir/{model_name}/{split}/{mri_sequence}/{plane}/*.safetensors (with mri_sequence)
             slice_encoder_models: List of slice encoder model names (e.g., ["dinov2", "rad-dino"])
                                   If single model, pass as ["dinov2"]
             view_plane: Which view plane to use (e.g., "sagittal", "axial", "coronal")
@@ -288,6 +374,8 @@ class FeatClassificationDataset(Dataset):
             target_columns: List of column names to use as classification targets
                            For binary/multiclass: single column.
                            For multilabel: multiple columns.
+            mri_sequence: Optional MRI sequence type (e.g., "t2", "pd"). If provided, features
+                         are loaded from {feat_dir}/{model}/{split}/{mri_sequence}/{plane}/
         """
         # Validate task
         if task not in ["binary", "multiclass", "multilabel"]:
@@ -301,10 +389,21 @@ class FeatClassificationDataset(Dataset):
         self.slice_encoder_models = slice_encoder_models
         self.view_plane = view_plane
         self.split = split
+        self.mri_sequence = mri_sequence
         
         # Load labels
         self.df_labels = pd.read_csv(annotations_path)
         self.df_labels.set_index("ID", inplace=True)
+        
+        # Validate target columns exist in the DataFrame
+        missing_cols = [col for col in target_columns if col not in self.df_labels.columns]
+        if missing_cols:
+            available_cols = list(self.df_labels.columns)
+            raise ValueError(
+                f"Target columns {missing_cols} not found in annotations file. "
+                f"Available columns: {available_cols}"
+            )
+        
         self.sample_ids = list(self.df_labels.index.astype(int))
         
         # Build feature paths for all encoders and verify consistency
@@ -312,7 +411,10 @@ class FeatClassificationDataset(Dataset):
         self.id_filename_map = {}
         
         for model_name in self.slice_encoder_models:
-            feat_path = os.path.join(feat_dir, model_name, split, view_plane)
+            if mri_sequence:
+                feat_path = os.path.join(feat_dir, model_name, split, mri_sequence, view_plane)
+            else:
+                feat_path = os.path.join(feat_dir, model_name, split, view_plane)
             if not os.path.exists(feat_path):
                 raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
             self.feat_paths[model_name] = feat_path
@@ -381,6 +483,10 @@ class MultiViewFeatClassificationDataset(Dataset):
     Dataset for multi-view classification using precomputed slice features.
     Returns features from all view planes for each sample to enable end-to-end
     multi-view training.
+    
+    Supports two directory structures:
+    1. Without mri_sequence: {feat_dir}/{model_name}/{split}/{plane}/*.safetensors
+    2. With mri_sequence: {feat_dir}/{model_name}/{split}/{mri_sequence}/{plane}/*.safetensors
     """
     def __init__(self,
                  feat_dir: str,
@@ -389,7 +495,8 @@ class MultiViewFeatClassificationDataset(Dataset):
                  split: str,
                  annotations_path: str,
                  task: str,
-                 target_columns: List[str]):
+                 target_columns: List[str],
+                 mri_sequence: Optional[str] = None):
         """
         Args:
             feat_dir: Directory containing precomputed features
@@ -399,6 +506,8 @@ class MultiViewFeatClassificationDataset(Dataset):
             annotations_path: Path to the annotation CSV file
             task: Classification task type ("binary", "multiclass", or "multilabel")
             target_columns: List of column names to use as classification targets
+            mri_sequence: Optional MRI sequence type (e.g., "t2", "pd"). If provided, features
+                         are loaded from {feat_dir}/{model}/{split}/{mri_sequence}/{plane}/
         """
         if task not in ["binary", "multiclass", "multilabel"]:
             raise ValueError(f"`task` must be 'binary', 'multiclass', or 'multilabel', got '{task}'")
@@ -411,10 +520,21 @@ class MultiViewFeatClassificationDataset(Dataset):
         self.slice_encoder_models = slice_encoder_models
         self.view_planes = view_planes
         self.split = split
+        self.mri_sequence = mri_sequence
         
         # Load labels
         self.df_labels = pd.read_csv(annotations_path)
         self.df_labels.set_index("ID", inplace=True)
+        
+        # Validate target columns exist in the DataFrame
+        missing_cols = [col for col in target_columns if col not in self.df_labels.columns]
+        if missing_cols:
+            available_cols = list(self.df_labels.columns)
+            raise ValueError(
+                f"Target columns {missing_cols} not found in annotations file. "
+                f"Available columns: {available_cols}"
+            )
+        
         self.sample_ids = list(self.df_labels.index.astype(int))
         
         # Build feature paths for all encoders and views
@@ -424,7 +544,10 @@ class MultiViewFeatClassificationDataset(Dataset):
         for view_plane in self.view_planes:
             self.feat_paths[view_plane] = {}
             for model_name in self.slice_encoder_models:
-                feat_path = os.path.join(feat_dir, model_name, split, view_plane)
+                if mri_sequence:
+                    feat_path = os.path.join(feat_dir, model_name, split, mri_sequence, view_plane)
+                else:
+                    feat_path = os.path.join(feat_dir, model_name, split, view_plane)
                 if not os.path.exists(feat_path):
                     raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
                 self.feat_paths[view_plane][model_name] = feat_path

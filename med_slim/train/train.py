@@ -29,6 +29,24 @@ from med_slim.data import PrecomputedFeatPairDataset, ssl_collate_fn
 
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 
+
+def validate_args(args) -> None:
+    """Validate arguments parser."""
+    valid_encoders = ["mamba2", "transformer"]
+    valid_poolings = ["abmil", "cls"]
+    
+    if args.sequence_encoder not in valid_encoders:
+        raise ValueError(f"Invalid sequence_encoder '{args.sequence_encoder}'. Must be one of {valid_encoders}")
+    
+    if args.pooling not in valid_poolings:
+        raise ValueError(f"Invalid pooling '{args.pooling}'. Must be one of {valid_poolings}")
+    
+    if args.sequence_encoder == "mamba2" and args.pooling == "cls":
+        raise ValueError(
+            "Invalid configuration: mamba2 encoder cannot use 'cls' pooling. "
+            "CLS token pooling requires transformer encoder. "
+        )
+
 def main(args, cfg):
 
     accelerator = Accelerator()
@@ -43,23 +61,43 @@ def main(args, cfg):
 
     # Initialize Weights & Biases on main process
     if accelerator.is_main_process:
+        run_name = f"test-run-MRNet-{args.sequence_encoder}-{args.pooling}-{CURR_TIME}"
         wandb.init(
             project="MedSliM-pretraining",
-            name="test-run-MRNet",
+            name=run_name,
         )
 
+    # Validate encoder/pooling combination
+    sequence_encoder = args.sequence_encoder
+    pooling = args.pooling
+    
+    # Build encoder-specific kwargs
+    cobra_cfg = cfg["model"]["cobra"]
+    encoder_kwargs = {}
+    
+    if sequence_encoder == "mamba2":
+        encoder_kwargs["d_state"] = cobra_cfg.get("mamba_d_state", 128)
+    else:
+        encoder_kwargs["rotary_positional_encoding"] = cobra_cfg.get("transformer_rotary_positional_encoding", None)
+        encoder_kwargs["norm_first"] = cobra_cfg.get("transformer_norm_first", True)
+        encoder_kwargs["dim_feedforward"] = cobra_cfg.get("transformer_dim_feedforward", 4 * cobra_cfg["embed_dim"])
+    
+    if pooling == "abmil":
+        encoder_kwargs["att_dim"] = cobra_cfg.get("attn_dim", 256)
+    
     # Build model
     print("Creating model...")
     model = MoCo(
-        embed_dim=cfg["model"]["cobra"]["embed_dim"],
-        contrast_dim=cfg["model"]["cobra"]["contrast_dim"],
-        input_dims=cfg["model"]["cobra"]["input_dims"],
-        num_heads=cfg["model"]["cobra"]["num_heads"],
-        num_mamba_layers=cfg["model"]["cobra"]["num_mamba_layers"],
+        embed_dim=cobra_cfg["embed_dim"],
+        contrast_dim=cobra_cfg["contrast_dim"],
+        input_dims=cobra_cfg["input_dims"],
+        num_heads=cobra_cfg["num_heads"],
+        num_layers=cobra_cfg["num_layers"],
         T=cfg["train"]["temperature"],
-        dropout=cfg["model"]["cobra"]["dropout"],
-        att_dim=cfg["model"]["cobra"]["attn_dim"],
-        d_state=cfg["model"]["cobra"]["mamba_d_state"],
+        dropout=cobra_cfg["dropout"],
+        sequence_encoder=sequence_encoder,
+        pooling=pooling,
+        **encoder_kwargs,
     )
 
     model_params = sum(p.numel() for p in model.parameters())
@@ -163,13 +201,13 @@ def main(args, cfg):
                     "epoch": e + 1,
                     "state_dict": accelerator.unwrap_model(model).state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "sequence_encoder": sequence_encoder,
+                    "pooling": pooling,
                 }
+                ckpt_name = f"medslim-epoch{e+1}.pth.tar"
                 torch.save(
                     state,
-                    os.path.join(
-                        cfg["train"]["save_ckpt_path"],
-                        f"medslim_test_run_MRNet-epoch{e+1}.pth.tar",
-                    ),
+                    os.path.join(cfg["train"]["save_ckpt_path"], ckpt_name),
                 )
 
 
@@ -213,7 +251,24 @@ if __name__ == "__main__":
         metavar="PATH",
         help="Path to latest checkpoint",
     )
+    parser.add_argument(
+        "--sequence-encoder",
+        type=str,
+        choices=["mamba2", "transformer"],
+        default="mamba2",
+        help="Sequence encoder model: 'mamba2' (default) or 'transformer'",
+    )
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        choices=["abmil", "cls"],
+        default="abmil",
+        help="Pooling method: 'abmil' (default) or 'cls'. Note: 'cls' requires transformer encoder.",
+    )
     args = parser.parse_args()
+    
+    # Validate arg parser
+    validate_args(args)
     
     # Get the directory of the current script
     curr_dir = Path(__file__).resolve().parent

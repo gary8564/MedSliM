@@ -8,7 +8,7 @@ from med_slim.model.sequence_encoder.cobra import Cobra
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def test_cobra_forward_pass():
+def test_cobra_mamba2_forward_pass():
     batch_size = 4
     num_slices = 16
     input_dim = 768
@@ -20,11 +20,11 @@ def test_cobra_forward_pass():
         contrast_dim=contrast_dim,
         input_dims=[512, 768, 1024, 1152, 1376],
         num_heads=4,
-        layer=1,
+        num_layers=1,
         dropout=0.1,
-        att_dim=128,
-        d_state=64,
         mode="train",
+        d_state=64,
+        att_dim=128,
     ).to(DEVICE).eval()
 
     x = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
@@ -35,7 +35,7 @@ def test_cobra_forward_pass():
     assert torch.isfinite(y).all()
 
 
-def test_cobra_attention_shape():
+def test_cobra_abmil_attention_shape():
     batch_size = 2
     num_slices = 10
     input_dim = 768
@@ -45,11 +45,11 @@ def test_cobra_attention_shape():
         contrast_dim=128,
         input_dims=[768],
         num_heads=2,
-        layer=1,
+        num_layers=1,
         dropout=0.0,
-        att_dim=64,
-        d_state=32,
         mode="train",
+        d_state=32,
+        att_dim=64,
     ).to(DEVICE).eval()
 
     x = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
@@ -58,6 +58,152 @@ def test_cobra_attention_shape():
     assert isinstance(attn, torch.Tensor)
     assert attn.shape == (batch_size, 1, num_slices)
     assert torch.isfinite(attn).all()
+
+def test_cobra_variable_slice_seq_lengths():
+    """
+    If seq_lengths is provided, padded slice positions should be ignored by:
+    - the Transformer encoder via src_key_padding_mask (True = padded)
+    - the ABMIL pooling attention via mask (True = valid)
+    """
+    batch_size = 2
+    max_slices = 8
+    input_dim = 768
+    contrast_dim = 128
+
+    model = Cobra(
+        embed_dim=input_dim,
+        contrast_dim=contrast_dim,
+        input_dims=[input_dim],
+        num_heads=2,
+        num_layers=1,
+        dropout=0.0,
+        mode="train",
+        sequence_encoder="transformer",
+        att_dim=64,
+    ).to(DEVICE).eval()
+
+    seq_lengths = torch.tensor([3, 6], dtype=torch.long, device=DEVICE)
+
+    x = torch.randn(batch_size, max_slices, input_dim, device=DEVICE)
+    x_alt = x.clone()
+    # Heavily perturb padded positions only (should not affect output if masking works)
+    x_alt[0, 3:, :] = torch.randn_like(x_alt[0, 3:, :]) * 50.0 + 100.0
+    x_alt[1, 6:, :] = torch.randn_like(x_alt[1, 6:, :]) * 50.0 + 100.0
+
+    with torch.no_grad():
+        y1 = model(x, seq_lengths=seq_lengths)
+        y2 = model(x_alt, seq_lengths=seq_lengths)
+        attn = model(x, seq_lengths=seq_lengths, get_attention=True)
+
+    assert y1.shape == (batch_size, contrast_dim)
+    assert torch.isfinite(y1).all() and torch.isfinite(y2).all()
+    assert torch.allclose(y1, y2, atol=1e-5, rtol=1e-5)
+
+    # Padded positions should get ~0 attention probability
+    assert attn.shape == (batch_size, 1, max_slices)
+    assert torch.allclose(attn[0, 0, 3:], torch.zeros_like(attn[0, 0, 3:]), atol=1e-6, rtol=0.0)
+    assert torch.allclose(attn[1, 0, 6:], torch.zeros_like(attn[1, 0, 6:]), atol=1e-6, rtol=0.0)
+
+def test_cobra_transformer_cls_pooling():
+    """
+    Test transformer + CLS token pooling.
+    The CLS token should aggregate information from all valid slices.
+    Padded positions should be ignored via src_key_padding_mask.
+    """
+    batch_size = 2
+    max_slices = 8
+    input_dim = 768
+    contrast_dim = 128
+
+    model = Cobra(
+        embed_dim=input_dim,
+        contrast_dim=contrast_dim,
+        input_dims=[input_dim],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="train",
+        sequence_encoder="transformer",
+        pooling="cls",
+    ).to(DEVICE).eval()
+
+    # Verify CLS token exists and ABMIL modules don't
+    assert model.cls_token is not None
+    assert model.cls_token.shape == (1, 1, input_dim)
+    assert model.attn is None 
+
+    seq_lengths = torch.tensor([3, 6], dtype=torch.long, device=DEVICE)
+
+    x = torch.randn(batch_size, max_slices, input_dim, device=DEVICE)
+    x_alt = x.clone()
+    # Heavily perturb padded positions (should not affect output if masking works)
+    x_alt[0, 3:, :] = torch.randn_like(x_alt[0, 3:, :]) * 50.0 + 100.0
+    x_alt[1, 6:, :] = torch.randn_like(x_alt[1, 6:, :]) * 50.0 + 100.0
+
+    with torch.no_grad():
+        y1 = model(x, seq_lengths=seq_lengths)
+        y2 = model(x_alt, seq_lengths=seq_lengths)
+
+    assert y1.shape == (batch_size, contrast_dim)
+    assert torch.isfinite(y1).all() and torch.isfinite(y2).all()
+    # Outputs should be identical since padded positions are masked
+    assert torch.allclose(y1, y2, atol=1e-5, rtol=1e-5)
+
+
+def test_cobra_transformer_cls_attention():
+    """
+    Test attention extraction for CLS pooling.
+    Should return attention weights from CLS token to slice tokens.
+    """
+    batch_size = 2
+    max_slices = 8
+    input_dim = 768
+
+    model = Cobra(
+        embed_dim=input_dim,
+        contrast_dim=128,
+        input_dims=[input_dim],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="train",
+        sequence_encoder="transformer",
+        pooling="cls",
+    ).to(DEVICE).eval()
+
+    seq_lengths = torch.tensor([3, 6], dtype=torch.long, device=DEVICE)
+    x = torch.randn(batch_size, max_slices, input_dim, device=DEVICE)
+
+    with torch.no_grad():
+        attn = model(x, seq_lengths=seq_lengths, get_attention=True)
+
+    # Should return attention in same format as ABMIL: [B, 1, num_slices]
+    assert attn.shape == (batch_size, 1, max_slices)
+    assert torch.isfinite(attn).all()
+    
+    # Padded positions should get ~0 attention
+    assert torch.allclose(attn[0, 0, 3:], torch.zeros_like(attn[0, 0, 3:]), atol=1e-6, rtol=0.0)
+    assert torch.allclose(attn[1, 0, 6:], torch.zeros_like(attn[1, 0, 6:]), atol=1e-6, rtol=0.0)
+    
+    # Valid positions should sum to ~1
+    assert torch.allclose(attn[0, 0, :3].sum(), torch.tensor(1.0, device=DEVICE), atol=1e-5)
+    assert torch.allclose(attn[1, 0, :6].sum(), torch.tensor(1.0, device=DEVICE), atol=1e-5)
+
+
+def test_cobra_cls_pooling_requires_transformer():
+    """CLS pooling should raise error when used with mamba2 encoder."""
+    with pytest.raises(ValueError, match="pooling='cls' requires sequence_encoder='transformer'"):
+        Cobra(
+            embed_dim=768,
+            contrast_dim=128,
+            input_dims=[768],
+            num_heads=2,
+            num_layers=1,
+            mode="train",
+            sequence_encoder="mamba2",
+            pooling="cls",
+        )
+
 
 def count_parameters(model):
     """Count total number of learnable parameters in a model"""
@@ -82,11 +228,11 @@ def get_pretrained_cobra_from_huggingface(config: dict):
         contrast_dim=256,  # Not used in inference, but needed for initialization
         input_dims=config['input_dims'],
         num_heads=config['num_heads'],
-        layer=config['layers'],
+        num_layers=config['num_layers'],
         dropout=config['dropout'],
-        att_dim=config['att_dim'],
+        mode="inference",
         d_state=config['d_state'],
-        mode="inference"
+        att_dim=config['att_dim'],
     )
     if "state_dict" in list(state_dict.keys()):
         chkpt = state_dict["state_dict"]
@@ -97,6 +243,7 @@ def get_pretrained_cobra_from_huggingface(config: dict):
     model.load_state_dict(cobra_weights, strict=False)
     return model
 
+
 def test_cobra_parameter_count_vs_original():
     """Test total parameters match with the pretrained model from Hugging Face."""
     # COBRAII configuration (from https://github.com/KatherLab/COBRA/blob/main/cobra/utils/load_cobra.py)
@@ -104,7 +251,7 @@ def test_cobra_parameter_count_vs_original():
         'embed_dim': 768,
         'input_dims': [512, 1024, 1280, 1536],
         'num_heads': 4,
-        'layers': 1,
+        'num_layers': 1,
         'dropout': 0.2,
         'att_dim': 256,
         'd_state': 128,
@@ -115,14 +262,14 @@ def test_cobra_parameter_count_vs_original():
     # Create our implementation with same config 
     our_model = Cobra(
         embed_dim=config['embed_dim'],
-        contrast_dim=256,  # Not in original, but needed for our implementation
+        contrast_dim=256,
         input_dims=config['input_dims'],
         num_heads=config['num_heads'],
-        layer=config['layers'],
+        num_layers=config['num_layers'],
         dropout=config['dropout'],
-        att_dim=config['att_dim'],
-        d_state=config['d_state'],
         mode="inference",
+        d_state=config['d_state'],
+        att_dim=config['att_dim'],
     )
     
     # Count parameters for both models

@@ -253,7 +253,7 @@ class MultiViewClassifier(nn.Module):
         # Classification: [B, embed_dim] -> [B, num_classes]
         logits = self.classifier(aggregated_emb)
         
-        return {"logits": logits, "attention_weights": attention_weights, "view_embeddings": view_embeddings}
+        return {"logits": logits, "attention_weights": attention_weights, "view_embeddings": view_embeddings, "embedding": aggregated_emb}
 
 
 # =============================================================================
@@ -601,7 +601,7 @@ def evaluate_single_view_classifier(
     all_logits = accelerator.gather_for_metrics(torch.cat(all_logits, dim=0))
     all_labels = accelerator.gather_for_metrics(torch.cat(all_labels, dim=0))
     
-    # Only compute metrics on main process (sample_ids gathered via dataloader)
+    # Only compute metrics on main process
     if not accelerator.is_main_process:
         return {"predictions": None, "metrics": None}
     
@@ -613,7 +613,7 @@ def evaluate_single_view_classifier(
     else:
         all_probs = F.softmax(all_logits, dim=-1).cpu().numpy()
     
-    return _compute_predictions_and_metrics(
+    eval_results = _compute_predictions_and_metrics(
         all_probs=all_probs,
         all_true=all_labels.cpu().numpy(),
         sample_ids=all_sample_ids,
@@ -621,6 +621,8 @@ def evaluate_single_view_classifier(
         target_labels=target_labels,
         output_dir=output_dir,
     )
+    
+    return eval_results
 
 
 def run_single_view_evaluation(
@@ -1441,10 +1443,6 @@ def evaluate_multiview_classifier(
     else:
         all_probs = F.softmax(all_logits, dim=-1).cpu().numpy()
     
-    # Compute predictions and metrics
-    if not accelerator.is_main_process:
-        return {"predictions": None, "metrics": None, "attention_weights": None, "view_planes": None}
-    
     eval_results = _compute_predictions_and_metrics(
         all_probs=all_probs,
         all_true=all_labels.cpu().numpy(),
@@ -1454,7 +1452,7 @@ def evaluate_multiview_classifier(
         output_dir=output_dir,
     )
     
-    # Store attention for analysis
+    # Store attention weights for interpretability
     eval_results["attention_weights"] = all_attention.cpu().numpy()
     eval_results["view_planes"] = accelerator.unwrap_model(model).view_planes
     
@@ -1620,8 +1618,14 @@ def main(args):
     with open(args.linear_classifier_config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    # Get view plane(s) from config
+    # Get view plane(s) and model names from config
     view_planes = cfg["feat_dataset"]["plane"]
+    if args.fm_model_names:
+        model_names = args.fm_model_names.split()  
+    else:
+        model_names = cfg["feat_dataset"]["model_name"]
+    if isinstance(model_names, str):
+        model_names = [model_names]
     use_multiview = len(view_planes) > 1
 
     # Create output directory
@@ -1648,20 +1652,25 @@ def main(args):
         )
     
     # Load pretrained COBRA model
+    checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg["checkpoint_path"]
+    
     if accelerator.is_main_process:
         logger.info("Loading pretrained COBRA model...")
+        logger.info(f"Checkpoint path: {checkpoint_path}")
     
-    pretrain_config_path = Path(cfg["checkpoint_path"]).parent / "config.yaml"
+    pretrain_config_path = Path(checkpoint_path).parent / "config.yaml"
     with open(pretrain_config_path, "r") as f:
         pretrain_cfg = yaml.safe_load(f)
     cobra_cfg = pretrain_cfg["model"]["cobra"]
-    model_names = pretrain_cfg["feat_dataset"]["model_name"]
     
     cobra_model = load_pretrained_cobra(
-        checkpoint_path=cfg["checkpoint_path"],
+        checkpoint_path=checkpoint_path,
         accelerator=accelerator,
         model_config=cobra_cfg,
         encoder_type=cfg["encoder_type"],
+        fm_pooling=args.fm_pooling,
+        sequence_encoder=args.sequence_encoder,  
+        slice_pooling=args.slice_pooling, 
     )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
@@ -1772,9 +1781,42 @@ if __name__ == "__main__":
         help="Path to the linear classifier config file"
     )
     parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help="Path to pretrained COBRA checkpoint. Overrides config file if provided."
+    )
+    parser.add_argument(
+        "--fm-model-names",
+        type=str,
+        default=None,
+        help="Foundation model names for slice feature extraction. If not provided, uses model names from config file."
+    )
+    parser.add_argument(
         "--weighted-loss",
         action="store_true",
         help="Use weighted loss for training"
+    )
+    parser.add_argument(
+        "--sequence-encoder",
+        type=str,
+        choices=["mamba2", "transformer"],
+        default=None,
+    )
+    parser.add_argument(
+        "--fm-pooling",
+        type=str,
+        choices=["mean", "concat"],
+        default="mean",
+        help="Foundation model pooling method: 'mean' (average) or 'concat' (concatenate)."
+        # NOTE: 'attention' pooling is not supported for linear probing since fm_attn weights 
+        # are randomly initialized and frozen. Use 'attention' only when fine-tuning COBRA.
+    )
+    parser.add_argument(
+        "--slice-pooling",
+        type=str,
+        choices=["abmil", "cls"],
+        default=None,
     )
     args = parser.parse_args()
     main(args)

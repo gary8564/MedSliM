@@ -1,20 +1,33 @@
 """
-Adapted from https://github.com/KatherLab/COBRA/blob/main/cobra/inference/extract_feats.py
+Feature extraction of MRI/CT volumetric images using COBRA.
 
+Adapted from COBRA (https://github.com/KatherLab/COBRA/blob/main/cobra/inference/extract_feats.py)
+==================================================================================================
+COBRA (Histopathology):                         MedSliM (MRI/CT):
+  tiles                                         slices
+    ↓ ABMIL                                        ↓ ABMIL
+  slide embedding                               volume embedding (per view plane / MRI sequence)
+    ↓ concat + ABMIL                               ↓ concat + ABMIL
+  patient embedding                             patient embedding (multi-view plane / MRI sequence)
+==================================================================================================
+
+References:
 Lenz, Tim, Peter Neidlinger, Marta Ligero, Georg Wölflein, Marko van Treeck and Jakob Nikolas Kather. 
 Unsupervised Foundation Model-Agnostic Slide-Level Representation Learning.
 2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR): 30807-30817, 2024.
 """
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from tqdm import tqdm
+
 from med_slim.model.sequence_encoder.cobra import Cobra
 
 
-def get_cobra_feats(
+def get_volume_feats(
     cobra_model: Cobra,
     dataloader: DataLoader,
     accelerator: Accelerator,
@@ -28,34 +41,159 @@ def get_cobra_feats(
         accelerator: HuggingFace Accelerator
     
     Returns:
-        cobra_feats: [N, embed_dim] tensor of volume-level COBRA features
+        volume_feats: [N, embed_dim] tensor of volume-level features
         labels: [N] tensor of labels
         sample_ids: List of sample IDs
     """
     cobra_model.eval()
-    all_cobra_feats = []
+    all_volume_feats = []
     all_labels = []
     all_sample_ids = []
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Extracting COBRA embeddings", disable=not accelerator.is_main_process):
+        for batch in tqdm(dataloader, desc="Extracting volume embeddings", disable=not accelerator.is_main_process):
             labels = batch["labels"]  
             sample_ids = batch["sample_ids"]
             seq_lengths = batch["seq_lengths"].to(accelerator.device)
             
             # Get features from all encoders and cast to model dtype
-            encoder_feats = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) for f in batch["feature_embeds"]]
+            encoder_feats = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) for f in batch["features"]]
             
-            # COBRA embeds each encoder's features and average them across encoders
-            cobra_feats = cobra_model(encoder_feats, seq_lengths=seq_lengths) 
+            # COBRA embeds each encoder's features and averages them across encoders
+            volume_feats = cobra_model(encoder_feats, seq_lengths=seq_lengths) 
             
             # Cast to float32 for downstream eval 
-            all_cobra_feats.append(cobra_feats.float())
+            all_volume_feats.append(volume_feats.float())
             all_labels.append(labels)
             all_sample_ids.extend(sample_ids)
     
-    cobra_feats = torch.cat(all_cobra_feats, dim=0)
+    volume_feats = torch.cat(all_volume_feats, dim=0)
     labels = torch.cat(all_labels, dim=0)
     
-    return cobra_feats, labels, all_sample_ids
+    return volume_feats, labels, all_sample_ids
 
+
+def get_patient_feats(
+    cobra_model: Cobra,
+    multiview_dataloader: DataLoader,
+    accelerator: Accelerator,
+    aggregation: str = "mean",
+) -> Tuple[torch.Tensor, torch.Tensor, List]:
+    """
+    Extract patient-level embeddings by aggregating multiple volumes.
+    
+    When a patient has multiple view planes (axial, sagittal, coronal) 
+    or multiple MRI sequences (T1, T2, FLAIR), this aggregates them into 
+    a single patient-level embedding.
+    
+    Args:
+        cobra_model: Pretrained COBRA model in inference mode
+        multiview_dataloader: DataLoader yielding batches from MultiViewFeatClassificationDataset
+        accelerator: HuggingFace Accelerator
+        aggregation: aggregation method for view embeddings ("mean" or "max")
+    
+    Returns:
+        patient_feats: [N, embed_dim] tensor of patient-level features
+        labels: [N] tensor of labels
+        sample_ids: List of sample IDs
+    """
+    cobra_model.eval()
+    all_patient_feats = []
+    all_labels = []
+    all_sample_ids = []
+    
+    with torch.no_grad():
+        for batch in tqdm(multiview_dataloader, desc="Extracting patient embeddings", disable=not accelerator.is_main_process):
+            labels = batch["labels"]
+            sample_ids = batch["sample_ids"]
+            features_by_view = batch["features"]
+            seq_lengths_by_view = batch["seq_lengths"]
+            
+            view_names = list(features_by_view.keys())
+            model_dtype = next(cobra_model.parameters()).dtype
+            
+            view_embeddings = []
+            for view_plane in view_names:
+                encoder_feats = [f.to(accelerator.device, dtype=model_dtype) 
+                                for f in features_by_view[view_plane]]
+                seq_lengths = seq_lengths_by_view[view_plane].to(accelerator.device)
+                view_emb = cobra_model(encoder_feats, seq_lengths=seq_lengths)
+                view_embeddings.append(view_emb)
+            
+            stacked_views = torch.stack(view_embeddings, dim=1)
+            
+            if aggregation == "mean":
+                patient_emb = stacked_views.mean(dim=1)
+            elif aggregation == "max":
+                patient_emb = stacked_views.max(dim=1).values
+            else:
+                raise ValueError(f"Unknown aggregation: {aggregation}")
+            
+            all_patient_feats.append(patient_emb.float())
+            all_labels.append(labels)
+            all_sample_ids.extend(sample_ids)
+    
+    patient_feats = torch.cat(all_patient_feats, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+    
+    return patient_feats, labels, all_sample_ids
+
+
+def get_volume_attention(
+    cobra_model: Cobra,
+    dataloader: DataLoader,
+    accelerator: Accelerator,
+    max_samples: Optional[int] = None,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[str], List[int]]:
+    """
+    Extract slice-level attention weights using pretrained COBRA model.
+    
+    Args:
+        cobra_model: Pretrained COBRA model in inference mode (must use ABMIL slice pooling)
+        dataloader: DataLoader yielding batches of slice features
+        accelerator: HuggingFace Accelerator
+        max_samples: Maximum number of samples to process (None = all)
+    
+    Returns:
+        attention_weights: List of attention arrays [num_slices] per sample
+        labels: List of label arrays per sample
+        sample_ids: List of sample IDs
+        seq_lengths: List of sequence lengths
+    """
+    cobra_model.eval()
+    all_attention = []
+    all_labels = []
+    all_sample_ids = []
+    all_seq_lengths = []
+    
+    sample_count = 0
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Extracting attention", disable=not accelerator.is_main_process):
+            seq_lengths = batch["seq_lengths"].to(accelerator.device)
+            features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) 
+                       for f in batch["features"]]
+            
+            # Get attention weights (requires ABMIL slice pooling)
+            attention = cobra_model(features, seq_lengths=seq_lengths, get_attention=True)
+            # attention shape: [B, 1, max_seq_len]
+            attention = attention.squeeze(1).cpu().numpy()  # [B, max_seq_len]
+            
+            batch_size = len(features)
+            for i in range(batch_size):
+                if max_samples and sample_count >= max_samples:
+                    break
+                
+                seq_len = seq_lengths[i].item()
+                attn = attention[i, :seq_len]  # Trim to actual sequence length
+                
+                all_attention.append(attn)
+                all_labels.append(batch["labels"][i].cpu().numpy())
+                all_sample_ids.append(batch["sample_ids"][i])
+                all_seq_lengths.append(seq_len)
+                sample_count += 1
+            
+            if max_samples and sample_count >= max_samples:
+                break
+    
+    return all_attention, all_labels, all_sample_ids, all_seq_lengths

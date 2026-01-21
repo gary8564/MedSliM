@@ -11,6 +11,7 @@ dependencies = [
     "accelerate==1.9.0",
     "causal-conv1d @ git+https://github.com/KatherLab/causal-conv1d.git@b73d1ca0e0726ba6520c38d342bd411bb5850064",
     "datasets==3.3.2",
+    "dcm2niix",
     "einops==0.8.1",
     "grad-cam==1.5.5",
     "hf-transfer",
@@ -49,6 +50,7 @@ dependencies = [
     "torchvision==0.21.0",
     "tqdm==4.67.1",
     "transformers>=4.51.3",
+    "umap-learn>=0.5.11",
     "wandb==0.19.6",
 ]
 

@@ -90,7 +90,13 @@ class ZNormalization(tio.ZNormalization):
   
 
     def _znorm(self, image_data, mask, image_name, image_path, mean, std):
-        cutoff = torch.quantile(image_data.masked_select(mask).float(), torch.tensor(self.percentiles)/100.0)
+        # torch.quantile() fails for tensors > ~16M elements, use numpy for large volumes
+        masked_values = image_data.masked_select(mask).float()
+        if masked_values.numel() > 10_000_000:
+            cutoff = np.quantile(masked_values.cpu().numpy(), np.array(self.percentiles) / 100.0)
+            cutoff = torch.tensor(cutoff, dtype=image_data.dtype, device=image_data.device)
+        else:
+            cutoff = torch.quantile(masked_values, torch.tensor(self.percentiles) / 100.0)
         torch.clamp(image_data, *cutoff.to(image_data.dtype).tolist(), out=image_data)
         if mean is not None and std is not None:
             if std == 0:

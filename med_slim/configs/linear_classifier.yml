@@ -1,5 +1,5 @@
 # Path to pretrained MedSliM checkpoint
-checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-01-09-04:57/medslim_test_run_MRNet-epoch2000.pth.tar"
+checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-01-09-04:53/medslim_test_run_MRNet-epoch2000.pth.tar"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 
 feat_dataset:
@@ -9,6 +9,13 @@ feat_dataset:
     - "sagittal"
     # - "coronal"
     # - "axial"
+  model_name:
+    - "dinov2"
+    # - "rad-dino"
+    # - "dinov3"
+    - "medsiglip"
+    # - "biomedclip"
+    - "ark"
 
 train_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/train.csv"
 test_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/test.csv"
@@ -22,7 +29,7 @@ target_labels:
 # Hyperparameters
 hyperparams:
   batch_size: 16
-  lr: 1e-5
+  lr: 5e-5 #1e-5
   warmup_ratio: 0.1  
   max_epochs: 100
   num_workers: 4
@@ -31,8 +38,8 @@ hyperparams:
   
   # Linear classifier hyperparameters
   linear:
-    hidden_dim: 1024
-    dropout: 0.3
+    hidden_dim: 512 
+    dropout: 0.5
   
   # Multi-view attention aggregator hyperparameters
   attention:

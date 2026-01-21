@@ -13,7 +13,10 @@ An Empirical Study of Training Self-Supervised Vision Transformers.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import List, Optional
+
 from med_slim.model.sequence_encoder.cobra import Cobra
+
 
 @torch.no_grad()
 def concat_all_gather(tensor):
@@ -36,49 +39,59 @@ class MoCo(nn.Module):
     Build a MoCo model with a base encoder, a momentum encoder, and two MLPs
     https://arxiv.org/abs/1911.05722
     """
-    def __init__(self,
-                 embed_dim, 
-                 contrast_dim, 
-                 input_dims=[384, 512, 768, 1024, 1152, 1376],
-                 num_heads=8, 
-                 num_mamba_layers=2, 
-                 T=0.2,
-                 dropout=0.25,
-                 att_dim=256,
-                 d_state=64):
+
+    def __init__(
+        self,
+        embed_dim: int,
+        contrast_dim: int,
+        input_dims: Optional[List[int]] = None,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        T: float = 0.2,
+        dropout: float = 0.25,
+        sequence_encoder: str = "mamba2",
+        pooling: str = "abmil",
+        **kwargs,
+    ):
         """
-        Parameters:
-        embed_dim (int):
-            Dimensionality of the embedding vectors.
-        contrast_dim (int):
-            Dimensionality of the contrastive features.
-        input_dims (list of int, optional):
-            A list of input feature dimensions. Each feature dimension corresponds to a key in the
-            embedding module dictionary. Default is [384, 512, 768, 1024, 1152, 1376].
-        num_heads (int, optional):
-            Number of attention heads. Each head processes a slice of the embedded features.
-            Default is 8.
-        num_mamba_layers (int, optional):
-            Number of layers in the Mamba2Enc encoder. Default is 2.
-        gpu_id (int, optional):
-            GPU ID to use for the model. Default is 0.
-        T (float, optional):
-            Softmax temperature parameter for the contrastive loss. Default is 0.2.
-        dropout (float, optional):
-            Dropout rate used throughout the model to prevent overfitting. Default is 0.25.
-        att_dim (int, optional):
-            The hidden dimensionality for the attention mechanism (BatchedABMIL) per attention head.
-            Default is 256.
-        d_state (int, optional):
-            Dimensionality of the internal state in the Mamba2Enc encoder. Default is 64.
+        Args:
+            embed_dim: Internal embedding dimensionality.
+            contrast_dim: Output dimensionality for contrastive features.
+            input_dims: List of input feature dimensions to support.
+            num_heads: Number of attention heads.
+            num_layers: Number of layers in the sequence encoder.
+            T: Softmax temperature for contrastive loss.
+            dropout: Dropout rate.
+            sequence_encoder: "mamba2" (default) or "transformer".
+            pooling: Slice pooling method - "abmil" (default) or "cls" (requires transformer).
+            **kwargs: Encoder/pooling-specific parameters (passed to Cobra):
+                - d_state (int): Mamba2 internal state dim (default: 128)
+                - dim_feedforward (int): Transformer FFN hidden size (default: 4 * embed_dim)
+                - norm_first (bool): Pre-LN transformer (default: True)
+                - rotary_positional_encoding (str): "RoPE" or None (default: None)
+                - att_dim (int): ABMIL attention hidden dim (default: 256)
         """
         super().__init__()
 
+        if input_dims is None:
+            input_dims = [512, 768, 1024, 1152, 1376, 1536]
+
         self.T = T
-        self.base_encoder = Cobra(embed_dim, contrast_dim, input_dims, num_heads, layer=num_mamba_layers, dropout=dropout,
-                              att_dim=att_dim, d_state=d_state)
-        self.momentum_encoder = Cobra(embed_dim, contrast_dim, input_dims, num_heads, layer=num_mamba_layers, dropout=None,
-                                  att_dim=att_dim,d_state=d_state)
+
+        # Shared encoder kwargs
+        encoder_kwargs = dict(
+            embed_dim=embed_dim,
+            contrast_dim=contrast_dim,
+            input_dims=input_dims,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            sequence_encoder=sequence_encoder,
+            slice_pooling=pooling,
+            **kwargs,
+        )
+
+        self.base_encoder = Cobra(dropout=dropout, **encoder_kwargs)
+        self.momentum_encoder = Cobra(dropout=0.0, **encoder_kwargs)  # No dropout for momentum encoder
         self.predictor = nn.Sequential(
             nn.LayerNorm(contrast_dim),
             nn.Linear(contrast_dim,2 * contrast_dim),
