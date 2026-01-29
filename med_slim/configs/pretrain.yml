@@ -2,9 +2,9 @@ feat_dataset:
   # Directory structure: {feat_dir}/{model}/{split}/{plane}/*.safetensors
   datasets:
     - name: mrnet
-      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw"
     - name: fastMRI
-      feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_32"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw"
   model_name: 
     - "dinov2"
     - "rad-dino"

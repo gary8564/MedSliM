@@ -10,7 +10,7 @@
 #SBATCH --time=72:00:00                 
 #SBATCH --job-name=pretrain_MRNet_fastMRI
 #SBATCH --output=stdout_pretrain_MRNet_fastMRI_%j.txt    
-#SBATCH --account=p0021834    
+#SBATCH --account=rwth1833    
 
 ### Setup
 source .venv/bin/activate
@@ -30,10 +30,16 @@ NUM_GPUS=2
 
 ### Run script with Accelerate for multi-GPU training
 # Use bf16 instead of fp16 for numerical stability
+# Available options:
+#   --collate-mode padded    # Default: pad sequences to max length
+#   --collate-mode packed    # Packed sequences without padding (more memory efficient)
+#   --sequence-encoder mamba2/transformer
+#   --pooling abmil          # abmil (default) or cls (requires transformer encoder)
+#   --compile                # Use torch.compile() for faster training
+#   --resume "${RESUME_PATH}"
+#   --planes ${PLANES}
+
 accelerate launch --num_processes=$NUM_GPUS --mixed_precision=bf16 \
-    ./med_slim/train/train.py
-    # Optional args:
-    # --sequence-encoder transformer 
-    # --pooling cls 
-    # --resume "${RESUME_PATH}" 
-    # --planes ${PLANES} 
+    ./med_slim/train/train.py \
+    --collate-mode packed \
+    --compile

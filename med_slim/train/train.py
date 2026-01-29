@@ -25,7 +25,7 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 import wandb
 
 from med_slim.model.ssl import MoCo
-from med_slim.data import PrecomputedFeatPairDataset, ssl_collate_fn
+from med_slim.data import PrecomputedFeatPairDataset, ssl_collate_fn, ssl_packed_collate_fn
 
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 
@@ -34,6 +34,7 @@ def validate_args(args) -> None:
     """Validate arguments parser."""
     valid_encoders = ["mamba2", "transformer"]
     valid_poolings = ["abmil", "cls"]
+    valid_collate_modes = ["padded", "packed"]
     
     if args.sequence_encoder not in valid_encoders:
         raise ValueError(f"Invalid sequence_encoder '{args.sequence_encoder}'. Must be one of {valid_encoders}")
@@ -45,6 +46,15 @@ def validate_args(args) -> None:
         raise ValueError(
             "Invalid configuration: mamba2 encoder cannot use 'cls' pooling. "
             "CLS token pooling requires transformer encoder. "
+        )
+    
+    if args.collate_mode not in valid_collate_modes:
+        raise ValueError(f"Invalid collate_mode '{args.collate_mode}'. Must be one of {valid_collate_modes}")
+    
+    if args.collate_mode == "packed" and args.pooling == "cls":
+        raise NotImplementedError(
+            "Packed sequences currently don't support CLS pooling. "
+            "Use --pooling abmil with --collate-mode packed."
         )
 
 def main(args, cfg):
@@ -131,9 +141,15 @@ def main(args, cfg):
     if accelerator.num_processes > 1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    # DataLoader
+    # DataLoader with configurable collate function
     per_device_batch_size = max(1, int(global_batch_size / max(1, accelerator.num_processes)))
     print(f"batch_size_per_device={per_device_batch_size}")
+    
+    # Select collate function based on mode
+    use_packed = args.collate_mode == "packed"
+    collate_fn = ssl_packed_collate_fn if use_packed else ssl_collate_fn
+    print(f"Using {'packed' if use_packed else 'padded'} sequence collation")
+    
     loader = DataLoader(
         dataset,
         batch_size=per_device_batch_size,
@@ -141,7 +157,7 @@ def main(args, cfg):
         num_workers=cfg["train"]["num_workers"],
         drop_last=False,
         pin_memory=True,
-        collate_fn=ssl_collate_fn,
+        collate_fn=collate_fn,
     )
 
     # Prepare with accelerator
@@ -160,6 +176,14 @@ def main(args, cfg):
         if args.resume:
             raise FileNotFoundError(f"No checkpoint found at '{args.resume}'")
 
+    # Optional: torch.compile for improved performance
+    if args.compile:
+        print("Compiling model with torch.compile()...")
+        # reduce-overhead: Uses CUDAGraphs when possible for lower overhead
+        # With DDP, CUDAGraphs may be disabled automatically but compilation still works
+        model = torch.compile(model, mode="reduce-overhead")
+        print("Model compiled successfully")
+    
     model.train()
     iters_per_epoch = len(loader)
     for e in tqdm(range(start_epoch, cfg["train"]["num_epochs"]), desc="MedSliM Pre-training...", disable=not accelerator.is_main_process):
@@ -169,23 +193,42 @@ def main(args, cfg):
             curr_lr = adjust_learning_rate(optimizer, e + i / iters_per_epoch, scaled_lr, cfg)
             curr_m = adjust_moco_momentum(e + i / iters_per_epoch, cfg)
 
-            x1 = batch["feats1"]
-            x2 = batch["feats2"]
-            sizes1 = batch["orig_embed_dim1"]
-            sizes2 = batch["orig_embed_dim2"]
-            seq_lens1 = batch["seq_lens1"]
-            seq_lens2 = batch["seq_lens2"]
-            x1 = x1.to(dtype=torch.float32)
-            x2 = x2.to(dtype=torch.float32)
-            sizes1 = sizes1.to(dtype=torch.long)
-            sizes2 = sizes2.to(dtype=torch.long)
-            seq_lens1 = seq_lens1.to(dtype=torch.long)
-            seq_lens2 = seq_lens2.to(dtype=torch.long)
-            
             optimizer.zero_grad(set_to_none=True)
-            with accelerator.autocast():
-                loss = model(x1, x2, input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
-                           seq_lengths_1=seq_lens1, seq_lengths_2=seq_lens2, m=curr_m)
+            
+            if use_packed:
+                # Packed sequence mode
+                x1 = batch["feats1"].to(dtype=torch.float32)
+                x2 = batch["feats2"].to(dtype=torch.float32)
+                cu_seqlens1 = batch["cu_seqlens1"].to(device=device)
+                cu_seqlens2 = batch["cu_seqlens2"].to(device=device)
+                max_seqlen1 = batch["max_seqlen1"]
+                max_seqlen2 = batch["max_seqlen2"]
+                sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
+                sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
+                seq_idx1 = batch["seq_idx1"].to(device=device)
+                seq_idx2 = batch["seq_idx2"].to(device=device)
+                
+                with accelerator.autocast():
+                    loss = model.forward_packed(
+                        x1, x2,
+                        cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+                        max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+                        input_feature_dims_1=sizes1, input_feature_dims_2=sizes2,
+                        seq_idx1=seq_idx1, seq_idx2=seq_idx2,
+                        m=curr_m
+                    )
+            else:
+                # Padded sequence mode
+                x1 = batch["feats1"].to(dtype=torch.float32)
+                x2 = batch["feats2"].to(dtype=torch.float32)
+                sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
+                sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
+                seq_lens1 = batch["seq_lens1"].to(dtype=torch.long)
+                seq_lens2 = batch["seq_lens2"].to(dtype=torch.long)
+                
+                with accelerator.autocast():
+                    loss = model(x1, x2, input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
+                               seq_lengths_1=seq_lens1, seq_lengths_2=seq_lens2, m=curr_m)
             
             # NaN check
             if torch.isnan(loss) or torch.isinf(loss):
@@ -283,6 +326,23 @@ if __name__ == "__main__":
         choices=["abmil", "cls"],
         default="abmil",
         help="Pooling method: 'abmil' (default) or 'cls'. Note: 'cls' requires transformer encoder.",
+    )
+    parser.add_argument(
+        "--collate-mode",
+        type=str,
+        choices=["padded", "packed"],
+        default="padded",
+        dest="collate_mode",
+        help=(
+            "Sequence collation mode: "
+            "'padded' (default) pads all sequences to max length, "
+            "'packed' concatenates sequences without padding for better memory efficiency. "
+        ),
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile() to optimize model for speeding up computation.",
     )
     args = parser.parse_args()
     

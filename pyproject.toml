@@ -9,10 +9,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "accelerate==1.9.0",
+    "editables",
+    "hatchling",
     "causal-conv1d @ git+https://github.com/KatherLab/causal-conv1d.git@b73d1ca0e0726ba6520c38d342bd411bb5850064",
     "datasets==3.3.2",
     "dcm2niix",
     "einops==0.8.1",
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
     "grad-cam==1.5.5",
     "hf-transfer",
     "huggingface_hub==0.34.3",

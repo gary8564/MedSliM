@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def ssl_collate_fn(batch):
     """
-    Custom collate function for PrecomputedFeatPairDataset.
+    Custom collate function for PrecomputedFeatPairDataset when traditional zero-padding approach is considered in SSL pretraining.
     """
     feats1_list = [item["feats1"] for item in batch]
     orig_embed_dims1 = torch.stack([item["orig_embed_dim1"].to(dtype=torch.long) for item in batch], dim=0)
@@ -47,6 +47,86 @@ def ssl_collate_fn(batch):
         "orig_embed_dim2": orig_embed_dims2,
         "seq_lens1": seq_lens1, # [B]
         "seq_lens2": seq_lens2, # [B]
+    }
+
+
+def ssl_packed_collate_fn(batch):
+    """
+    Packed sequence collate function for PrecomputedFeatPairDataset.
+    
+    Instead of padding all sequences to max_seq_len (wasting memory/compute),
+    concatenates all sequences and uses cumulative sequence lengths (cu_seqlens)
+    to track document boundaries.
+    
+    Efficient for:
+    - Mamba2: Uses seq_idx or cu_seqlens to avoid passing states in between
+    - Transformer with FlashAttention/varlen_attn: Uses cu_seqlens for variable-length attention
+    
+    Returns:
+        dict with keys:
+            - feats1: packed features with shape [total_seq_len, max_feat_dim]
+            - feats2: packed features with shape [total_seq_len, max_feat_dim]  
+            - cu_seqlens1: cumulative sequence lengths for view 1 with shape [B+1]
+            - cu_seqlens2: cumulative sequence lengths for view 2 with shape [B+1]
+            - max_seqlen1: max sequence length in batch for view 1
+            - max_seqlen2: max sequence length in batch for view 2
+            - seq_idx1: index for each token with shape [total_seq_len] (needed for Mamba2)
+            - seq_idx2: index for each token with shape [total_seq_len] (needed for Mamba2)
+            - orig_embed_dim1: original embedding dimensions with shape [B]
+            - orig_embed_dim2: original embedding dimensions with shape [B]
+    """
+    feats1_list = [item["feats1"] for item in batch]
+    feats2_list = [item["feats2"] for item in batch]
+    orig_embed_dims1 = torch.stack([item["orig_embed_dim1"].to(dtype=torch.long) for item in batch], dim=0)
+    orig_embed_dims2 = torch.stack([item["orig_embed_dim2"].to(dtype=torch.long) for item in batch], dim=0)
+    
+    batch_size = len(batch)
+    max_embed_dim = feats1_list[0].shape[-1]
+    
+    # Get sequence lengths
+    seq_lens1 = [feat.shape[0] for feat in feats1_list]
+    seq_lens2 = [feat.shape[0] for feat in feats2_list]
+    
+    # Compute cumulative sequence lengths (cu_seqlens)
+    # cu_seqlens[i] = sum of seq_lens[0:i], cu_seqlens[0] = 0, cu_seqlens[-1] = total_seq_len
+    cu_seqlens1 = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens2 = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens1[1:] = torch.cumsum(torch.tensor(seq_lens1, dtype=torch.int32), dim=0)
+    cu_seqlens2[1:] = torch.cumsum(torch.tensor(seq_lens2, dtype=torch.int32), dim=0)
+    
+    total_seq_len1 = cu_seqlens1[-1].item()
+    total_seq_len2 = cu_seqlens2[-1].item()
+    
+    # Pack features: concatenate all sequences along sequence length dimension
+    feats1_packed = torch.zeros(total_seq_len1, max_embed_dim)
+    feats2_packed = torch.zeros(total_seq_len2, max_embed_dim)
+    
+    # Build seq_idx: maps each token to its document index (for Mamba2)
+    seq_idx1 = torch.zeros(total_seq_len1, dtype=torch.int32)
+    seq_idx2 = torch.zeros(total_seq_len2, dtype=torch.int32)
+    
+    for i, (feat1, feat2) in enumerate(zip(feats1_list, feats2_list)):
+        start1, end1 = cu_seqlens1[i].item(), cu_seqlens1[i+1].item()
+        start2, end2 = cu_seqlens2[i].item(), cu_seqlens2[i+1].item()
+        
+        feats1_packed[start1:end1] = feat1
+        feats2_packed[start2:end2] = feat2
+        
+        seq_idx1[start1:end1] = i
+        seq_idx2[start2:end2] = i
+    
+    return {
+        "feats1": feats1_packed,  # [total_seq_len, max_feat_dim]
+        "feats2": feats2_packed,
+        "cu_seqlens1": cu_seqlens1,  # [B+1]
+        "cu_seqlens2": cu_seqlens2,
+        "max_seqlen1": max(seq_lens1),
+        "max_seqlen2": max(seq_lens2),
+        "seq_idx1": seq_idx1,  # [total_seq_len] 
+        "seq_idx2": seq_idx2,
+        "orig_embed_dim1": orig_embed_dims1,  # [B]
+        "orig_embed_dim2": orig_embed_dims2,
+        "batch_size": batch_size,
     }
 
 
@@ -149,6 +229,141 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
         "labels": labels,
         "sample_ids": sample_ids,
     }
+
+def linear_classifier_packed_collate_fn(batch):
+    """
+    Custom collate function for FeatClassificationDataset with packed sequences.
+    
+    Returns:
+        dict with keys:
+            - features: List of K tensors, each [total_seq_len, embed_dim]
+            - cu_seqlens: Cumulative sequence lengths [B+1], int32
+            - max_seqlen: Maximum sequence length in batch
+            - seq_idx: Document index for each token [total_seq_len], int32
+            - labels: [B] tensor of labels
+            - sample_ids: List of sample IDs
+            - batch_size: Number of samples in batch
+    """
+    labels = torch.stack([item["label"] for item in batch])
+    sample_ids = [item["sample_id"] for item in batch]
+    seq_lengths = [item["seq_length"] for item in batch]
+    
+    all_feats_list = [item["feature_embeds"] for item in batch]
+    K = len(all_feats_list[0])  # Number of slice encoders
+    batch_size = len(batch)
+    max_seqlen = max(seq_lengths)
+    
+    # Compute cumulative sequence lengths: [0, len1, len1+len2, ...]
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens[1:] = torch.cumsum(torch.tensor(seq_lengths, dtype=torch.int32), dim=0)
+    total_seq_len = cu_seqlens[-1].item()
+    
+    # Build seq_idx: document index for each token
+    seq_idx = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.int32),
+        torch.tensor(seq_lengths, dtype=torch.int32)
+    )
+    
+    # Pack features for each encoder: List of K [total_seq_len, embed_dim]
+    features_list = []
+    for k in range(K):
+        kth_feats = [sample_feats[k] for sample_feats in all_feats_list]
+        embed_dim = kth_feats[0].shape[-1]
+        
+        # Concatenate all sequences
+        packed = torch.zeros(total_seq_len, embed_dim)
+        for i, feat in enumerate(kth_feats):
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i + 1].item()
+            packed[start:end] = feat
+        
+        features_list.append(packed)
+    
+    return {
+        "features": features_list,  # List of K [total_seq_len, embed_dim]
+        "cu_seqlens": cu_seqlens,   # [B+1]
+        "max_seqlen": max_seqlen,
+        "seq_idx": seq_idx,         # [total_seq_len]
+        "labels": labels,
+        "sample_ids": sample_ids,
+        "batch_size": batch_size,
+    }
+
+
+def multiview_classifier_packed_collate_fn(batch: List[Dict]) -> Dict:
+    """
+    Packed sequence collate function for MultiViewFeatClassificationDataset.
+    
+    Returns:
+        Dict with keys:
+            - features: {view_plane: List of K tensors [total_seq_len, embed_dim]}
+            - cu_seqlens: {view_plane: tensor [B+1]}
+            - max_seqlen: {view_plane: int}
+            - seq_idx: {view_plane: tensor [total_seq_len]}
+            - labels: tensor [B] or [B, num_labels]
+            - sample_ids: list of sample IDs
+            - batch_size: Number of samples in batch
+    """
+    view_planes = list(batch[0]["feature_embeds"].keys())
+    batch_size = len(batch)
+    
+    collated_features = {}
+    collated_cu_seqlens = {}
+    collated_max_seqlens = {}
+    collated_seq_idx = {}
+    
+    for view_plane in view_planes:
+        # Get all slice encoder features for this view plane
+        all_feats_list = [item["feature_embeds"][view_plane] for item in batch]
+        all_seq_lengths = [item["seq_length"][view_plane] for item in batch]
+        
+        K = len(all_feats_list[0])  # Number of slice encoders
+        max_seqlen = max(all_seq_lengths)
+        
+        # Compute cumulative sequence lengths
+        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
+        cu_seqlens[1:] = torch.cumsum(torch.tensor(all_seq_lengths, dtype=torch.int32), dim=0)
+        total_seq_len = cu_seqlens[-1].item()
+        
+        # Build seq_idx
+        seq_idx = torch.repeat_interleave(
+            torch.arange(batch_size, dtype=torch.int32),
+            torch.tensor(all_seq_lengths, dtype=torch.int32)
+        )
+        
+        # Pack features for each encoder
+        features_list = []
+        for k in range(K):
+            kth_feats = [sample_feats[k] for sample_feats in all_feats_list]
+            embed_dim = kth_feats[0].shape[-1]
+            
+            packed = torch.zeros(total_seq_len, embed_dim)
+            for i, feat in enumerate(kth_feats):
+                start = cu_seqlens[i].item()
+                end = cu_seqlens[i + 1].item()
+                packed[start:end] = feat
+            
+            features_list.append(packed)
+        
+        collated_features[view_plane] = features_list
+        collated_cu_seqlens[view_plane] = cu_seqlens
+        collated_max_seqlens[view_plane] = max_seqlen
+        collated_seq_idx[view_plane] = seq_idx
+    
+    # Collate labels
+    labels = torch.stack([item["label"] for item in batch])
+    sample_ids = [item["sample_id"] for item in batch]
+    
+    return {
+        "features": collated_features,
+        "cu_seqlens": collated_cu_seqlens,
+        "max_seqlen": collated_max_seqlens,
+        "seq_idx": collated_seq_idx,
+        "labels": labels,
+        "sample_ids": sample_ids,
+        "batch_size": batch_size,
+    }
+
 
 class PrecomputedFeatPairDataset(Dataset):
     """

@@ -21,6 +21,10 @@ from torch.nn.functional import pad, softmax, linear, scaled_dot_product_attenti
 
 from .rotary_embedding_torch import RotaryEmbedding, AttentionLiereRotator
 
+from flash_attn import flash_attn_varlen_func
+
+from .rotary_embedding_torch import apply_rotary_emb
+
 def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
     if activation == "relu":
         return F.relu
@@ -590,3 +594,274 @@ class TransformerEncoderLayer(Module):
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
+
+
+class VarlenMultiheadAttention(nn.Module):
+    """
+    Multi-head attention for packed/variable-length sequences using FlashAttention.
+    
+    Input shape: [total_seq_len, embed_dim] (packed sequences)
+    
+    References:
+        - https://github.com/Dao-AILab/flash-attention
+    """
+    
+    def __init__(
+        self, 
+        embed_dim: int, 
+        num_heads: int, 
+        dropout: float = 0.0,
+        bias: bool = True,
+        rotary_positional_encoding: Optional[str] = None,
+        device=None, 
+        dtype=None
+    ):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.dropout = dropout
+        
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        
+        # QKV projection
+        self.qkv_proj = Linear(embed_dim, 3 * embed_dim, bias=bias, **factory_kwargs)
+        self.out_proj = Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
+        
+        # Rotary positional encoding
+        if rotary_positional_encoding == 'RoPE':
+            self.rotary_emb = RotaryEmbedding(
+                dim=self.head_dim,
+                freqs_for='lang',
+                theta=256,
+                cache_if_possible=True
+            )
+        else:
+            self.rotary_emb = None
+    
+    def forward(
+        self, 
+        x: Tensor, 
+        cu_seqlens: Tensor, 
+        max_seqlen: int,
+        is_causal: bool = False
+    ) -> Tensor:
+        """
+        Forward pass for variable-length attention using FlashAttention.
+        
+        Args:
+            x: Packed input tensor [total_seq_len, embed_dim]
+            cu_seqlens: Cumulative sequence lengths [batch_size + 1], int32
+            max_seqlen: Maximum sequence length in the batch
+            is_causal: Whether to apply causal masking
+            
+        Returns:
+            Output tensor [total_seq_len, embed_dim]
+        """
+        total_seq_len = x.shape[0]
+        batch_size = cu_seqlens.shape[0] - 1
+        
+        # Project to Q, K, V: [total_seq_len, 3 * embed_dim]
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Reshape for multi-head attention: [total_seq_len, num_heads, head_dim]
+        q = q.view(total_seq_len, self.num_heads, self.head_dim)
+        k = k.view(total_seq_len, self.num_heads, self.head_dim)
+        v = v.view(total_seq_len, self.num_heads, self.head_dim)
+        
+        # Apply RoPE with per-slice positions
+        # Each slice's positions start from 0, not global positions
+        if self.rotary_emb is not None:
+            # Compute per-slice positions for packed sequences
+            positions = torch.zeros(total_seq_len, device=x.device, dtype=torch.float32)
+            for i in range(batch_size):
+                start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+                seq_len = end - start
+                positions[start:end] = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+            
+            # Generate frequencies for these positions: [total_seq_len, head_dim]
+            freqs = self.rotary_emb.forward(positions, seq_len=total_seq_len)
+            
+            # Reshape freqs for broadcasting: [total_seq_len, 1, head_dim]
+            # This broadcasts across all heads
+            freqs = freqs.unsqueeze(1)
+            
+            # Apply RoPE to Q and K: [total_seq_len, num_heads, head_dim]
+            q = apply_rotary_emb(freqs, q, seq_dim=0)
+            k = apply_rotary_emb(freqs, k, seq_dim=0)
+        
+        # FlashAttention for variable-length sequences
+        out = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            dropout_p=self.dropout if self.training else 0.0,
+            causal=is_causal,
+        )
+        
+        # Reshape back: [total_seq_len, embed_dim]
+        out = out.view(total_seq_len, self.embed_dim)
+        out = self.out_proj(out)
+        
+        return out
+
+
+class VarlenTransformerEncoderLayer(Module):
+    """
+    Transformer encoder layer for packed/variable-length sequences using FlashAttention.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: Union[str, Callable[[Tensor], Tensor]] = F.gelu,
+        layer_norm_eps: float = 1e-5,
+        norm_first: bool = True,
+        bias: bool = True,
+        rotary_positional_encoding: Optional[str] = None,
+        device=None,
+        dtype=None
+    ):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        
+        self.self_attn = VarlenMultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            bias=bias,
+            rotary_positional_encoding=rotary_positional_encoding,
+            **factory_kwargs
+        )
+        
+        # Feedforward network
+        self.linear1 = Linear(d_model, dim_feedforward, bias=bias, **factory_kwargs)
+        self.dropout = Dropout(dropout)
+        self.linear2 = Linear(dim_feedforward, d_model, bias=bias, **factory_kwargs)
+        
+        self.norm_first = norm_first
+        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, **factory_kwargs)
+        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, **factory_kwargs)
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
+        
+        # Activation
+        if isinstance(activation, str):
+            activation = _get_activation_fn(activation)
+        self.activation = activation
+    
+    def forward(
+        self,
+        src: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        is_causal: bool = False
+    ) -> Tensor:
+        """
+        Forward pass for packed sequences.
+        
+        Args:
+            src: Packed input tensor [total_seq_len, d_model]
+            cu_seqlens: Cumulative sequence lengths [batch_size + 1], int32
+            max_seqlen: Maximum sequence length in the batch
+            is_causal: Whether to apply causal masking
+            
+        Returns:
+            Output tensor [total_seq_len, d_model]
+        """
+        x = src
+        if self.norm_first:
+            x = x + self._sa_block(self.norm1(x), cu_seqlens, max_seqlen, is_causal)
+            x = x + self._ff_block(self.norm2(x))
+        else:
+            x = self.norm1(x + self._sa_block(x, cu_seqlens, max_seqlen, is_causal))
+            x = self.norm2(x + self._ff_block(x))
+        return x
+    
+    def _sa_block(
+        self, 
+        x: Tensor, 
+        cu_seqlens: Tensor, 
+        max_seqlen: int,
+        is_causal: bool
+    ) -> Tensor:
+        x = self.self_attn(x, cu_seqlens, max_seqlen, is_causal)
+        return self.dropout1(x)
+    
+    def _ff_block(self, x: Tensor) -> Tensor:
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout2(x)
+
+
+class VarlenTransformerEncoder(Module):
+    """
+    Transformer encoder stack for packed/variable-length sequences using FlashAttention.
+    
+    Usage:
+        >>> encoder = VarlenTransformerEncoder(d_model=768, nhead=8, num_layers=6)
+        >>> # Packed input: [total_seq_len, d_model]
+        >>> # cu_seqlens: [batch_size + 1] marking sequence boundaries
+        >>> out = encoder(x_packed, cu_seqlens, max_seqlen)
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        norm_first: bool = True,
+        rotary_positional_encoding: Optional[str] = None,
+        device=None,
+        dtype=None
+    ):
+        super().__init__()
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        
+        self.layers = nn.ModuleList([
+            VarlenTransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation=activation,
+                norm_first=norm_first,
+                rotary_positional_encoding=rotary_positional_encoding,
+                **factory_kwargs
+            )
+            for _ in range(num_layers)
+        ])
+        self.norm = LayerNorm(d_model, **factory_kwargs)
+    
+    def forward(
+        self,
+        src: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        is_causal: bool = False
+    ) -> Tensor:
+        """
+        Forward pass through all encoder layers.
+        
+        Args:
+            src: Packed input [total_seq_len, d_model]
+            cu_seqlens: Cumulative sequence lengths [batch_size + 1]
+            max_seqlen: Maximum sequence length
+            is_causal: Whether to use causal attention
+            
+        Returns:
+            Encoded output [total_seq_len, d_model]
+        """
+        output = src
+        for layer in self.layers:
+            output = layer(output, cu_seqlens, max_seqlen, is_causal)
+        return self.norm(output)

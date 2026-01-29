@@ -73,16 +73,28 @@ class Mamba2Enc(nn.Module):
 
         self.apply(initialize_weights)
 
-    def forward(self, x):
+    def forward(self, x, seq_idx=None):
+        """
+        Forward pass through Mamba2 encoder.
+        
+        Args:
+            x: Input tensor [B, seq_len, dim] or [seq_len, dim]
+            seq_idx: Optional sequence indices for variable-length packed sequences.
+                     Shape [1, total_seq_len] with values indicating which sequence
+                     each token belongs to. When provided, x should be [1, total_seq_len, dim].
+        
+        Returns:
+            Output tensor with same shape as input
+        """
         if len(x.shape) == 2:
-            x = x.expand(1, -1, -1)
+            x = x.unsqueeze(0)
 
         h = self._fc1(x)
 
         for layer in self.layers:
             h_ = h
-            h = layer[0](h) # LayerNorm
-            h = layer[1](h) # Mamba2
+            h = layer[0](h)  # LayerNorm
+            h = layer[1](h, seq_idx=seq_idx)  # Mamba2
             h = h + h_
 
         logits = self.classifier(h)

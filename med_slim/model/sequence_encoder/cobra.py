@@ -5,7 +5,7 @@ Unsupervised Foundation Model-Agnostic Slide-Level Representation Learning.
 2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR): 30807-30817, 2024.
 """
 
-from typing import List
+from typing import List, Tuple
 from contextlib import contextmanager
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ from einops import rearrange
 
 
 from .mamba2 import Mamba2Enc
-from .transformer import TransformerEncoderLayer
+from .transformer import TransformerEncoderLayer, VarlenTransformerEncoder
 from med_slim.model.attention_pooling import BatchedABMIL
 
 
@@ -123,6 +123,7 @@ class Cobra(nn.Module):
                 d_state=kwargs.get('d_state', 128),
             )
         else:
+            # Standard TransformerEncoder for zero-padding
             enc_layer = TransformerEncoderLayer(
                 d_model=embed_dim,
                 nhead=num_heads,
@@ -138,6 +139,17 @@ class Cobra(nn.Module):
                 num_layers=num_layers,
                 norm=nn.LayerNorm(embed_dim),
                 enable_nested_tensor=False,
+            )
+            # VarlenTransformerEncoder for packed sequences using FlashAttention
+            self.varlen_seq_enc = VarlenTransformerEncoder(
+                d_model=embed_dim,
+                nhead=num_heads,
+                num_layers=num_layers,
+                dim_feedforward=kwargs.get('dim_feedforward', 4 * embed_dim),
+                dropout=dropout,
+                activation="gelu",
+                norm_first=kwargs.get('norm_first', True),
+                rotary_positional_encoding=kwargs.get('rotary_positional_encoding', None),
             )
 
         # Optional CLS token
@@ -286,7 +298,7 @@ class Cobra(nn.Module):
         return logits
 
     def _embed_inference_forward(self, x) -> torch.Tensor:
-        """Foundation model feature embedding in inference mode."""
+        """Foundation model feature embedding in inference mode (zero padding)."""
         # Inference mode with ensembling feature embeddings from multiple slice encoders
         # x is a list of K tensors, each with shape [B, num_slices, encoder_embed_dim]
         embedded_features = [self.embed[str(xi.shape[-1])](xi) for xi in x]  # List of K [B, num_slices, embed_dim]
@@ -315,6 +327,76 @@ class Cobra(nn.Module):
             # Concatenate embeddings across different slice encoders
             logits = rearrange(fm_embs, 'k b t e -> b (t k) e')  # [B, num_slices* K, embed_dim]
         return logits
+
+    def _embed_ssl_forward_packed(
+        self, 
+        x: torch.Tensor, 
+        cu_seqlens: torch.Tensor,
+        input_feature_dims: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Foundation model feature embedding in SSL mode (packed sequences).
+        
+        Args:
+            x: Packed input tensor [total_seq_len, feature_dim]
+            cu_seqlens: Cumulative sequence lengths [batch_size + 1], int32
+            input_feature_dims: Feature dimensions per sample [batch_size] (optional)
+        
+        Returns:
+            Embedded features [total_seq_len, embed_dim]
+        """
+        if input_feature_dims is not None:
+            # Different feature dims per sample - need per-sample processing
+            batch_size = cu_seqlens.shape[0] - 1
+            logits_list = []
+            for i in range(batch_size):
+                start, end = cu_seqlens[i].item(), cu_seqlens[i+1].item()
+                feat_dim = input_feature_dims[i].item()
+                sample_tokens = x[start:end, :feat_dim]
+                embedded = self.embed[str(feat_dim)](sample_tokens)
+                logits_list.append(embedded)
+            return torch.cat(logits_list, dim=0)  # [total_seq_len, embed_dim]
+        else:
+            # Same feature dim - vectorized embedding
+            return self.embed[str(x.shape[-1])](x)  # [total_seq_len, embed_dim]
+
+    def _embed_inference_forward_packed(self, x: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Foundation model feature embedding in inference mode (packed sequences).
+        
+        Args:
+            x: List of K tensors from different slice encoders, 
+               each with shape [total_seq_len, encoder_embed_dim_k]
+        
+        Returns:
+            Embedded features [total_seq_len, embed_dim]
+        
+        Raises:
+            ValueError: 'concat' mode is not supported for packed sequences.
+        """
+        # Embed each encoder's features: List of K [total_seq_len, embed_dim]
+        embedded_features = [self.embed[str(xi.shape[-1])](xi) for xi in x]
+        
+        fm_embs = torch.stack(embedded_features, dim=0)  # [K, total_seq_len, embed_dim]
+        K, T, E = fm_embs.shape
+        
+        assert E == self.embed_dim, f"Expected embed_dim {self.embed_dim}, got {E}"
+        
+        if K == 1:
+            return fm_embs[0]  # [total_seq_len, embed_dim]
+        
+        if self.fm_pooling == "mean":
+            return fm_embs.mean(dim=0)  # [total_seq_len, embed_dim]
+            
+        elif self.fm_pooling == "attention":
+            # Attention-weighted pooling across K encoders for each slice
+            fm_embs_t = rearrange(fm_embs, 'k t e -> t k e')
+            attn_weights = self.fm_attn(fm_embs_t)  # [total_seq_len, K, 1]
+            attn_weights_t = attn_weights.transpose(2, 1)  # [total_seq_len, 1, K]
+            return torch.bmm(attn_weights_t, fm_embs_t).squeeze(1)  # [total_seq_len, embed_dim]
+            
+        else:
+            raise ValueError(f"fm_pooling='concat' is not supported for packed sequences.")
 
     def forward(self, x, input_feature_dims=None, seq_lengths=None, get_attention=False, return_slice_embeddings=False):
         """
@@ -411,3 +493,142 @@ class Cobra(nn.Module):
 
         assert len(feats.shape)==2, feats.shape
         return feats
+
+    def _packed_to_padded(
+        self, 
+        packed: torch.Tensor, 
+        cu_seqlens: torch.Tensor, 
+        max_seqlen: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert packed tensor to padded tensor with mask.
+        
+        Args:
+            packed: Packed tensor [total_seq_len, dim]
+            cu_seqlens: Cumulative sequence lengths [batch_size + 1]
+            max_seqlen: Maximum sequence length
+        
+        Returns:
+            padded: Padded tensor [batch_size, max_seqlen, dim]
+            mask: Boolean mask [batch_size, max_seqlen] (True = valid)
+        """
+        batch_size = cu_seqlens.shape[0] - 1
+        dim = packed.shape[-1]
+        
+        padded = torch.zeros(batch_size, max_seqlen, dim, device=packed.device, dtype=packed.dtype)
+        mask = torch.zeros(batch_size, max_seqlen, dtype=torch.bool, device=packed.device)
+        
+        for i in range(batch_size):
+            start, end = cu_seqlens[i].item(), cu_seqlens[i+1].item()
+            seq_len = end - start
+            padded[i, :seq_len] = packed[start:end]
+            mask[i, :seq_len] = True
+        
+        return padded, mask
+
+    def _abmil_pooling(
+        self, 
+        h: torch.Tensor, 
+        mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Apply ABMIL attention pooling.
+        
+        Args:
+            h: Input tensor [batch_size, seq_len, embed_dim]
+            mask: Boolean mask [batch_size, seq_len] (True = valid)
+        
+        Returns:
+            Attention weights [batch_size, 1, seq_len]
+        """
+        if self.num_heads > 1:
+            h_heads = rearrange(h, 'b t (e c) -> b t e c', c=self.num_heads)
+            attentions = []
+            for i, attn_net in enumerate(self.attn):
+                _, raw_attention = attn_net(h_heads[:, :, :, i], mask=mask, return_raw_attention=True)
+                attentions.append(raw_attention)
+            A = torch.stack(attentions, dim=-1)
+            A = rearrange(A, 'b t e c -> b t (e c)', c=self.num_heads).mean(-1).unsqueeze(-1)
+            A = torch.transpose(A, 2, 1)
+            A = F.softmax(A, dim=-1)
+        else:
+            A = self.attn[0](h, mask=mask)
+            A = torch.transpose(A, 2, 1)
+        return A
+
+    def forward_packed(
+        self, 
+        x, 
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        input_feature_dims: torch.Tensor = None,
+        seq_idx: torch.Tensor = None,
+        get_attention: bool = False,
+        return_slice_embeddings: bool = False,
+    ) -> torch.Tensor:
+        """
+        Forward pass for packed/variable-length sequences.
+        
+        Supports both SSL training mode and inference mode with multiple encoders.
+        Both Mamba2 and FlashAttention (from Tri Dao's lab) share the same cu_seqlens
+        interface, enabling efficient variable-length processing without padding.
+        
+        Args:
+            x: Packed input tensor or list of tensors:
+               - Train mode: [total_seq_len, feature_dim]
+               - Inference mode: List of K tensors [total_seq_len, encoder_embed_dim_k]
+            cu_seqlens: Cumulative sequence lengths [batch_size + 1], int32.
+            max_seqlen: Maximum sequence length in the batch.
+            input_feature_dims: Feature dimensions per sample [batch_size] (for multi-encoder SSL).
+            seq_idx: Document index for each token [total_seq_len], int32.
+            get_attention: If True, return attention maps instead of features.
+            return_slice_embeddings: If True, return slice embeddings before pooling.
+        
+        Returns:
+            If get_attention=True: List of attention maps, each [1, seq_len_i]
+            If return_slice_embeddings=True: Packed slice embeddings [total_seq_len, embed_dim]
+            Train mode: Projected features [batch_size, contrast_dim]
+            Inference mode: Features [batch_size, embed_dim]
+        
+        References:
+            - https://tridao.me/blog/2024/mamba2-part4-systems/
+        """
+        batch_size = cu_seqlens.shape[0] - 1
+        
+        # ===== Feature Embedding =====
+        if self.mode == "inference":
+            logits = self._embed_inference_forward_packed(x)
+        else:
+            logits = self._embed_ssl_forward_packed(x, cu_seqlens, input_feature_dims)
+        
+        # ===== Sequence Encoding =====
+        if self.sequence_encoder == "transformer" and hasattr(self, 'varlen_seq_enc'):
+            # Transformer with FlashAttention varlen
+            # Processes all sequences in one pass without padding
+            h = self.varlen_seq_enc(logits, cu_seqlens, max_seqlen)
+            # Note: VarlenTransformerEncoder already has final LayerNorm
+        else:
+            # Pack all sequences into one batch with seq_idx indicating sequence boundaries
+            logits_packed = logits.unsqueeze(0)  # [1, total_seq_len, embed_dim]
+            seq_idx_2d = seq_idx.unsqueeze(0) if seq_idx is not None and seq_idx.dim() == 1 else seq_idx # [1, total_seq_len]
+            h = self.seq_enc(logits_packed, seq_idx=seq_idx_2d).squeeze(0)  # [total_seq_len, embed_dim]
+            h = self.norm(h)
+        
+        if return_slice_embeddings:
+            return h
+        
+        # ===== ABMIL Pooling =====
+        # Convert to padded for batched ABMIL (efficient since ABMIL is cheap)
+        h_padded, mask = self._packed_to_padded(h, cu_seqlens, max_seqlen)
+        A = self._abmil_pooling(h_padded, mask)
+        
+        if get_attention:
+            return [A[i, :, :cu_seqlens[i+1]-cu_seqlens[i]] for i in range(batch_size)]
+        
+        # ===== Final Pooling =====
+        if self.mode == "train":
+            pooled = torch.bmm(A, h_padded).squeeze(1)
+            return self.proj(pooled)
+        else:
+            logits_padded, _ = self._packed_to_padded(logits, cu_seqlens, max_seqlen)
+            return torch.bmm(A, logits_padded).squeeze(1)

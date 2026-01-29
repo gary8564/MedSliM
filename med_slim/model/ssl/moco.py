@@ -149,3 +149,71 @@ class MoCo(nn.Module):
         labels = (torch.arange(N, dtype=torch.long, device=logits.device) + N * rank) # for query i, the correct class index is i (or i + offset) (N * rank is for multi-GPU setting)
         
         return nn.CrossEntropyLoss()(logits, labels) * (2 * self.T)
+
+    def forward_packed(
+        self, 
+        x1: torch.Tensor, 
+        x2: torch.Tensor, 
+        cu_seqlens1: torch.Tensor,
+        cu_seqlens2: torch.Tensor,
+        max_seqlen1: int,
+        max_seqlen2: int,
+        input_feature_dims_1: torch.Tensor = None, 
+        input_feature_dims_2: torch.Tensor = None,
+        seq_idx1: torch.Tensor = None,
+        seq_idx2: torch.Tensor = None,
+        m: float = 0.99,
+    ):
+        """
+        Forward pass for packed/variable-length sequences.
+        
+        This is an efficient alternative to the standard forward() that eliminates
+        zero-padding waste. All sequences are concatenated and cu_seqlens tracks boundaries.
+        
+        Args:
+            x1: Packed features for view 1 [total_seq_len_1, feature_dim]
+            x2: Packed features for view 2 [total_seq_len_2, feature_dim]
+            cu_seqlens1: Cumulative sequence lengths for view 1 [batch_size + 1]
+            cu_seqlens2: Cumulative sequence lengths for view 2 [batch_size + 1]
+            max_seqlen1: Max sequence length in batch for view 1
+            max_seqlen2: Max sequence length in batch for view 2
+            input_feature_dims_1: Feature dimensions per sample for view 1 [batch_size]
+            input_feature_dims_2: Feature dimensions per sample for view 2 [batch_size]
+            seq_idx1: Document index per token for view 1 [total_seq_len_1] (for Mamba2)
+            seq_idx2: Document index per token for view 2 [total_seq_len_2] (for Mamba2)
+            m: Momentum coefficient for momentum encoder update
+            
+        Returns:
+            Contrastive loss (scalar)
+            
+        References:
+            - https://tridao.me/blog/2024/mamba2-part4-systems/ (Variable Length section)
+        """
+        # Compute contrastive features using packed forward
+        q1 = self.predictor(self.base_encoder.forward_packed(
+            x1, cu_seqlens1, max_seqlen1, 
+            input_feature_dims=input_feature_dims_1, 
+            seq_idx=seq_idx1
+        ))
+        q2 = self.predictor(self.base_encoder.forward_packed(
+            x2, cu_seqlens2, max_seqlen2,
+            input_feature_dims=input_feature_dims_2,
+            seq_idx=seq_idx2
+        ))
+       
+        with torch.no_grad():
+            self._update_momentum_encoder(m=m)
+
+            # Compute momentum encoder targets using packed forward
+            k1 = self.momentum_encoder.forward_packed(
+                x1, cu_seqlens1, max_seqlen1,
+                input_feature_dims=input_feature_dims_1,
+                seq_idx=seq_idx1
+            )
+            k2 = self.momentum_encoder.forward_packed(
+                x2, cu_seqlens2, max_seqlen2,
+                input_feature_dims=input_feature_dims_2,
+                seq_idx=seq_idx2
+            )
+
+        return self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1)
