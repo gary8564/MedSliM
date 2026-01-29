@@ -472,10 +472,11 @@ def train_single_view_classifier(
     
     # Setup optimizer (only train unfrozen parameters)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    weight_decay = float(hyperparams.get("weight_decay", 1e-4))
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=float(hyperparams.get("lr", 1e-4)),
-        weight_decay=1e-4
+        weight_decay=weight_decay
     )
     
     # Setup scheduler
@@ -501,6 +502,11 @@ def train_single_view_classifier(
     patience = hyperparams.get("patience", None)
     ckpt_path = os.path.join(output_dir, "checkpoints")
     early_stopping = EarlyStopping(patience=patience, mode="max", ckpt_path=ckpt_path, accelerator=accelerator) if patience else None
+    
+    if accelerator.is_main_process:
+        logger.info(f"Optimizer: AdamW, lr={hyperparams.get('lr', 1e-4)}, weight_decay={weight_decay}")
+        if patience:
+            logger.info(f"Early stopping enabled with patience={patience}")
     
     best_val_auroc = 0.0
     best_state_dict = None
@@ -690,14 +696,19 @@ def run_single_view_evaluation(
         logger.info(f"Num classes: {num_classes}, COBRA output dim: {input_dim}")
     
     # Initialize model
+    freeze_cobra = cfg.get("freeze_cobra", True)
     model = SingleViewClassifier(
         cobra_model=cobra_model,
         input_dim=input_dim,
         num_classes=num_classes,
         classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
         classifier_dropout=linear_hyperparams.get("dropout", 0.5),
-        freeze_cobra=True,
+        freeze_cobra=freeze_cobra,
     )
+    
+    if accelerator.is_main_process:
+        mode = "Linear Probing" if freeze_cobra else "Fine-tuning"
+        logger.info(f"Training mode: {mode}")
     
     # Train
     training_results = train_single_view_classifier(
@@ -806,13 +817,14 @@ def collect_predictions_per_view_classifier(
     input_dim = cobra_model.embed_dim
     
     # Initialize model
+    freeze_cobra = cfg.get("freeze_cobra", True)
     model = SingleViewClassifier(
         cobra_model=cobra_model,
         input_dim=input_dim,
         num_classes=num_classes,
         classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
         classifier_dropout=linear_hyperparams.get("dropout", 0.5),
-        freeze_cobra=True,
+        freeze_cobra=freeze_cobra,
     )
     
     # Create view-specific output directory
@@ -1296,10 +1308,11 @@ def train_multiview_classifier(
     
     # Setup optimizer (only train unfrozen parameters)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    weight_decay = float(hyperparams.get("weight_decay", 1e-4))
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=float(hyperparams.get("lr", 1e-4)),
-        weight_decay=1e-4
+        weight_decay=weight_decay
     )
     
     # Setup scheduler
@@ -1323,7 +1336,13 @@ def train_multiview_classifier(
     
     # Early stopping
     patience = hyperparams.get("patience", None)
-    early_stopping = EarlyStopping(patience=patience, mode="max", min_delta=0.001) if patience else None
+    ckpt_path = os.path.join(output_dir, "checkpoints")
+    early_stopping = EarlyStopping(patience=patience, mode="max", ckpt_path=ckpt_path, accelerator=accelerator) if patience else None
+    
+    if accelerator.is_main_process:
+        logger.info(f"Optimizer: AdamW, lr={hyperparams.get('lr', 1e-4)}, weight_decay={weight_decay}")
+        if patience:
+            logger.info(f"Early stopping enabled with patience={patience}")
     
     best_val_auroc = 0.0
     best_state_dict = None
@@ -1527,6 +1546,7 @@ def run_multiview_evaluation(
         logger.info(f"Num classes: {num_classes}, COBRA output dim: {input_dim}")
     
     # Initialize model
+    freeze_cobra = cfg.get("freeze_cobra", True)
     model = MultiViewClassifier(
         cobra_model=cobra_model,
         view_planes=view_planes,
@@ -1536,8 +1556,12 @@ def run_multiview_evaluation(
         classifier_dropout=linear_hyperparams.get("dropout", 0.5),
         attention_hidden_dim=attention_hyperparams.get("hidden_dim", 128),
         attention_dropout=attention_hyperparams.get("dropout", 0.1),
-        freeze_cobra=True,
+        freeze_cobra=freeze_cobra,
     )
+    
+    if accelerator.is_main_process:
+        mode = "Linear Probing" if freeze_cobra else "Fine-tuning"
+        logger.info(f"Training mode: {mode}")
     
     # Train
     training_results = train_multiview_classifier(

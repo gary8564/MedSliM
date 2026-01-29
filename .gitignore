@@ -7,3 +7,5 @@ stdout_*.txt
 .DS_Store
 wandb
 scripts/download_dataset
+scripts/debug
+scripts/precompute_slice_feature/parallel_launch.sh

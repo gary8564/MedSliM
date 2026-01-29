@@ -2,13 +2,19 @@ import os
 from pathlib import Path
 import pytest
 import torch
+import yaml
 
 from med_slim.data.feat_dataset import (
     PrecomputedFeatPairDataset,
     FeatClassificationDataset,
     MultiViewFeatClassificationDataset,
-    multiview_collate_fn,
+    multiview_classifier_collate_fn,
+    ssl_collate_fn,
 )
+from torch.utils.data import DataLoader
+
+# Path to pretrain config
+PRETRAIN_CONFIG_PATH = Path(__file__).parent.parent.parent / "med_slim" / "configs" / "pretrain.yml"
 
 
 FEAT_ROOT = Path("/hpcwork/rwth1833/feat_caches/MRNet/slices_raw")
@@ -163,7 +169,7 @@ def test_multiview_feat_classification_dataset():
             assert feat.shape == (seq_len, EMBED_DIMS[i])
 
 
-def test_multiview_collate_fn():
+def test_multiview_classifier_collate_fn():
     view_planes = _get_available_views(min_views=2)
     if not view_planes:
         pytest.skip("Not enough view planes available on disk for multi-view test.")
@@ -182,7 +188,7 @@ def test_multiview_collate_fn():
         pytest.skip("Need at least two samples for collate function test.")
 
     batch = [ds[0], ds[1]]
-    collated = multiview_collate_fn(batch)
+    collated = multiview_classifier_collate_fn(batch)
 
     assert set(collated.keys()) == {"features", "seq_lengths", "labels", "sample_ids"}
 
@@ -197,3 +203,72 @@ def test_multiview_collate_fn():
             # Each tensor should be [B, max_seq_len, embed_dim]
             assert feat.shape == (len(batch), max_seq, EMBED_DIMS[i])
 
+
+# -------------------- Pretrain Config Validation --------------------
+def test_dataloader_matches_number_of_studies():
+    """Test the precomputed feature pair dataset matches the number of studies specified in pretrain.yml."""
+    assert PRETRAIN_CONFIG_PATH.exists(), f"Pretrain config not found: {PRETRAIN_CONFIG_PATH}"
+    with open(PRETRAIN_CONFIG_PATH, "r") as f:
+        cfg = yaml.safe_load(f)
+    datasets_cfg = cfg["feat_dataset"]["datasets"]
+    models = cfg["feat_dataset"]["model_name"]
+    planes = cfg["feat_dataset"]["plane"]
+    split = "train"
+    
+    max_feature_dim = max(m["embed_dim"] for m in cfg["model"]["slice_encoder_models"])
+    
+    # Count unique exam_ids across all planes
+    expected_counts = {}
+    for ds_cfg in datasets_cfg:
+        dataset_name = ds_cfg["name"]
+        feat_dir = Path(ds_cfg["feat_dir"])
+        
+        exam_ids = set()
+        plane_counts = {}
+        for plane in planes:
+            ref_path = feat_dir / models[0] / split / plane
+            if not ref_path.exists():
+                print(f"\n{plane}: path not found ({ref_path})")
+                continue
+            
+            plane_exam_ids = set()
+            for f in ref_path.glob("*.safetensors"):
+                exam_id = f.stem
+                plane_exam_ids.add(exam_id)
+                exam_ids.add(exam_id)
+            
+            plane_counts[plane] = len(plane_exam_ids)
+            print(f"\n{dataset_name.upper()}/{plane}: {len(plane_exam_ids)} exams")
+        
+        expected_counts[dataset_name] = len(exam_ids)
+        print(f"\n{dataset_name.upper()}: {len(exam_ids)} unique exams across all planes")
+    
+    total_expected = sum(expected_counts.values())
+    print(f"\nTotal expected studies: {total_expected}")
+    
+    feat_dirs = [{"name": d["name"], "feat_dir": d["feat_dir"]} for d in datasets_cfg]
+    
+    ds = PrecomputedFeatPairDataset(
+        feat_dirs=feat_dirs,
+        slice_encoder_models=models,
+        view_planes=planes,
+        split=split,
+        max_feature_dim=max_feature_dim,
+    )
+    
+    loader = DataLoader(
+        ds,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=0,
+        drop_last=False,
+        pin_memory=False,
+        collate_fn=ssl_collate_fn,
+    )
+    
+    print(f"Dataset length: {len(ds)}")
+    print(f"DataLoader batches: {len(loader)} (batch_size={cfg['train']['batch_size']})")
+    
+    # Verify dataset length matches expected
+    assert len(ds) == total_expected, \
+        f"Dataset has {len(ds)} studies but expected {total_expected} studies"

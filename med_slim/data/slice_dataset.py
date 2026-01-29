@@ -19,13 +19,17 @@ def slice_collate_fn(batch):
     return {"uid": uids, "orientation": orientations, "x": x}
 
 class SliceDataset(data.Dataset):
+    """
+    Dataset for loading 3D medical imaging data as slice sequences.
+    
+    Directory structure: {path_root}/{split}/{plane}/*.nii.gz
+    """
     def __init__(
             self,
             path_root: str,
             split: str,
             transform: Optional[tio.Compose] = None,
             plane: str = 'axial',
-            mri_sequence: Optional[str] = None,
         ):
         super().__init__()
         if split not in ["train", "val", "test"]:
@@ -37,19 +41,13 @@ class SliceDataset(data.Dataset):
         self.transform = transform
         self.df = pd.read_csv(self.path_root/f'{split}.csv', index_col='ID')
         self.plane = plane
-        self.mri_sequence = mri_sequence
         
-        # Filter DataFrame by plane and mri_sequence if exist
+        # Filter DataFrame by plane if column exists
         if 'plane' in self.df.columns:
             self.df = self.df[self.df['plane'] == plane]
-        if mri_sequence is not None and 'mri_sequence' in self.df.columns:
-            self.df = self.df[self.df['mri_sequence'] == mri_sequence]
         
         if len(self.df) == 0:
-            filter_msg = f"plane={plane}"
-            if mri_sequence:
-                filter_msg += f", mri_sequence={mri_sequence}"
-            raise ValueError(f"No samples found after filtering by {filter_msg}.")
+            raise ValueError(f"No samples found after filtering by plane={plane}.")
         
         self.sample_ids = self.df.index.tolist()
         
@@ -59,10 +57,7 @@ class SliceDataset(data.Dataset):
     def __getitem__(self, index):
         sample_id = self.sample_ids[index]
         uid = str(sample_id)  
-        if self.mri_sequence is None:
-            img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
-        else:
-            img_path = self.path_root / f'{self.split}' / f'{self.mri_sequence}' / f'{self.plane}' / f'{uid}.nii.gz'
+        img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
         img = tio.ScalarImage(img_path)
         if self.transform is not None:
             img = self.transform(img)
@@ -77,9 +72,8 @@ class SliceClassificationDataset(SliceDataset):
             transform: Optional[tio.Compose] = None,
             labels: Optional[List[str]] = None,
             plane: str = 'axial',
-            mri_sequence: Optional[str] = None,
         ):
-        super().__init__(path_root, split, transform, plane=plane, mri_sequence=mri_sequence)
+        super().__init__(path_root, split, transform, plane=plane)
         if task not in ["binary", "multiclass", "multilabel"]:
             raise AttributeError(f"`task` attribute must be a str type and specified as either `binary`, `multiclass`, or `multilabel`.")
         if len(labels) > 1 and task == "binary":
@@ -92,10 +86,7 @@ class SliceClassificationDataset(SliceDataset):
     def __getitem__(self, index):
         sample_id = self.sample_ids[index]
         uid = str(sample_id) 
-        if self.mri_sequence is None:
-            img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
-        else:
-            img_path = self.path_root / f'{self.split}' / f'{self.mri_sequence}' / f'{self.plane}' / f'{uid}.nii.gz'
+        img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
         img = tio.ScalarImage(img_path)
         if self.transform is not None:
             img = self.transform(img)
@@ -118,19 +109,14 @@ class SliceSegmentationDataset(SliceDataset):
             split: str,
             transform: Optional[tio.Compose] = None,
             plane: str = 'axial',
-            mri_sequence: Optional[str] = None,
             ):
-        super().__init__(path_root, split, transform, plane=plane, mri_sequence=mri_sequence)
+        super().__init__(path_root, split, transform, plane=plane)
     
     def __getitem__(self, index):
         sample_id = self.sample_ids[index]
         uid = str(sample_id) 
-        if self.mri_sequence is None:
-            img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
-            mask_path = self.path_root / f'{self.split}' / f'{self.plane}' / 'mask' / f'{uid}.nii.gz'
-        else:
-            img_path = self.path_root / f'{self.split}' / f'{self.mri_sequence}' / f'{self.plane}' / f'{uid}.nii.gz'
-            mask_path = self.path_root / f'{self.split}' / f'{self.mri_sequence}' / f'{self.plane}' / 'mask' / f'{uid}.nii.gz'
+        img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
+        mask_path = self.path_root / f'{self.split}' / f'{self.plane}' / 'mask' / f'{uid}.nii.gz'
         img = tio.ScalarImage(img_path)
         mask = tio.LabelMap(mask_path)
         subject = tio.Subject(img=img, mask=mask)

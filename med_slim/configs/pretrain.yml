@@ -1,19 +1,10 @@
 feat_dataset:
-  # Each dataset can optionally specify mri_sequences if it has sequence subfolders
-  # Directory structure without mri_sequences: {feat_dir}/{model}/{split}/{plane}/*.safetensors
-  # Directory structure with mri_sequences: {feat_dir}/{model}/{split}/{mri_sequence}/{plane}/*.safetensors
+  # Directory structure: {feat_dir}/{model}/{split}/{plane}/*.safetensors
   datasets:
     - name: mrnet
-      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw"
-    - name: kneeMRI
-      feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw"
-    # - name: fastMRI
-    #   feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw"
-    #   mri_sequences:  # fastMRI has multiple MRI sequences
-    #     - "t2"
-    #     - "pd"
-    #     - "t2_fs"
-    #     - "pd_fs"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32"
+    - name: fastMRI
+      feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_32"
   model_name: 
     - "dinov2"
     - "rad-dino"
@@ -83,13 +74,13 @@ model:
 train:
   momentum: 0.99
   temperature: 0.2
-  batch_size: 256
+  batch_size: 512
   num_epochs: 2000
-  learning_rate: 3e-4
+  learning_rate: 5e-4
   warmup_epochs: 50
   weight_decay: 0.1
   num_workers: 4
   early_stopping: 
     patience: 10
-  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet"
+  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI"
 

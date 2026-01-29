@@ -25,6 +25,7 @@ def plot_embedding_clustering(
     fig_size: Tuple[int, int] = (10, 8),
     filename: str = 'embedding_umap.png',
     umap_kwargs: Optional[Dict] = None,
+    continuous_color: bool = False,
 ) -> str:
     """
     Visualize embeddings using UMAP dimensionality reduction.
@@ -35,11 +36,13 @@ def plot_embedding_clustering(
         labels: Optional labels for coloring. Can be:
                 - 1D array of class indices [num_samples]
                 - 2D array of multi-label binary indicators [num_samples, num_labels]
-        label_names: List of class/label names for legend
+                - 1D array of continuous values (when continuous_color=True)
+        label_names: List of class/label names for legend (or single name for continuous colorbar)
         title: Plot title
         fig_size: Figure size
         filename: Output filename
         umap_kwargs: Additional arguments for UMAP
+        continuous_color: If True, treat labels as continuous values and use colormap
     
     Returns:
         Path to saved figure
@@ -95,7 +98,21 @@ def plot_embedding_clustering(
     
     fig, ax = plt.subplots(figsize=fig_size)
     
-    if labels is not None:
+    if labels is not None and continuous_color:
+        # Continuous colormap (e.g., for slice position or volume ID)
+        scatter = ax.scatter(
+            embedding_2d[:, 0],
+            embedding_2d[:, 1],
+            c=labels,
+            cmap='gist_rainbow',
+            alpha=0.7,
+            s=30,
+            edgecolor='none',
+        )
+        cbar = fig.colorbar(scatter, ax=ax, shrink=0.8, pad=0.02)
+        cbar_label = label_names[0] if label_names else ''
+        cbar.set_label(cbar_label, fontsize=11)
+    elif labels is not None:
         unique_labels = df['Label'].unique()
         palette = sns.color_palette("tab10", n_colors=len(unique_labels))
         

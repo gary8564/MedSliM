@@ -6,8 +6,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=8G 
-#SBATCH --time=3:00:00                 
+#SBATCH --mem-per-cpu=32G 
+#SBATCH --time=36:00:00                 
 #SBATCH --job-name=precompute_slice_feature_%j
 #SBATCH --output=stdout_precompute_slice_feature_%j.txt    
 #SBATCH --account=rwth1833    
@@ -21,12 +21,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ### Configuration
 DATA_DIR="/work/rwth1833/datasets/preprocessed/fastMRI"
 SAVE_DIR="/hpcwork/rwth1833/feat_caches/fastMRI"
-PLANE="sagittal"
-USE_RAW_SLICE_RESOLUTION=true
-MODEL_NAME="ark" # "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "ark"
+PLANE="axial"
+USE_RAW_SLICE_RESOLUTION=false
+MODEL_NAME="biomedclip" # "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "ark"
 SPLIT="train"
-MRI_SEQUENCES="pd" # "pd", "pd_fs", "t2", "t2_fs"
-EXTRA_ARGS="--amp"
+ARK_CHECKPOINT="/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
+EXTRA_ARGS="--amp bf16"
 
 # Conditionally extend extra args
 if [ "$USE_RAW_SLICE_RESOLUTION" = true ]; then
@@ -37,8 +37,9 @@ if [ "$USE_RAW_SLICE_RESOLUTION" = false ]; then
   EXTRA_ARGS="$EXTRA_ARGS --num-slices 32"
 fi
 
-if [ "$MRI_SEQUENCES" != "" ]; then
-  EXTRA_ARGS="$EXTRA_ARGS --mri-sequence $MRI_SEQUENCES"
+# Add ark checkpoint if using ark model
+if [ "$MODEL_NAME" = "ark" ]; then
+  EXTRA_ARGS="$EXTRA_ARGS --ark-checkpoint $ARK_CHECKPOINT --workers 2"
 fi
 
 # Run your program

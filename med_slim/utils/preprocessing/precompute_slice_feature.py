@@ -1,12 +1,11 @@
 import argparse
 import os
 import glob
-import logging
+import gc
 import torch
 import numpy as np
 import nibabel as nib
-from typing import Optional
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from safetensors.torch import save_file
 from pathlib import Path
@@ -15,11 +14,8 @@ from med_slim.model.slice_encoder import build_slice_encoder
 from med_slim.data.slice_dataset import SliceDataset, slice_collate_fn
 from med_slim.utils.preprocessing.transforms import get_transforms
 
-def get_num_slices(data_dir: str, split: str, plane: str, mri_sequence: Optional[str] = None) -> int:
-    if mri_sequence:
-        pattern = os.path.join(data_dir, split, mri_sequence, plane, '*.nii.gz')
-    else:
-        pattern = os.path.join(data_dir, split, plane, '*.nii.gz')
+def get_num_slices(data_dir: str, split: str, plane: str) -> int:
+    pattern = os.path.join(data_dir, split, plane, '*.nii.gz')
     nifti_file_paths = glob.glob(pattern)
     num_slices = []
     for nifti_file_path in nifti_file_paths:
@@ -34,20 +30,28 @@ def main():
     parser.add_argument("--plane", type=str, default="axial", choices=["axial", "sagittal", "coronal"], help="Plane of the slices to be precomputed.")
     parser.add_argument("--use-raw-slice-resolution", action="store_true", help="Use raw slice resolution instead of cropped or padded resolution.")
     parser.add_argument("--num-slices", type=int, default=None, help="Number of slices along depth used by transforms.")
-    parser.add_argument("--amp", action="store_true", help="Use automatic mixed precision on CUDA")
+    parser.add_argument("--amp", type=str, default=None, choices=["fp16", "bf16"], 
+                        help="Use automatic mixed precision: 'fp16' (faster but can overflow) or 'bf16' (safer, recommended)")
     parser.add_argument("--model-name", type=str, default="dinov2", choices=["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip"], help="Slice encoder backbone.")
     parser.add_argument("--model-repo", type=str, default=None, help="Optional HF repo override for DINO/MedSigLIP/CLIP.")
     parser.add_argument("--ark-checkpoint", type=str, default=None, help="Ark checkpoint path (required if --model-name ark).")
     parser.add_argument("--local-cache-dir", type=str, default=None, help="Local cache directory to store the model.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Dataset split to precompute.")
-    parser.add_argument("--mri-sequence", type=str, default=None, choices=["t2", "pd", "t2_fs", "pd_fs"], help="MRI sequence type with dataset containing multiple sequences.")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader workers")
-    # parser.add_argument("--batch-size", type=int, default=8, help="Number of studies per batch")
+    # Optimization options
+    parser.add_argument("--shard-id", type=int, default=0, help="Shard ID for parallel processing (0-indexed)")
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards for parallel processing")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for faster inference")
     args = parser.parse_args()
     device = torch.device("cuda")
 
     # Build slice encoder (expects [B, C, W, H, D] with C=1 grayscale)
     slice_encoder = build_slice_encoder(name=args.model_name, model_repo=args.model_repo, checkpoint=args.ark_checkpoint,local_cache_dir=args.local_cache_dir, freeze=True).to(device).eval()
+    
+    # Optional: compile model for faster inference
+    if args.compile:
+        print("Compiling model with torch.compile()...")
+        slice_encoder = torch.compile(slice_encoder)
     
     if args.use_raw_slice_resolution:
         batch_size = 1
@@ -55,14 +59,11 @@ def main():
         _, image_transforms = get_transforms(model_name=args.model_name)
     else:
         batch_size = 4
-        num_slices = args.num_slices if args.num_slices is not None else get_num_slices(args.data_dir, args.split, args.plane, args.mri_sequence)
+        num_slices = args.num_slices if args.num_slices is not None else get_num_slices(args.data_dir, args.split, args.plane)
         _, image_transforms = get_transforms(model_name=args.model_name, num_slices=num_slices)
     
-    # Build output directory path (with optional mri_sequence subfolder)
-    if args.mri_sequence:
-        out_dir = Path(args.save_dir) / f"slices_{num_slices}" / args.model_name / args.split / args.mri_sequence / args.plane
-    else:
-        out_dir = Path(args.save_dir) / f"slices_{num_slices}" / args.model_name / args.split / args.plane
+    # Build output directory path: {save_dir}/slices_{num_slices}/{model_name}/{split}/{plane}/
+    out_dir = Path(args.save_dir) / f"slices_{num_slices}" / args.model_name / args.split / args.plane
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ds = SliceDataset(
@@ -70,8 +71,15 @@ def main():
         split=args.split,
         transform=image_transforms,
         plane=args.plane,
-        mri_sequence=args.mri_sequence,
     )
+    
+    # Apply sharding for parallel processing
+    if args.num_shards > 1:
+        # Get indices for this shard: [shard_id, shard_id + num_shards, shard_id + 2*num_shards, ...]
+        all_indices = list(range(len(ds)))
+        shard_indices = [idx for idx in all_indices if idx % args.num_shards == args.shard_id]
+        ds = Subset(ds, shard_indices)
+        print(f"Shard {args.shard_id}/{args.num_shards}: Processing {len(ds)}/{len(all_indices)} samples")
     
     data_loader = DataLoader(
         ds,
@@ -83,25 +91,35 @@ def main():
     )
     
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Precomputing slice features"):
+        for batch_idx, batch in enumerate(tqdm(data_loader, desc="Precomputing slice features")):
             uids = batch["uid"]
             x = batch["x"].to(device=device, dtype=torch.float32, non_blocking=True)  # (B, C, W, H, D)
-            with torch.autocast("cuda", enabled=args.amp):
+            
+            # Check for NaN in input
+            if torch.isnan(x).any():
+                raise ValueError(f"NaN in input for batch {batch_idx}, uids: {uids}")
+            
+            amp_enabled = args.amp is not None
+            # bf16 is recommended (same exponent range as fp32, no overflow)
+            amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16 
+            with torch.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 feats = slice_encoder(x)  # (B, D, embed_dim)
-            feats = feats.cpu()
+            feats = feats.cpu().to(dtype=torch.float32)
+            
+            # Check for NaN/Inf in output
+            if torch.isnan(feats).any() or torch.isinf(feats).any():
+                raise ValueError(f"NaN/Inf in features for batch {batch_idx}, uids: {uids}")
 
             # Save one file per case in the batch
             for i, uid in enumerate(uids):
                 save_path = out_dir / f"{uid}.safetensors"
-                tensor_dict = {"feats": feats[i].to(dtype=torch.float16)}  
+                tensor_dict = {"feats": feats[i]}  
                 metadata = {
                     "uid": str(uid),
                     "plane": str(args.plane),
                     "model_name": str(args.model_name),
                     "num_slices": str(num_slices),
                 }
-                if args.mri_sequence:
-                    metadata["mri_sequence"] = str(args.mri_sequence)
                 save_file(tensor_dict, str(save_path), metadata=metadata)
 
 

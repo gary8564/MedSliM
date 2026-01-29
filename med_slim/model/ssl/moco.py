@@ -14,25 +14,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
+from accelerate import Accelerator
 
 from med_slim.model.sequence_encoder.cobra import Cobra
-
-
-@torch.no_grad()
-def concat_all_gather(tensor):
-    """
-    Performs all_gather operation on the provided tensors.
-    *** Warning ***: torch.distributed.all_gather has no gradient.
-    """
-    # If distributed is not initialized, just return the input tensor
-    if (not torch.distributed.is_available()) or (not torch.distributed.is_initialized()):
-        return tensor
-    world_size = torch.distributed.get_world_size()
-    tensors_gather = [torch.ones_like(tensor) for _ in range(world_size)] # world_size = number of GPUs
-    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
-
-    output = torch.cat(tensors_gather, dim=0)
-    return output
 
 class MoCo(nn.Module): 
     """
@@ -44,6 +28,7 @@ class MoCo(nn.Module):
         self,
         embed_dim: int,
         contrast_dim: int,
+        accelerator: Accelerator,
         input_dims: Optional[List[int]] = None,
         num_heads: int = 8,
         num_layers: int = 2,
@@ -57,6 +42,7 @@ class MoCo(nn.Module):
         Args:
             embed_dim: Internal embedding dimensionality.
             contrast_dim: Output dimensionality for contrastive features.
+            accelerator: HuggingFace Accelerator for distributed training.
             input_dims: List of input feature dimensions to support.
             num_heads: Number of attention heads.
             num_layers: Number of layers in the sequence encoder.
@@ -77,6 +63,7 @@ class MoCo(nn.Module):
             input_dims = [512, 768, 1024, 1152, 1376, 1536]
 
         self.T = T
+        self.accelerator = accelerator
 
         # Shared encoder kwargs
         encoder_kwargs = dict(
@@ -150,11 +137,15 @@ class MoCo(nn.Module):
         # normalize
         q = F.normalize(q, dim=1)
         k = F.normalize(k, dim=1)
+        
         # gather all targets
-        k = concat_all_gather(k) # shape [world_size * batch_size, contrast_dim]
+        with torch.no_grad():
+            k = self.accelerator.gather(k)  # shape [world_size * batch_size, contrast_dim]
+        
         # Einstein sum is more intuitive
         logits = torch.einsum('nc, mc -> nm', [q, k]) / self.T # shape [batch_size, world_size * batch_size]
-        N = logits.shape[0]  # batch size per GPU = world_size * batch_size
-        rank = torch.distributed.get_rank() if (torch.distributed.is_available() and torch.distributed.is_initialized()) else 0
+        N = logits.shape[0]  # batch size per GPU
+        rank = self.accelerator.process_index
         labels = (torch.arange(N, dtype=torch.long, device=logits.device) + N * rank) # for query i, the correct class index is i (or i + offset) (N * rank is for multi-GPU setting)
+        
         return nn.CrossEntropyLoss()(logits, labels) * (2 * self.T)

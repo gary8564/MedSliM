@@ -1,20 +1,21 @@
 # Path to pretrained MedSliM checkpoint
-checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-01-09-04:53/medslim_test_run_MRNet-epoch2000.pth.tar"
+checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-01-09-04:55/medslim_test_run_MRNet-epoch2000.pth.tar"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
+freeze_cobra: false  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
 
 feat_dataset:
   dataset_name: "MRNet"
   feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32"
-  plane: 
+  plane:
     - "sagittal"
     # - "coronal"
     # - "axial"
   model_name:
     - "dinov2"
-    # - "rad-dino"
-    # - "dinov3"
+    - "rad-dino"
+    - "dinov3"
     - "medsiglip"
-    # - "biomedclip"
+    - "biomedclip"
     - "ark"
 
 train_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/train.csv"
@@ -27,14 +28,16 @@ target_labels:
   - "meniscus" # "acl", "meniscus"
 
 # Hyperparameters
+# Note: For fine-tuning, use lower learning rate and enable early stopping
 hyperparams:
   batch_size: 16
-  lr: 5e-5 #1e-5
+  lr: 1e-6  # Linear probing: 5e-5, Fine-tuning: 1e-6 to 5e-6
+  weight_decay: 0.01  # L2 regularization to prevent overfitting
   warmup_ratio: 0.1  
   max_epochs: 100
   num_workers: 4
   val_split_ratio: 0.1
-  # patience: 10  # Uncomment to enable early stopping
+  patience: 10  # Early stopping: stop if val_auroc doesn't improve for 10 epochs
   
   # Linear classifier hyperparameters
   linear:

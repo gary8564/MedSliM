@@ -237,18 +237,23 @@ class ArkFeatureExtractor(nn.Module):
         x = x.swapaxes(2, -1) # [B, C, W, H, D] -> [B, C, D, H, W]
         B, C, *_ = x.shape
         assert C == 1, "MRI/CT slices should be grayscale (C = 1)"
-        x = rearrange(x, 'b c d h w -> (b d c) h w') 
-        x = x[:, None, :, :] # [B*D, H, W] -> [B*D, 1, H, W]
-        x = x.repeat(1, 3, 1, 1) # Gray to RGB
+        
+        # Rearrange to process slices: [B, 1, D, H, W] -> [B*D, 1, H, W]
+        x = rearrange(x, 'b c d h w -> (b d) c h w')
+        
         # Micro-batch over slices to avoid CUDA out of memory
         total_slices = x.shape[0]  # B*D
         chunk_size = 2
         outputs = []
+        
         for start in range(0, total_slices, chunk_size):
             end = min(start + chunk_size, total_slices)
-            x_chunk = x[start:end]
+            # Convert grayscale to RGB only for current chunk (saves GPU memory during forward pass)
+            x_chunk = x[start:end].repeat(1, 3, 1, 1)  # [chunk, 1, H, W] -> [chunk, 3, H, W]
             out_chunk = self.model.generate_embeddings(x_chunk, after_proj=self.use_projector)
-            outputs.append(out_chunk)
+            outputs.append(out_chunk)  # Keep on GPU - embeddings are small
+            del x_chunk
+        
         features = torch.cat(outputs, dim=0)
         features = rearrange(features, '(b d) e -> b d e', b=B) # [(B D), embed_dim] -> [B, D, embed_dim]
         return features

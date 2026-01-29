@@ -316,7 +316,7 @@ class Cobra(nn.Module):
             logits = rearrange(fm_embs, 'k b t e -> b (t k) e')  # [B, num_slices* K, embed_dim]
         return logits
 
-    def forward(self, x, input_feature_dims=None, seq_lengths=None, get_attention=False):
+    def forward(self, x, input_feature_dims=None, seq_lengths=None, get_attention=False, return_slice_embeddings=False):
         """
         Forward pass through the Cobra network.
         
@@ -325,9 +325,12 @@ class Cobra(nn.Module):
             input_feature_dims: Feature dimensions per sample [B] (SSL mode).
             seq_lengths: Actual sequence lengths [B] for masking padded positions.
             get_attention: If True, return attention map instead of features.
+            return_slice_embeddings: If True, return slice-level embeddings [B, num_slices, embed_dim]
+                                     before aggregation (after Mamba/Transformer blocks).
         
         Returns:
             If get_attention=True: Attention map [B, 1, num_slices]
+            If return_slice_embeddings=True: Slice embeddings [B, num_slices, embed_dim]
             Otherwise: Features [B, contrast_dim] (train) or [B, embed_dim] (inference)
         """
         # Foundation model feature embedding
@@ -362,6 +365,13 @@ class Cobra(nn.Module):
         else:
             h = self.seq_enc(logits, src_key_padding_mask=src_key_padding_mask)
         h = self.norm(h)
+
+        # Return slice-level embeddings before aggregation
+        if return_slice_embeddings:
+            if self.slice_pooling == "cls":
+                # Remove CLS token from output
+                return h[:, 1:, :]  # [B, num_slices, embed_dim]
+            return h  # [B, num_slices, embed_dim]
 
         # Slice feature aggregation
         # CLS token pooling

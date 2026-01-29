@@ -21,7 +21,7 @@ from jinja2 import Environment, FileSystemLoader
 from pprint import pprint
 from datetime import datetime
 import math
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 import wandb
 
 from med_slim.model.ssl import MoCo
@@ -49,7 +49,10 @@ def validate_args(args) -> None:
 
 def main(args, cfg):
 
-    accelerator = Accelerator()
+    # Enable find_unused_parameters for DDP
+    # Needed because COBRA uses nn.ModuleDict with embedding layers for each input dim, but only one is used per forward pass
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
 
     if not accelerator.is_main_process:
@@ -90,6 +93,7 @@ def main(args, cfg):
     model = MoCo(
         embed_dim=cobra_cfg["embed_dim"],
         contrast_dim=cobra_cfg["contrast_dim"],
+        accelerator=accelerator,
         input_dims=cobra_cfg["input_dims"],
         num_heads=cobra_cfg["num_heads"],
         num_layers=cobra_cfg["num_layers"],
@@ -135,7 +139,7 @@ def main(args, cfg):
         batch_size=per_device_batch_size,
         shuffle=True,
         num_workers=cfg["train"]["num_workers"],
-        drop_last=True,
+        drop_last=False,
         pin_memory=True,
         collate_fn=ssl_collate_fn,
     )
@@ -178,15 +182,31 @@ def main(args, cfg):
             seq_lens1 = seq_lens1.to(dtype=torch.long)
             seq_lens2 = seq_lens2.to(dtype=torch.long)
             
+            optimizer.zero_grad(set_to_none=True)
             with accelerator.autocast():
                 loss = model(x1, x2, input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
                            seq_lengths_1=seq_lens1, seq_lengths_2=seq_lens2, m=curr_m)
-            optimizer.zero_grad(set_to_none=True)
+            
+            # NaN check
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise RuntimeError(f"NaN/Inf loss detected at epoch {e+1} with iter {i}.")
+            
             accelerator.backward(loss)
             # Gradient clipping to prevent exploding gradients
             accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            total_loss += loss.detach().item()
+            
+            loss_val = loss.detach().item()
+            total_loss += loss_val
+            
+            # Log iteration-level metrics to WandB
+            if accelerator.is_main_process:
+                global_step = e * iters_per_epoch + i
+                wandb.log({
+                    "train/step_loss": loss_val,
+                    "train/lr": curr_lr,
+                    "train/momentum": curr_m,
+                }, step=global_step)
 
         if accelerator.is_main_process:
             avg_loss = total_loss / len(loader)
@@ -194,8 +214,7 @@ def main(args, cfg):
             wandb.log({
                 "train/epoch": e + 1,
                 "train/epoch_loss": avg_loss,
-                "train/lr": curr_lr,
-            }, step=e + 1)
+            }, step=e * iters_per_epoch + iters_per_epoch)
             if (e + 1) % 50 == 0:
                 state = {
                     "epoch": e + 1,
