@@ -12,6 +12,7 @@ from glob import glob
 from tqdm import tqdm
 from safetensors import safe_open
 from collections import defaultdict
+from torch.nn.utils.rnn import pad_sequence
 
 from med_slim.logging.setup import init_logging
 init_logging()
@@ -59,6 +60,70 @@ class FeatureCache:
             return cached
         with safe_open(path, framework="pt", device="cpu") as f:
             return f.get_tensor("feats")
+
+def ssl_packed_collate_fn(batch):
+    """
+    Packed sequence collate function for PrecomputedFeatPairDataset.
+    
+    Instead of padding all sequences to max_seq_len (wasting memory/compute),
+    concatenates all sequences and uses cumulative sequence lengths (cu_seqlens)
+    to track document boundaries.
+    
+    Efficient for:
+    - Mamba2: Uses seq_idx or cu_seqlens to avoid passing states in between
+    - Transformer with FlashAttention/varlen_attn: Uses cu_seqlens for variable-length attention
+    
+    Returns:
+        dict with keys:
+            - feats1: packed features with shape [total_seq_len, max_feat_dim]
+            - feats2: packed features with shape [total_seq_len, max_feat_dim]  
+            - cu_seqlens1: cumulative sequence lengths for view 1 with shape [B+1]
+            - cu_seqlens2: cumulative sequence lengths for view 2 with shape [B+1]
+            - max_seqlen1: max sequence length in batch for view 1
+            - max_seqlen2: max sequence length in batch for view 2
+            - seq_idx1: index for each token with shape [total_seq_len] (needed for Mamba2)
+            - seq_idx2: index for each token with shape [total_seq_len] (needed for Mamba2)
+            - orig_embed_dim1: original embedding dimensions with shape [B]
+            - orig_embed_dim2: original embedding dimensions with shape [B]
+    """
+    feats1_list = [item["feats1"] for item in batch]
+    feats2_list = [item["feats2"] for item in batch]
+    orig_embed_dims1 = torch.stack([item["orig_embed_dim1"].to(dtype=torch.long) for item in batch], dim=0)
+    orig_embed_dims2 = torch.stack([item["orig_embed_dim2"].to(dtype=torch.long) for item in batch], dim=0)
+    
+    batch_size = len(batch)
+    
+    # Get sequence lengths
+    seq_lens1 = torch.tensor([feat.shape[0] for feat in feats1_list], dtype=torch.int32)
+    seq_lens2 = torch.tensor([feat.shape[0] for feat in feats2_list], dtype=torch.int32)
+    
+    # Compute cumulative sequence lengths (cu_seqlens)
+    cu_seqlens1 = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens2 = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens1[1:] = torch.cumsum(seq_lens1, dim=0)
+    cu_seqlens2[1:] = torch.cumsum(seq_lens2, dim=0)
+    
+    # Pack features: concatenate all sequences along sequence length dimension
+    feats1_packed = torch.cat(feats1_list, dim=0)  # [total_seq_len1, max_feat_dim]
+    feats2_packed = torch.cat(feats2_list, dim=0)  # [total_seq_len2, max_feat_dim]
+    
+    # Vectorized building seq_idx: repeat each batch index by its sequence length
+    seq_idx1 = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens1)
+    seq_idx2 = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens2)
+    
+    return {
+        "feats1": feats1_packed,  # [total_seq_len, max_feat_dim]
+        "feats2": feats2_packed,
+        "cu_seqlens1": cu_seqlens1,  # [B+1]
+        "cu_seqlens2": cu_seqlens2,
+        "max_seqlen1": seq_lens1.max().item(),
+        "max_seqlen2": seq_lens2.max().item(),
+        "seq_idx1": seq_idx1,  # [total_seq_len] 
+        "seq_idx2": seq_idx2,
+        "orig_embed_dim1": orig_embed_dims1,  # [B]
+        "orig_embed_dim2": orig_embed_dims2,
+        "batch_size": batch_size,
+    }
 
 
 def linear_classifier_collate_fn(batch):
@@ -426,11 +491,13 @@ class PrecomputedFeatPairDataset(Dataset):
     def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
         Pad the embedding dimension to the largest embedding dimension in the batch by padding with zeros if it is smaller than the target dimension.
+        Pad the embedding dimension to the largest embedding dimension in the batch by padding with zeros if it is smaller than the target dimension.
         """
         seq_len, embed_dim = x.shape
         
         if embed_dim < self.max_feature_dim:
             pad_size = self.max_feature_dim - embed_dim
+            x = torch.nn.functional.pad(x, (0, pad_size), mode='constant', value=0)
             x = torch.nn.functional.pad(x, (0, pad_size), mode='constant', value=0)
         return x, embed_dim
     

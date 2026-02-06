@@ -16,6 +16,9 @@
 # Load Intel libraries (required by Triton for mamba_ssm kernels)
 module load intel 2>/dev/null || true
 
+# Load Intel libraries (required by Triton for mamba_ssm kernels)
+module load intel 2>/dev/null || true
+
 source .venv/bin/activate
 
 # Reduce fragmentation and enable expandable segments
@@ -25,6 +28,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 # Multi-GPU settings
+NUM_GPUS=1
 NUM_GPUS=1
 
 ### Configuration

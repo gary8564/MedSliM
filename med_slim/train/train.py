@@ -219,27 +219,54 @@ def main(args, cfg):
 
             optimizer.zero_grad(set_to_none=True)
             
-            x1 = batch["feats1"].to(dtype=torch.float32)
-            x2 = batch["feats2"].to(dtype=torch.float32)
-            sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
-            sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
-            seq_lens = batch["seq_len"].to(dtype=torch.long)
-            
             # Semi-supervised mode: pass labels when available (SupCon for labeled, InfoNCE for unlabeled)
             labels = batch.get("label", None)
             has_label = batch.get("has_label", None)
             if labels is not None:
                 labels = labels.to(dtype=torch.float32)
             
-            with accelerator.autocast():
-                loss = model(
-                    x1, x2, 
-                    input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
-                    seq_lengths=seq_lens, 
-                    m=curr_m,
-                    labels=labels,
-                    has_label=has_label,
-                )
+            if use_packed:
+                # Packed sequence mode
+                x1 = batch["feats1"].to(dtype=torch.float32)
+                x2 = batch["feats2"].to(dtype=torch.float32)
+                cu_seqlens1 = batch["cu_seqlens1"].to(device=device)
+                cu_seqlens2 = batch["cu_seqlens2"].to(device=device)
+                max_seqlen1 = batch["max_seqlen1"]
+                max_seqlen2 = batch["max_seqlen2"]
+                sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
+                sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
+                seq_idx1 = batch["seq_idx1"].to(device=device)
+                seq_idx2 = batch["seq_idx2"].to(device=device)
+                
+                with accelerator.autocast():
+                    loss = model(
+                        x1, x2,
+                        input_feature_dims_1=sizes1, input_feature_dims_2=sizes2,
+                        m=curr_m,
+                        use_packed=True,
+                        cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+                        max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+                        seq_idx1=seq_idx1, seq_idx2=seq_idx2,
+                        labels=labels,
+                        has_label=has_label,
+                    )
+            else:
+            
+                x1 = batch["feats1"].to(dtype=torch.float32)
+                x2 = batch["feats2"].to(dtype=torch.float32)
+                sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
+                sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
+                seq_lens = batch["seq_len"].to(dtype=torch.long)
+            
+                with accelerator.autocast():
+                    loss = model(
+                        x1, x2, 
+                        input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
+                        seq_lengths=seq_lens, 
+                        m=curr_m,
+                        labels=labels,
+                        has_label=has_label,
+                    )
             
             # NaN check
             if torch.isnan(loss) or torch.isinf(loss):
@@ -265,6 +292,10 @@ def main(args, cfg):
                     num_labeled = has_label.sum().item()
                     log_dict["train/labeled_ratio"] = num_labeled / has_label.shape[0]
                 wandb.log(log_dict, step=global_step)
+
+        # Synchronization barrier: ensure all ranks finished the epoch before logging/checkpointing
+        # This helps catch GPU desync issues early rather than hanging during the next epoch
+        accelerator.wait_for_everyone()
 
         # Synchronization barrier: ensure all ranks finished the epoch before logging/checkpointing
         # This helps catch GPU desync issues early rather than hanging during the next epoch

@@ -145,6 +145,7 @@ class Cobra(nn.Module):
                 d_state=kwargs.get('d_state', 128),
             )
         else:
+            # Standard TransformerEncoder for zero-padding
             enc_layer = TransformerEncoderLayer(
                 d_model=embed_dim,
                 nhead=num_heads,
@@ -159,6 +160,17 @@ class Cobra(nn.Module):
                 enc_layer,
                 num_layers=num_layers,
                 enable_nested_tensor=False,
+            )
+            # VarlenTransformerEncoder for packed sequences using FlashAttention
+            self.varlen_seq_enc = VarlenTransformerEncoder(
+                d_model=embed_dim,
+                nhead=num_heads,
+                num_layers=num_layers,
+                dim_feedforward=kwargs.get('dim_feedforward', 4 * embed_dim),
+                dropout=dropout,
+                activation="gelu",
+                norm_first=kwargs.get('norm_first', True),
+                rotary_positional_encoding=kwargs.get('rotary_positional_encoding', None),
             )
 
         # Optional CLS token
@@ -307,29 +319,100 @@ class Cobra(nn.Module):
     def _embed_ssl_forward(self, x, input_feature_dims=None) -> torch.Tensor:
         """Foundation model feature embedding in SSL pretraining mode."""
         if input_feature_dims is not None:
-            assert len(x) == len(input_feature_dims), "Batch size mismatch between input x and input_feature_dims"
-            batch_size, seq_len, _ = x.shape
+            assert len(x)==len(input_feature_dims), "Batch size mismatch between input x and input_feature_dims"
+            logits = torch.concat([self.embed[str(input_feature_dims[i].item())](x[i,:,:input_feature_dims[i].item()]).unsqueeze(0) for i in range(len(x))], dim=0) # [B, num_slices, embed_dim]
+        else:
+            logits = self.embed[str(x.shape[-1])](x)  # [B, num_slices, embed_dim]
+        return logits
+    
+    def _embed_ssl_forward_packed(
+        self, 
+        x: torch.Tensor, 
+        cu_seqlens: torch.Tensor,
+        input_feature_dims: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Foundation model feature embedding in SSL mode (packed sequences).
+        
+        Args:
+            x: Packed input tensor [total_seq_len, feature_dim]
+            cu_seqlens: Cumulative sequence lengths [batch_size + 1], int32
+            input_feature_dims: Feature dimensions per sample [batch_size] (optional)
+        
+        Returns:
+            Embedded features [total_seq_len, embed_dim]
+        """
+        if input_feature_dims is not None:
+            batch_size = cu_seqlens.shape[0] - 1
+            total_seq_len = x.shape[0]
             
-            # Group samples by their feature dimension to batch-process each group
+            # Calculate sequence lengths
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]  # [batch_size]
+            
+            # Group slices by their feature dimension for batch processing
             unique_dims = input_feature_dims.unique()
             
             if len(unique_dims) == 1:
                 feat_dim = unique_dims[0].item()
-                logits = self.embed[str(feat_dim)](x[:, :, :feat_dim])
+                return self.embed[str(feat_dim)](x[:, :feat_dim])
             else:
+                slice_feat_dims = torch.repeat_interleave(input_feature_dims, seq_lens)  # [total_seq_len]
                 logits = None
                 for dim in unique_dims:
                     feat_dim = dim.item()
-                    mask = input_feature_dims == dim  # [batch_size]
-                    x_group = x[mask, :, :feat_dim]  # [num_samples_with_dim, seq_len, feat_dim]
-                    embedded = self.embed[str(feat_dim)](x_group)  # [num_samples_with_dim, seq_len, embed_dim]
+                    mask = slice_feat_dims == dim  # [total_seq_len]
+                    x_group = x[mask, :feat_dim]  # [num_slices_with_dim, feat_dim]
+                    embedded = self.embed[str(feat_dim)](x_group)  # [num_slices_with_dim, embed_dim]
                     if logits is None:
-                        logits = torch.zeros(batch_size, seq_len, self.embed_dim, device=x.device, dtype=embedded.dtype)
+                        logits = torch.zeros(total_seq_len, self.embed_dim, device=x.device, dtype=embedded.dtype)
                     logits[mask] = embedded
+                return logits
         else:
-            logits = self.embed[str(x.shape[-1])](x)  # [B, num_slices, embed_dim]
-        return logits
-
+            return self.embed[str(x.shape[-1])](x)  # [total_seq_len, embed_dim]
+        
+    def _packed_to_padded(
+        self, 
+        packed: torch.Tensor, 
+        cu_seqlens: torch.Tensor, 
+        max_seqlen: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert packed tensor to padded tensor with mask.
+        
+        Args:
+            packed: Packed tensor [total_seq_len, dim]
+            cu_seqlens: Cumulative sequence lengths [batch_size + 1]
+            max_seqlen: Maximum sequence length
+        
+        Returns:
+            padded: Padded tensor [batch_size, max_seqlen, dim]
+            mask: Boolean mask [batch_size, max_seqlen] (True = valid)
+        """
+        batch_size = cu_seqlens.shape[0] - 1
+        dim = packed.shape[-1]
+        total_len = packed.shape[0]
+        
+        # Calculate sequence lengths
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]  # [batch_size]
+        
+        # Vectorized mask creation
+        mask = torch.arange(max_seqlen, device=packed.device).unsqueeze(0) < lengths.unsqueeze(1)
+        
+        # Create batch indices
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device=packed.device), 
+            lengths
+        )
+        
+        # Create position indices
+        position_indices = torch.arange(total_len, device=packed.device) - cu_seqlens[:-1].repeat_interleave(lengths)
+        
+        # Scatter into padded tensor
+        padded = torch.zeros(batch_size, max_seqlen, dim, device=packed.device, dtype=packed.dtype)
+        padded[batch_indices, position_indices] = packed
+        
+        return padded, mask
+            
     def _embed_inference_forward(self, x) -> torch.Tensor:
         """Foundation model feature embedding in inference mode (zero padding)."""
         # Inference mode with ensembling feature embeddings from multiple slice encoders
@@ -395,6 +478,69 @@ class Cobra(nn.Module):
             A = self.attn[0](h, mask=mask) 
             A = torch.transpose(A, 2, 1) # [B, 1, num_slices]
         return A
+    
+    def _forward_packed(
+        self, 
+        x, 
+        input_feature_dims: torch.Tensor = None,
+        get_attention: bool = False,
+        return_slice_embeddings: bool = False,
+        cu_seqlens: torch.Tensor = None,
+        max_seqlen: int = None,
+        seq_idx: torch.Tensor = None,
+        **_,  # Ignore extra kwargs
+    ) -> torch.Tensor:
+        """Forward pass for packed/variable-length sequences."""
+        batch_size = cu_seqlens.shape[0] - 1
+        
+        # Foundation model feature embedding
+        if self.mode == "inference":
+            logits = self._embed_inference_forward(x)
+        else:
+            logits = self._embed_ssl_forward_packed(x, cu_seqlens, input_feature_dims)
+        
+        # Sequence encoder
+        if self.sequence_encoder == "transformer" and hasattr(self, 'varlen_seq_enc'):
+            # Transformer with FlashAttention varlen
+            # Processes all sequences in one pass without padding
+            h = self.varlen_seq_enc(logits, cu_seqlens, max_seqlen)
+            # Note: VarlenTransformerEncoder already has final LayerNorm
+        else:
+            # Pack all sequences into one batch with seq_idx indicating sequence boundaries
+            logits_packed = logits.unsqueeze(0)  # [1, total_seq_len, embed_dim]
+            seq_idx_2d = seq_idx.unsqueeze(0) if seq_idx is not None and seq_idx.dim() == 1 else seq_idx # [1, total_seq_len]
+            h = self.seq_enc(logits_packed, seq_idx=seq_idx_2d).squeeze(0)  # [total_seq_len, embed_dim]
+            h = self.norm(h)
+        
+        if return_slice_embeddings:
+            return h
+        
+        # Slice feature aggregation
+        if self.mode == "train":
+            h_padded, mask = self._packed_to_padded(h, cu_seqlens, max_seqlen)
+            A = self._abmil_pooling(h_padded, mask)
+        else:
+            A = self._abmil_pooling(h)
+        
+        if get_attention:
+            return [A[i, :, :cu_seqlens[i+1]-cu_seqlens[i]] for i in range(batch_size)]
+        
+        
+        if self.mode == "train":
+            pooled = torch.bmm(A, h_padded).squeeze(1)
+            return self.proj(pooled)
+        if self.pooling_target == "post_encoder":
+            return torch.bmm(A, h).squeeze(1)        # [B, embed_dim]
+        elif self.pooling_target == "raw":
+            if isinstance(x, list):
+                logger.info("Multi-FM mode: using first FM embedding dimension for raw pooling")
+                raw_x = x[0]
+            else:
+                raw_x = x
+            return torch.bmm(A, raw_x).squeeze(1)    # [B, raw_output_dim]
+        else:  # post_embed
+            return torch.bmm(A, logits).squeeze(1)   # [B, embed_dim]
+        
 
     def _forward(
         self, 
@@ -492,7 +638,8 @@ class Cobra(nn.Module):
         get_per_head_attention=False,
         return_slice_embeddings=False,
         seq_lengths=None,
-        **_,
+        use_packed: bool = False,
+        **kwargs,
     ):
         """
         Forward pass through the Cobra network.
@@ -505,7 +652,14 @@ class Cobra(nn.Module):
             get_attention: If True, return aggregated attention map [B, 1, num_slices].
             get_per_head_attention: If True, return per-head attention [B, num_heads, num_slices] (ABMIL only).
             return_slice_embeddings: If True, return slice-level embeddings [B, num_slices, embed_dim] before pooling.
-            seq_lengths: Actual sequence lengths [B] for masking padded positions.
+            use_packed: If True, use packed sequence for variable sequence length handling.
+            **kwargs: Mode-specific parameters
+                Padded mode:
+                    - seq_lengths: Actual sequence lengths [B] for masking padded positions.
+                Packed mode:
+                    - cu_seqlens: Cumulative sequence lengths [B+1], int32
+                    - max_seqlen: Maximum sequence length in the batch
+                    - seq_idx: Document index for each token [total_seq_len], int32
         
         Returns:
             If get_attention=True: Attention map [B, 1, num_slices]
@@ -513,11 +667,24 @@ class Cobra(nn.Module):
             If return_slice_embeddings=True: Slice embeddings [B, num_slices, embed_dim]
             Otherwise: Features [B, contrast_dim] (train) or [B, output_dim] (inference)
         """
-        return self._forward(
-            x,
-            input_feature_dims=input_feature_dims,
-            get_attention=get_attention,
-            get_per_head_attention=get_per_head_attention,
-            return_slice_embeddings=return_slice_embeddings,
-            seq_lengths=seq_lengths,
-        )
+        if use_packed:
+            if kwargs.get('cu_seqlens') is None or kwargs.get('max_seqlen') is None or kwargs.get('seq_idx') is None:
+                raise ValueError("cu_seqlens, max_seqlen, and seq_idx are required for packed mode.")
+            return self._forward_packed(
+                x,
+                input_feature_dims=input_feature_dims,
+                get_attention=get_attention,
+                return_slice_embeddings=return_slice_embeddings,
+                **kwargs,
+            )
+        else:
+            if kwargs.get('seq_lengths') is None:
+                raise ValueError("seq_lengths is required for padded mode.")
+            return self._forward(
+                x,
+                input_feature_dims=input_feature_dims,
+                get_attention=get_attention,
+                get_per_head_attention=get_per_head_attention,
+                return_slice_embeddings=return_slice_embeddings,
+                **kwargs,
+            )

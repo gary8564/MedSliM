@@ -27,6 +27,7 @@ POOLING_TARGET="raw"
 N_FOLDS=3
 EXTRA_ARGS=""
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
+if [[ -n "${CHECKPOINT_PATH}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --checkpoint-path ${CHECKPOINT_PATH}"
 fi
 

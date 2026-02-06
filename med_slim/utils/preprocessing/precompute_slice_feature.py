@@ -18,6 +18,12 @@ from med_slim.utils.preprocessing.transforms import get_transforms, get_adaptive
 # Preprocessing modes available for experimentation
 # Each mode can be used as a form of augmentation in SSL
 SPATIAL_MODES = ["resize", "resample", "crop", "adaptive"]
+from med_slim.utils.preprocessing.transforms import get_transforms, get_adaptive_transform
+
+
+# Preprocessing modes available for experimentation
+# Each mode can be used as a form of augmentation in SSL
+SPATIAL_MODES = ["resize", "resample", "crop", "adaptive"]
 
 def get_num_slices(data_dir: str, split: str, plane: str) -> int:
     pattern = os.path.join(data_dir, split, plane, '*.nii.gz')
@@ -27,6 +33,40 @@ def get_num_slices(data_dir: str, split: str, plane: str) -> int:
         image = nib.load(nifti_file_path).get_fdata()
         num_slices.append(image.shape[2])
     return int(np.ceil(np.mean(num_slices)))
+
+def build_transform(model_name: str, spatial_mode: str, num_slices: int = None):
+    """
+    Build the appropriate transform based on spatial mode.
+    
+    Args:
+        model_name: Name of the pretrained model (e.g., 'ark', 'dinov2', 'dinov3', 'rad-dino', 'medsiglip', 'biomedclip')
+        spatial_mode: Preprocessing strategy:
+            - 'resize': Scale in-plane to target size (fast, may distort aspect ratio)
+            - 'resample': Resample maintaining physical spacing (preserves anatomy)
+            - 'crop': CropOrPad to target size (preserves native resolution)
+            - 'adaptive': Smart selection based on source/target resolution ratio
+        num_slices: Number of slices for depth dimension (None = keep original)
+    
+    Returns:
+        val_transform: The validation/inference transform (no augmentation)
+    """
+    if spatial_mode == "adaptive":
+        # AdaptivePreprocessing chooses optimal strategy based on resolution
+        return get_adaptive_transform(
+            model_name=model_name,
+            num_slices=num_slices,
+            to_tensor=False,
+        )
+    else:
+        # Standard transforms with specified spatial mode
+        _, val_transform = get_transforms(
+            model_name=model_name,
+            num_slices=num_slices,
+            spatial_mode=spatial_mode,
+            to_tensor=False,
+        )
+        return val_transform
+
 
 def build_transform(model_name: str, spatial_mode: str, num_slices: int = None):
     """
@@ -81,9 +121,32 @@ def main():
                 python precompute_slice_feature.py --spatial-mode adaptive
                 """
     )
+    parser = argparse.ArgumentParser(
+        description="Precompute slice features with different preprocessing strategies",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+                Examples:
+                # Precompute with resize
+                python precompute_slice_feature.py --spatial-mode resize
+                
+                # Precompute with resample
+                python precompute_slice_feature.py --spatial-mode resample
+                
+                # Precompute with crop
+                python precompute_slice_feature.py --spatial-mode crop
+                
+                # Precompute with adaptive selection based on source/target resolution ratio
+                python precompute_slice_feature.py --spatial-mode adaptive
+                """
+    )
     parser.add_argument("--data-dir", type=str, default="/hpcwork/rwth1833/datasets/preprocessed/MRNet", help="Root folder of the dataset to precompute.")
     parser.add_argument("--save-dir", type=str, default="/hpcwork/rwth1833/feat_caches/MRNet", help="Output directory for precomputed features.")
     parser.add_argument("--plane", type=str, default="axial", choices=["axial", "sagittal", "coronal"], help="Plane of the slices to be precomputed.")
+    parser.add_argument("--spatial-mode", type=str, default="crop", choices=SPATIAL_MODES,
+                        help="Preprocessing strategy: "
+                             "'resize' (scale to target), 'resample' (maintain spacing), "
+                             "'crop' (crop/pad to target), 'adaptive' (adaptive selection). "
+                             "Default: crop")
     parser.add_argument("--spatial-mode", type=str, default="crop", choices=SPATIAL_MODES,
                         help="Preprocessing strategy: "
                              "'resize' (scale to target), 'resample' (maintain spacing), "
@@ -102,12 +165,20 @@ def main():
     parser.add_argument("--min-slices", type=int, default=10,
                         help="Minimum number of slices required. Volumes with fewer slices "
                              "(e.g., scout/localizer scans) are skipped. Default: 10")
+    parser.add_argument("--min-slices", type=int, default=10,
+                        help="Minimum number of slices required. Volumes with fewer slices "
+                             "(e.g., scout/localizer scans) are skipped. Default: 10")
     # Optimization options
     parser.add_argument("--shard-id", type=int, default=0, help="Shard ID for parallel processing (0-indexed)")
     parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards for parallel processing")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile for faster inference")
     args = parser.parse_args()
     device = torch.device("cuda")
+    
+    # Validate spatial mode
+    spatial_mode = args.spatial_mode
+    if spatial_mode not in SPATIAL_MODES:
+        raise ValueError(f"Unknown spatial_mode: {spatial_mode}. Choose from {SPATIAL_MODES}")
     
     # Validate spatial mode
     spatial_mode = args.spatial_mode
@@ -123,8 +194,11 @@ def main():
         slice_encoder = torch.compile(slice_encoder)
     
     # Determine num_slices and build transforms
+    # Determine num_slices and build transforms
     if args.use_raw_slice_resolution:
         batch_size = 1
+        num_slices = None
+        num_slices_for_logging = "raw"
         num_slices = None
         num_slices_for_logging = "raw"
     else:
@@ -152,6 +226,11 @@ def main():
     # This enables using different preprocessing as positive pairs in SSL
     out_dir = Path(args.save_dir) / f"slices_{num_slices_for_logging}" / spatial_mode / args.model_name / args.split / args.plane
     # out_dir = Path(args.save_dir) / f"slices_{num_slices_for_logging}" / args.model_name / args.split / args.plane
+    # Build output directory path: {save_dir}/slices_{num_slices}/{spatial_mode}/{model_name}/{split}/{plane}/
+    # Including spatial_mode in path allows storing features from different preprocessing methods
+    # This enables using different preprocessing as positive pairs in SSL
+    out_dir = Path(args.save_dir) / f"slices_{num_slices_for_logging}" / spatial_mode / args.model_name / args.split / args.plane
+    # out_dir = Path(args.save_dir) / f"slices_{num_slices_for_logging}" / args.model_name / args.split / args.plane
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ds = SliceDataset(
@@ -160,6 +239,24 @@ def main():
         transform=image_transforms,
         plane=args.plane,
     )
+    
+    # Filter out volumes with too few slices (e.g., scout/localizer scans)
+    if args.min_slices > 0:
+        valid_indices = []
+        skipped = []
+        for idx in range(len(ds)):
+            uid = ds.sample_ids[idx]
+            img_path = ds.path_root / ds.split / ds.plane / f"{uid}.nii.gz"
+            n_slices = nib.load(str(img_path)).shape[2]
+            if n_slices >= args.min_slices:
+                valid_indices.append(idx)
+            else:
+                skipped.append((uid, n_slices))
+        if skipped:
+            print(f"Skipping {len(skipped)} volumes with less than {args.min_slices} slices:")
+            for uid, n in skipped:
+                print(f"  {uid}: {n} slices")
+            ds = Subset(ds, valid_indices)
     
     # Filter out volumes with too few slices (e.g., scout/localizer scans)
     if args.min_slices > 0:
@@ -224,6 +321,8 @@ def main():
                     "uid": str(uid),
                     "plane": str(args.plane),
                     "model_name": str(args.model_name),
+                    "num_slices": num_slices_for_logging,
+                    "spatial_mode": spatial_mode,
                     "num_slices": num_slices_for_logging,
                     "spatial_mode": spatial_mode,
                 }

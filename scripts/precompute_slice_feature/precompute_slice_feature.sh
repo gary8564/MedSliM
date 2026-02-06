@@ -8,6 +8,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=32G 
 #SBATCH --time=1:00:00                 
+#SBATCH --time=1:00:00                 
 #SBATCH --job-name=precompute_slice_feature_%j
 #SBATCH --output=stdout_precompute_slice_feature_%j.txt    
 #SBATCH --account=rwth1833    
@@ -19,6 +20,8 @@ source .venv/bin/activate
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
+DATA_DIR="/work/rwth1833/datasets/preprocessed/fastMRI" #"/hpcwork/rwth1833/datasets/preprocessed/MRNet"
+SAVE_DIR="/hpcwork/rwth1833/feat_caches/fastMRI" #"/hpcwork/rwth1833/feat_caches/MRNet"
 DATA_DIR="/work/rwth1833/datasets/preprocessed/fastMRI" #"/hpcwork/rwth1833/datasets/preprocessed/MRNet"
 SAVE_DIR="/hpcwork/rwth1833/feat_caches/fastMRI" #"/hpcwork/rwth1833/feat_caches/MRNet"
 PLANE="axial"
@@ -55,5 +58,6 @@ python ./med_slim/utils/preprocessing/precompute_slice_feature.py \
     --plane "$PLANE" \
     --model-name "$MODEL_NAME" \
     --split "$SPLIT" \
+    --spatial-mode "$SPATIAL_MODE" \
     --spatial-mode "$SPATIAL_MODE" \
     $EXTRA_ARGS

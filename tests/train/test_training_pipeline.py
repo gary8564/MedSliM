@@ -1,11 +1,14 @@
 import torch
 import torch._dynamo
 import torch._inductor.config as inductor_config
+import torch._dynamo
+import torch._inductor.config as inductor_config
 import pytest
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 
 from med_slim.model.ssl import MoCo
+from med_slim.data import ssl_packed_collate_fn
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,6 +188,10 @@ def test_training_with_transformer_encoder():
             input_feature_dims_1=size1, input_feature_dims_2=size2,
             seq_lengths=seq_lens,
             m=0.99,
+            use_packed=True,
+            cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+            max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+            seq_idx1=seq_idx1, seq_idx2=seq_idx2,
         )
         assert torch.isfinite(loss).all(), f"Loss is not finite: {loss}"
 

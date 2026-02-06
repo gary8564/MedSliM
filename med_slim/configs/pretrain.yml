@@ -1,5 +1,6 @@
 feat_dataset:
-  # Directory structure: {feat_dir}/{model}/{split}/{plane}/*.safetensors
+  # Directory structure (with spatial_modes): {feat_dir}/{spatial_mode}/{model}/{split}/{plane}/*.safetensors
+  # Directory structure (without spatial_modes): {feat_dir}/{model}/{split}/{plane}/*.safetensors
   datasets:
     # Semi-supervised contrastive learning (SemiSupCon):
     # Uncomment to use SupCon loss for labeled MRNet samples alongside InfoNCE.
