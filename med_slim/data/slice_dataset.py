@@ -39,7 +39,7 @@ class SliceDataset(data.Dataset):
         self.path_root = Path(path_root)
         self.split = split 
         self.transform = transform
-        self.df = pd.read_csv(self.path_root/f'{split}.csv', index_col='ID')
+        self.df = pd.read_csv(self.path_root/f'{split}.csv', index_col='ID', dtype={'ID': str})
         self.plane = plane
         
         # Filter DataFrame by plane if column exists
@@ -56,7 +56,7 @@ class SliceDataset(data.Dataset):
 
     def __getitem__(self, index):
         sample_id = self.sample_ids[index]
-        uid = str(sample_id)  
+        uid = str(sample_id)
         img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
         img = tio.ScalarImage(img_path)
         if self.transform is not None:
@@ -85,7 +85,7 @@ class SliceClassificationDataset(SliceDataset):
     
     def __getitem__(self, index):
         sample_id = self.sample_ids[index]
-        uid = str(sample_id) 
+        uid = str(sample_id)
         img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
         img = tio.ScalarImage(img_path)
         if self.transform is not None:
@@ -114,7 +114,7 @@ class SliceSegmentationDataset(SliceDataset):
     
     def __getitem__(self, index):
         sample_id = self.sample_ids[index]
-        uid = str(sample_id) 
+        uid = str(sample_id)
         img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
         mask_path = self.path_root / f'{self.split}' / f'{self.plane}' / 'mask' / f'{uid}.nii.gz'
         img = tio.ScalarImage(img_path)

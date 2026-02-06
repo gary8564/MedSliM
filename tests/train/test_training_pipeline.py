@@ -1,9 +1,12 @@
 import torch
+import torch._dynamo
+import torch._inductor.config as inductor_config
 import pytest
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 
 from med_slim.model.ssl import MoCo
+from med_slim.data import ssl_packed_collate_fn
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -135,8 +138,6 @@ def test_training_one_epoch_random_data():
 
 def test_training_packed_sequences():
     """Test training with packed sequences (variable-length without padding)."""
-    from med_slim.data import ssl_packed_collate_fn
-    
     torch.manual_seed(0)
 
     # Tiny problem size for speed
@@ -200,16 +201,15 @@ def test_training_packed_sequences():
         seq_idx1 = batch["seq_idx1"].to(DEVICE)
         seq_idx2 = batch["seq_idx2"].to(DEVICE)
 
-        # Use forward_packed
-        loss = model.forward_packed(
+        loss = model(
             feats1, feats2,
-            cu_seqlens1, cu_seqlens2,
-            max_seqlen1, max_seqlen2,
             input_feature_dims_1=orig_embed_dim1,
             input_feature_dims_2=orig_embed_dim2,
-            seq_idx1=seq_idx1,
-            seq_idx2=seq_idx2,
             m=0.99,
+            use_packed=True,
+            cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+            max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+            seq_idx1=seq_idx1, seq_idx2=seq_idx2,
         )
         assert torch.isfinite(loss).all(), f"Loss is not finite: {loss}"
 
@@ -232,8 +232,6 @@ def test_training_packed_sequences():
 
 def test_training_packed_sequences_mamba2():
     """Test training with packed sequences using Mamba2 encoder."""
-    from med_slim.data import ssl_packed_collate_fn
-    
     torch.manual_seed(0)
 
     batch_size = 4
@@ -292,15 +290,15 @@ def test_training_packed_sequences_mamba2():
         seq_idx1 = batch["seq_idx1"].to(DEVICE)
         seq_idx2 = batch["seq_idx2"].to(DEVICE)
 
-        loss = model.forward_packed(
+        loss = model(
             feats1, feats2,
-            cu_seqlens1, cu_seqlens2,
-            max_seqlen1, max_seqlen2,
             input_feature_dims_1=orig_embed_dim1,
             input_feature_dims_2=orig_embed_dim2,
-            seq_idx1=seq_idx1,
-            seq_idx2=seq_idx2,
             m=0.99,
+            use_packed=True,
+            cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+            max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+            seq_idx1=seq_idx1, seq_idx2=seq_idx2,
         )
         assert torch.isfinite(loss).all(), f"Loss is not finite: {loss}"
 
@@ -322,8 +320,6 @@ def test_training_packed_sequences_mamba2():
 
 def test_packed_collate_fn_shapes():
     """Test that ssl_packed_collate_fn produces correct shapes."""
-    from med_slim.data import ssl_packed_collate_fn
-    
     batch_size = 4
     feature_dim = 16
     
@@ -367,5 +363,368 @@ def test_packed_collate_fn_shapes():
     assert collated["cu_seqlens2"][0] == 0
     assert (collated["cu_seqlens1"][1:] > collated["cu_seqlens1"][:-1]).all()
     assert (collated["cu_seqlens2"][1:] > collated["cu_seqlens2"][:-1]).all()
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch.compile tests")
+class TestTorchCompile:
+    """
+    Test suite for torch.compile() compatibility.
+    
+    These tests verify that the training pipeline works correctly with torch.compile(),
+    catching issues like CUDA graph incompatibilities before submitting to SLURM.
+    """
+    
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Reset torch.compile cache between tests."""
+        torch._dynamo.reset()
+        yield
+        torch._dynamo.reset()
+    
+    def test_compile_transformer_padded(self):
+        """Test torch.compile() with transformer encoder and padded sequences."""
+        torch.manual_seed(42)
+        
+        batch_size = 2
+        num_batches = 2
+        num_slices = 8
+        feature_dim = 16
+        
+        accelerator = Accelerator()
+        
+        model = MoCo(
+            embed_dim=64,
+            contrast_dim=16,
+            accelerator=accelerator,
+            input_dims=[feature_dim],
+            num_heads=2,
+            num_layers=1,
+            T=0.2,
+            dropout=0.0,
+            att_dim=32,
+            sequence_encoder="transformer",
+        ).to(DEVICE).train()
+        
+        # Disable CUDA graphs to avoid compatibility issues
+        inductor_config.triton.cudagraphs = False
+        compiled_model = torch.compile(model, mode="default")
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        
+        ds = RandomPairDataset(
+            length=batch_size * num_batches,
+            num_slices=num_slices,
+            max_feature_dim=feature_dim,
+            true_feature_dim=feature_dim,
+        )
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=True)
+        
+        params_before = _clone_params(model)
+        
+        for x1, size1, x2, size2 in loader:
+            x1 = x1.to(DEVICE)
+            x2 = x2.to(DEVICE)
+            size1 = size1.to(DEVICE)
+            size2 = size2.to(DEVICE)
+            
+            loss = compiled_model(x1, x2, input_feature_dims_1=size1, input_feature_dims_2=size2, m=0.99)
+            assert torch.isfinite(loss).all(), f"Loss not finite: {loss}"
+            
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+        
+        params_after = [p.detach() for p in model.parameters() if p.requires_grad]
+        changed = any(not torch.allclose(b, a) for b, a in zip(params_before, params_after))
+        assert changed, "Model parameters did not update with torch.compile()"
+    
+    def test_compile_transformer_packed(self):
+        """Test torch.compile() with transformer encoder and packed sequences."""
+        torch.manual_seed(42)
+        
+        batch_size = 4
+        num_batches = 2
+        min_slices = 4
+        max_slices = 12
+        feature_dim = 16
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        
+        accelerator = Accelerator()
+        
+        model = MoCo(
+            embed_dim=64,
+            contrast_dim=16,
+            accelerator=accelerator,
+            input_dims=[feature_dim],
+            num_heads=2,
+            num_layers=1,
+            T=0.2,
+            dropout=0.0,
+            att_dim=32,
+            sequence_encoder="transformer",
+        ).to(DEVICE, dtype=dtype).train()
+        
+        # Disable CUDA graphs
+        inductor_config.triton.cudagraphs = False
+        compiled_model = torch.compile(model, mode="default")
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        
+        ds = RandomPairDatasetVariableLength(
+            length=batch_size * num_batches,
+            min_slices=min_slices,
+            max_slices=max_slices,
+            feature_dim=feature_dim,
+        )
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=True, collate_fn=ssl_packed_collate_fn)
+        
+        params_before = _clone_params(model)
+        steps = 0
+        
+        for batch in loader:
+            feats1 = batch["feats1"].to(DEVICE, dtype=dtype)
+            feats2 = batch["feats2"].to(DEVICE, dtype=dtype)
+            cu_seqlens1 = batch["cu_seqlens1"].to(DEVICE)
+            cu_seqlens2 = batch["cu_seqlens2"].to(DEVICE)
+            max_seqlen1 = batch["max_seqlen1"]
+            max_seqlen2 = batch["max_seqlen2"]
+            orig_embed_dim1 = batch["orig_embed_dim1"].to(DEVICE)
+            orig_embed_dim2 = batch["orig_embed_dim2"].to(DEVICE)
+            seq_idx1 = batch["seq_idx1"].to(DEVICE)
+            seq_idx2 = batch["seq_idx2"].to(DEVICE)
+            
+            loss = compiled_model(
+                feats1, feats2,
+                input_feature_dims_1=orig_embed_dim1,
+                input_feature_dims_2=orig_embed_dim2,
+                m=0.99,
+                use_packed=True,
+                cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+                max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+                seq_idx1=seq_idx1, seq_idx2=seq_idx2,
+            )
+            assert torch.isfinite(loss).all(), f"Loss not finite: {loss}"
+            
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            steps += 1
+        
+        assert steps == num_batches, f"Expected {num_batches} steps, got {steps}"
+        
+        params_after = [p.detach() for p in model.parameters() if p.requires_grad]
+        changed = any(not torch.allclose(b, a) for b, a in zip(params_before, params_after))
+        assert changed, "Model parameters did not update with torch.compile() packed"
+
+    def test_compile_mamba2(self):
+        """
+        Test that Mamba2 encoder works with torch.compile().
+        
+        Mamba2 uses custom CUDA kernels (causal_conv1d_cuda) that are incompatible
+        with torch.compile()'s CUDA graphs. This test verifies the baseline works.
+        """
+        torch.manual_seed(42)
+        
+        batch_size = 4
+        num_batches = 2
+        feature_dim = 16
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        
+        accelerator = Accelerator()
+        
+        model = MoCo(
+            embed_dim=256,
+            contrast_dim=16,
+            accelerator=accelerator,
+            input_dims=[feature_dim],
+            num_heads=2,
+            num_layers=1,
+            T=0.2,
+            dropout=0.0,
+            att_dim=32,
+            d_state=64,
+            sequence_encoder="mamba2",
+        ).to(DEVICE, dtype=dtype).train()
+        
+        # Disable CUDA graphs
+        inductor_config.triton.cudagraphs = False
+        compiled_model = torch.compile(model, mode="default")
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        
+        ds = RandomPairDatasetVariableLength(
+            length=batch_size * num_batches,
+            min_slices=4,
+            max_slices=12,
+            feature_dim=feature_dim,
+        )
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=True, collate_fn=ssl_packed_collate_fn)
+        
+        params_before = _clone_params(model)
+        
+        for batch in loader:
+            feats1 = batch["feats1"].to(DEVICE, dtype=dtype)
+            feats2 = batch["feats2"].to(DEVICE, dtype=dtype)
+            cu_seqlens1 = batch["cu_seqlens1"].to(DEVICE)
+            cu_seqlens2 = batch["cu_seqlens2"].to(DEVICE)
+            max_seqlen1 = batch["max_seqlen1"]
+            max_seqlen2 = batch["max_seqlen2"]
+            orig_embed_dim1 = batch["orig_embed_dim1"].to(DEVICE)
+            orig_embed_dim2 = batch["orig_embed_dim2"].to(DEVICE)
+            seq_idx1 = batch["seq_idx1"].to(DEVICE)
+            seq_idx2 = batch["seq_idx2"].to(DEVICE)
+            
+            loss = compiled_model(
+                feats1, feats2,
+                input_feature_dims_1=orig_embed_dim1,
+                input_feature_dims_2=orig_embed_dim2,
+                m=0.99,
+                use_packed=True,
+                cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+                max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+                seq_idx1=seq_idx1, seq_idx2=seq_idx2,
+            )
+            assert torch.isfinite(loss).all(), f"Mamba2 loss not finite: {loss}"
+            
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+        
+        params_after = [p.detach() for p in model.parameters() if p.requires_grad]
+        changed = any(not torch.allclose(b, a) for b, a in zip(params_before, params_after))
+        assert changed, "Mamba2 model parameters did not update"
+
+    def test_compile_with_autocast(self):
+        """Test torch.compile() works correctly with autocast (mixed precision)."""
+        torch.manual_seed(42)
+        
+        batch_size = 4
+        num_batches = 2
+        feature_dim = 16
+        
+        accelerator = Accelerator()
+        
+        model = MoCo(
+            embed_dim=64,
+            contrast_dim=16,
+            accelerator=accelerator,
+            input_dims=[feature_dim],
+            num_heads=2,
+            num_layers=1,
+            T=0.2,
+            dropout=0.0,
+            att_dim=32,
+            sequence_encoder="transformer",
+        ).to(DEVICE).train()
+        
+        inductor_config.triton.cudagraphs = False
+        compiled_model = torch.compile(model, mode="default")
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        
+        ds = RandomPairDatasetVariableLength(
+            length=batch_size * num_batches,
+            min_slices=4,
+            max_slices=12,
+            feature_dim=feature_dim,
+        )
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=True, collate_fn=ssl_packed_collate_fn)
+        
+        params_before = _clone_params(model)
+        
+        for batch in loader:
+            # Data stays float32, autocast handles conversion
+            feats1 = batch["feats1"].to(DEVICE)
+            feats2 = batch["feats2"].to(DEVICE)
+            cu_seqlens1 = batch["cu_seqlens1"].to(DEVICE)
+            cu_seqlens2 = batch["cu_seqlens2"].to(DEVICE)
+            max_seqlen1 = batch["max_seqlen1"]
+            max_seqlen2 = batch["max_seqlen2"]
+            orig_embed_dim1 = batch["orig_embed_dim1"].to(DEVICE)
+            orig_embed_dim2 = batch["orig_embed_dim2"].to(DEVICE)
+            seq_idx1 = batch["seq_idx1"].to(DEVICE)
+            seq_idx2 = batch["seq_idx2"].to(DEVICE)
+            
+            # Use autocast context like the real training script
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = compiled_model(
+                    feats1, feats2,
+                    input_feature_dims_1=orig_embed_dim1,
+                    input_feature_dims_2=orig_embed_dim2,
+                    m=0.99,
+                    use_packed=True,
+                    cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+                    max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+                    seq_idx1=seq_idx1, seq_idx2=seq_idx2,
+                )
+            
+            assert torch.isfinite(loss).all(), f"Loss not finite with autocast: {loss}"
+            
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+        
+        params_after = [p.detach() for p in model.parameters() if p.requires_grad]
+        changed = any(not torch.allclose(b, a) for b, a in zip(params_before, params_after))
+        assert changed, "Model parameters did not update with autocast + compile"
+
+    def test_compile_multiple_feature_dims(self):
+        """
+        Test torch.compile() with multiple feature dimensions.
+        """
+        torch.manual_seed(42)
+        
+        batch_size = 4
+        num_slices = 8
+        feature_dims = [16, 32]  # Multiple feature dimensions
+        max_feature_dim = max(feature_dims)
+        
+        accelerator = Accelerator()
+        
+        model = MoCo(
+            embed_dim=64,
+            contrast_dim=16,
+            accelerator=accelerator,
+            input_dims=feature_dims,
+            num_heads=2,
+            num_layers=1,
+            T=0.2,
+            dropout=0.0,
+            att_dim=32,
+            sequence_encoder="transformer",
+        ).to(DEVICE).train()
+        
+        inductor_config.triton.cudagraphs = False
+        compiled_model = torch.compile(model, mode="default")
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        
+        # Create batch with mixed feature dimensions
+        x1 = torch.zeros(batch_size, num_slices, max_feature_dim, device=DEVICE)
+        x2 = torch.zeros(batch_size, num_slices, max_feature_dim, device=DEVICE)
+        sizes1 = torch.zeros(batch_size, dtype=torch.long, device=DEVICE)
+        sizes2 = torch.zeros(batch_size, dtype=torch.long, device=DEVICE)
+        
+        for i in range(batch_size):
+            feat_dim = feature_dims[i % len(feature_dims)]
+            x1[i, :, :feat_dim] = torch.randn(num_slices, feat_dim)
+            x2[i, :, :feat_dim] = torch.randn(num_slices, feat_dim)
+            sizes1[i] = feat_dim
+            sizes2[i] = feat_dim
+        
+        params_before = _clone_params(model)
+        
+        # Run with autocast to test dtype handling
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = compiled_model(x1, x2, input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, m=0.99)
+        
+        assert torch.isfinite(loss).all(), f"Loss not finite with multiple feature dims: {loss}"
+        
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        
+        params_after = [p.detach() for p in model.parameters() if p.requires_grad]
+        changed = any(not torch.allclose(b, a) for b, a in zip(params_before, params_after))
+        assert changed, "Model parameters did not update with multiple feature dims"
 
 

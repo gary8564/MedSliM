@@ -98,122 +98,159 @@ class MoCo(nn.Module):
         for param_b, param_m in zip(self.base_encoder.parameters(), self.momentum_encoder.parameters()):
             param_m.data = param_m.data * m + param_b.data * (1. - m)
 
-
-    def forward(self, 
-                x1, 
-                x2, 
-                *, 
-                input_feature_dims_1: torch.Tensor | None = None, 
-                input_feature_dims_2: torch.Tensor | None = None, 
-                seq_lengths_1: torch.Tensor | None = None,
-                seq_lengths_2: torch.Tensor | None = None,
-                m: float = 0.99):
-        """
-        Args:
-            x1 (Tensor): First view of the input images.
-            x2 (Tensor): Second view of the input images.
-            input_feature_dims_1 (Tensor, optional): Original feature dims per-sample for x1 (before padding).
-            input_feature_dims_2 (Tensor, optional): Original feature dims per-sample for x2 (before padding).
-            seq_lengths_1 (Tensor, optional): Actual sequence lengths per-sample for x1 (before subsampling/zero-padding).
-            seq_lengths_2 (Tensor, optional): Actual sequence lengths per-sample for x2 (before subsampling/zero-padding).
-            m (float, optional): Momentum parameter. Default is 0.99.
-        Returns:
-            Tensor: Contrastive loss.
-        """
-        # Compute the contrastive features 
-        q1 = self.predictor(self.base_encoder(x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths_1))
-        q2 = self.predictor(self.base_encoder(x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths_2))
-       
-        with torch.no_grad():  # no gradient
-            self._update_momentum_encoder(m=m) # update the momentum encoder
-
-            # Compute the contrastive features for the momentum encoder as targets
-            k1 = self.momentum_encoder(x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths_1)
-            k2 = self.momentum_encoder(x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths_2)
-
-        return self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1) # return the contrastive loss
-    
     def contrastive_loss(self, q, k):
+        """Compute InfoNCE contrastive loss."""
         # normalize
         q = F.normalize(q, dim=1)
         k = F.normalize(k, dim=1)
         
         # gather all targets
         with torch.no_grad():
-            k = self.accelerator.gather(k)  # shape [world_size * batch_size, contrast_dim]
+            k = self.accelerator.gather(k)  # [world_size * batch_size, contrast_dim]
         
         # Einstein sum is more intuitive
         logits = torch.einsum('nc, mc -> nm', [q, k]) / self.T # shape [batch_size, world_size * batch_size]
-        N = logits.shape[0]  # batch size per GPU
+        N = logits.shape[0] # batch size per GPU
         rank = self.accelerator.process_index
-        labels = (torch.arange(N, dtype=torch.long, device=logits.device) + N * rank) # for query i, the correct class index is i (or i + offset) (N * rank is for multi-GPU setting)
+        labels = torch.arange(N, dtype=torch.long, device=logits.device) + N * rank # for query i, the correct class index is i (or i + offset) (N * rank is for multi-GPU setting)
         
         return nn.CrossEntropyLoss()(logits, labels) * (2 * self.T)
 
-    def forward_packed(
-        self, 
-        x1: torch.Tensor, 
-        x2: torch.Tensor, 
-        cu_seqlens1: torch.Tensor,
-        cu_seqlens2: torch.Tensor,
-        max_seqlen1: int,
-        max_seqlen2: int,
-        input_feature_dims_1: torch.Tensor = None, 
+    def _forward_padded(
+        self,
+        x1,
+        x2,
+        input_feature_dims_1: torch.Tensor = None,
         input_feature_dims_2: torch.Tensor = None,
+        m: float = 0.99,
+        seq_lengths_1: torch.Tensor = None,
+        seq_lengths_2: torch.Tensor = None,
+        **_, 
+    ):
+        """Forward pass for padded sequences."""
+        # Compute the contrastive features 
+        q1 = self.predictor(self.base_encoder(
+            x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths_1
+        ))
+        q2 = self.predictor(self.base_encoder(
+            x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths_2
+        ))
+       
+        with torch.no_grad():
+            self._update_momentum_encoder(m=m) # Update the momentum encoder
+            # Compute the contrastive features for the momentum encoder as targets
+            k1 = self.momentum_encoder(
+                x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths_1
+            )
+            k2 = self.momentum_encoder(
+                x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths_2
+            )
+
+        return self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1)
+    
+    def _forward_packed(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        input_feature_dims_1: torch.Tensor = None,
+        input_feature_dims_2: torch.Tensor = None,
+        m: float = 0.99,
+        cu_seqlens1: torch.Tensor = None,
+        cu_seqlens2: torch.Tensor = None,
+        max_seqlen1: int = None,
+        max_seqlen2: int = None,
         seq_idx1: torch.Tensor = None,
         seq_idx2: torch.Tensor = None,
-        m: float = 0.99,
+        **_,  # Ignore extra kwargs
     ):
-        """
-        Forward pass for packed/variable-length sequences.
-        
-        This is an efficient alternative to the standard forward() that eliminates
-        zero-padding waste. All sequences are concatenated and cu_seqlens tracks boundaries.
-        
-        Args:
-            x1: Packed features for view 1 [total_seq_len_1, feature_dim]
-            x2: Packed features for view 2 [total_seq_len_2, feature_dim]
-            cu_seqlens1: Cumulative sequence lengths for view 1 [batch_size + 1]
-            cu_seqlens2: Cumulative sequence lengths for view 2 [batch_size + 1]
-            max_seqlen1: Max sequence length in batch for view 1
-            max_seqlen2: Max sequence length in batch for view 2
-            input_feature_dims_1: Feature dimensions per sample for view 1 [batch_size]
-            input_feature_dims_2: Feature dimensions per sample for view 2 [batch_size]
-            seq_idx1: Document index per token for view 1 [total_seq_len_1] (for Mamba2)
-            seq_idx2: Document index per token for view 2 [total_seq_len_2] (for Mamba2)
-            m: Momentum coefficient for momentum encoder update
-            
-        Returns:
-            Contrastive loss (scalar)
-            
-        References:
-            - https://tridao.me/blog/2024/mamba2-part4-systems/ (Variable Length section)
-        """
-        # Compute contrastive features using packed forward
-        q1 = self.predictor(self.base_encoder.forward_packed(
-            x1, cu_seqlens1, max_seqlen1, 
-            input_feature_dims=input_feature_dims_1, 
-            seq_idx=seq_idx1
+        """Forward pass for packed sequences (no padding waste)."""
+        # Compute the contrastive features 
+        q1 = self.predictor(self.base_encoder(
+            x1, 
+            input_feature_dims=input_feature_dims_1,
+            use_packed=True,
+            cu_seqlens=cu_seqlens1,
+            max_seqlen=max_seqlen1,
+            seq_idx=seq_idx1,
         ))
-        q2 = self.predictor(self.base_encoder.forward_packed(
-            x2, cu_seqlens2, max_seqlen2,
+        q2 = self.predictor(self.base_encoder(
+            x2,
             input_feature_dims=input_feature_dims_2,
-            seq_idx=seq_idx2
+            use_packed=True,
+            cu_seqlens=cu_seqlens2,
+            max_seqlen=max_seqlen2,
+            seq_idx=seq_idx2,
         ))
        
         with torch.no_grad():
             self._update_momentum_encoder(m=m)
-
-            # Compute momentum encoder targets using packed forward
-            k1 = self.momentum_encoder.forward_packed(
-                x1, cu_seqlens1, max_seqlen1,
+            k1 = self.momentum_encoder(
+                x1,
                 input_feature_dims=input_feature_dims_1,
-                seq_idx=seq_idx1
+                use_packed=True,
+                cu_seqlens=cu_seqlens1,
+                max_seqlen=max_seqlen1,
+                seq_idx=seq_idx1,
             )
-            k2 = self.momentum_encoder.forward_packed(
-                x2, cu_seqlens2, max_seqlen2,
+            k2 = self.momentum_encoder(
+                x2,
                 input_feature_dims=input_feature_dims_2,
-                seq_idx=seq_idx2
+                use_packed=True,
+                cu_seqlens=cu_seqlens2,
+                max_seqlen=max_seqlen2,
+                seq_idx=seq_idx2,
             )
 
         return self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1)
+
+    def forward(
+        self, 
+        x1, 
+        x2, 
+        *,
+        input_feature_dims_1: torch.Tensor | None = None, 
+        input_feature_dims_2: torch.Tensor | None = None, 
+        m: float = 0.99,
+        use_packed: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        """        
+        Args:
+            x1: First view features
+                - Padded mode: [B, max_seq_len, feature_dim]
+                - Packed mode: [total_seq_len, feature_dim]
+            x2: Second view features with same shape as x1.
+            input_feature_dims_1: Original feature dims per-sample for x1 with shape [B].
+            input_feature_dims_2: Original feature dims per-sample for x2 with shape [B].
+            m: Momentum parameter for momentum encoder update. Default: 0.99.
+            use_packed: If True, use packed sequence for variable sequence length handling.
+            
+            **kwargs: Additional mode-specific parameters for variable sequence length handling:
+                Padded mode:
+                    - seq_lengths_1: Actual sequence lengths for x1 with shape [B]
+                    - seq_lengths_2: Actual sequence lengths for x2 with shape [B]
+                Packed mode:
+                    - cu_seqlens1, cu_seqlens2: Cumulative sequence lengths with shape [B+1]
+                    - max_seqlen1, max_seqlen2: Max sequence length in batch for x1 and x2
+                    - seq_idx1, seq_idx2: Document index per token with shape [total_seq_len]
+            
+        Returns:
+            Contrastive loss.
+        """
+        if use_packed:
+            return self._forward_packed(
+                x1, x2,
+                input_feature_dims_1=input_feature_dims_1,
+                input_feature_dims_2=input_feature_dims_2,
+                m=m,
+                **kwargs,
+            )
+        else:
+            return self._forward_padded(
+                x1, x2,
+                input_feature_dims_1=input_feature_dims_1,
+                input_feature_dims_2=input_feature_dims_2,
+                m=m,
+                **kwargs,
+            )
+    

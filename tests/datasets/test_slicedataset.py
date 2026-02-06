@@ -37,7 +37,7 @@ def test_slicedataset_shapes_and_metadata():
     assert "uid" in sample and "orientation" in sample and "source" in sample
     assert isinstance(sample["source"], tio.ScalarImage)
     assert sample["orientation"] == plane
-    assert isinstance(sample["uid"], int)
+    assert isinstance(sample["uid"], (str, int)) 
 
     # TorchIO Image stores tensor in (C, W, H, D)
     img: tio.ScalarImage = sample["source"]

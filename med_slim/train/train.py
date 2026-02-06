@@ -10,19 +10,19 @@ An Empirical Study of Training Self-Supervised Vision Transformers.
 2021 IEEE/CVF International Conference on Computer Vision (ICCV) (2021): 9620-9629.
 """
 import torch
-from tqdm import tqdm
-from pathlib import Path
 import os
 import builtins
-from torch.utils.data import DataLoader
 import argparse
 import yaml
+import math
+import wandb
+from torch.utils.data import DataLoader
 from jinja2 import Environment, FileSystemLoader
 from pprint import pprint
 from datetime import datetime
-import math
 from accelerate import Accelerator, DistributedDataParallelKwargs
-import wandb
+from tqdm import tqdm
+from pathlib import Path
 
 from med_slim.model.ssl import MoCo
 from med_slim.data import PrecomputedFeatPairDataset, ssl_collate_fn, ssl_packed_collate_fn
@@ -129,12 +129,14 @@ def main(args, cfg):
     feat_dirs = feat_cfg["datasets"]
     slice_encoder_models = feat_cfg["model_name"]
     view_planes = args.planes if args.planes else feat_cfg["plane"]
+    spatial_modes = feat_cfg.get("spatial_modes", None)  # Optional: preprocessing methods as augmentation
     dataset = PrecomputedFeatPairDataset(
         feat_dirs=feat_dirs,
         slice_encoder_models=slice_encoder_models,
         view_planes=view_planes,
         split="train",
         max_feature_dim=max_feature_dim,
+        spatial_modes=spatial_modes,
     )
 
     # Optional: convert to SyncBatchNorm when training across processes for parity with DDP
@@ -143,7 +145,7 @@ def main(args, cfg):
 
     # DataLoader with configurable collate function
     per_device_batch_size = max(1, int(global_batch_size / max(1, accelerator.num_processes)))
-    print(f"batch_size_per_device={per_device_batch_size}")
+    print(f"Batch size per device: {per_device_batch_size}")
     
     # Select collate function based on mode
     use_packed = args.collate_mode == "packed"
@@ -155,9 +157,11 @@ def main(args, cfg):
         batch_size=per_device_batch_size,
         shuffle=True,
         num_workers=cfg["train"]["num_workers"],
-        drop_last=False,
+        drop_last=True,
         pin_memory=True,
         collate_fn=collate_fn,
+        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=2,  # Prefetch more batches per worker
     )
 
     # Prepare with accelerator
@@ -168,22 +172,38 @@ def main(args, cfg):
     if args.resume and os.path.isfile(args.resume):
         print(f"Loading checkpoint '{args.resume}'")
         checkpoint = torch.load(args.resume, map_location="cpu")
-        start_epoch = checkpoint.get("epoch", 0)
-        accelerator.unwrap_model(model).load_state_dict(checkpoint["state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        print(f"Loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+        # TODO: Remove this once all checkpoints are updated
+        # Handle legacy checkpoint key names (mamba_enc -> seq_enc)
+        # Old checkpoints used "mamba_enc" but new code uses generic "seq_enc"
+        state_dict = checkpoint["state_dict"]
+        
+        # Handle legacy checkpoint key formats
+        remapped_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key
+            # Remap legacy mamba_enc -> seq_enc
+            if "mamba_enc" in new_key:
+                new_key = new_key.replace("mamba_enc", "seq_enc")
+            remapped_state_dict[new_key] = value        
+        if any("mamba_enc" in k for k in state_dict.keys()):
+            print("Detected legacy checkpoint format, remapping keys: mamba_enc -> seq_enc")
+        
+        accelerator.unwrap_model(model).load_state_dict(remapped_state_dict)
+        
+        if args.curriculum:
+            # Curriculum learning: load model weights only, reset optimizer and epoch
+            # Use this when changing datasets (e.g., MRNet -> MRNet+fastMRI)
+            print("Curriculum learning mode: loaded model weights, reset optimizer and epoch counter")
+            print("Starting fresh training from epoch 0 with new dataset configuration")
+        else:
+            # Standard resume: continue training from saved state
+            start_epoch = checkpoint.get("epoch", 0)
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            print(f"Resuming training from epoch {start_epoch}")
     else:
         if args.resume:
             raise FileNotFoundError(f"No checkpoint found at '{args.resume}'")
 
-    # Optional: torch.compile for improved performance
-    if args.compile:
-        print("Compiling model with torch.compile()...")
-        # reduce-overhead: Uses CUDAGraphs when possible for lower overhead
-        # With DDP, CUDAGraphs may be disabled automatically but compilation still works
-        model = torch.compile(model, mode="reduce-overhead")
-        print("Model compiled successfully")
-    
     model.train()
     iters_per_epoch = len(loader)
     for e in tqdm(range(start_epoch, cfg["train"]["num_epochs"]), desc="MedSliM Pre-training...", disable=not accelerator.is_main_process):
@@ -209,13 +229,14 @@ def main(args, cfg):
                 seq_idx2 = batch["seq_idx2"].to(device=device)
                 
                 with accelerator.autocast():
-                    loss = model.forward_packed(
+                    loss = model(
                         x1, x2,
+                        input_feature_dims_1=sizes1, input_feature_dims_2=sizes2,
+                        m=curr_m,
+                        use_packed=True,
                         cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
                         max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
-                        input_feature_dims_1=sizes1, input_feature_dims_2=sizes2,
                         seq_idx1=seq_idx1, seq_idx2=seq_idx2,
-                        m=curr_m
                     )
             else:
                 # Padded sequence mode
@@ -227,8 +248,13 @@ def main(args, cfg):
                 seq_lens2 = batch["seq_lens2"].to(dtype=torch.long)
                 
                 with accelerator.autocast():
-                    loss = model(x1, x2, input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
-                               seq_lengths_1=seq_lens1, seq_lengths_2=seq_lens2, m=curr_m)
+                    loss = model(
+                        x1, x2, 
+                        input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
+                        seq_lengths_1=seq_lens1, seq_lengths_2=seq_lens2, 
+                        m=curr_m,
+                        use_packed=False,
+                    )
             
             # NaN check
             if torch.isnan(loss) or torch.isinf(loss):
@@ -242,14 +268,18 @@ def main(args, cfg):
             loss_val = loss.detach().item()
             total_loss += loss_val
             
-            # Log iteration-level metrics to WandB
-            if accelerator.is_main_process:
+            # Log iteration-level metrics to WandB (every 10 steps to reduce overhead)
+            if accelerator.is_main_process and i % 10 == 0:
                 global_step = e * iters_per_epoch + i
                 wandb.log({
                     "train/step_loss": loss_val,
                     "train/lr": curr_lr,
                     "train/momentum": curr_m,
                 }, step=global_step)
+
+        # Synchronization barrier: ensure all ranks finished the epoch before logging/checkpointing
+        # This helps catch GPU desync issues early rather than hanging during the next epoch
+        accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
             avg_loss = total_loss / len(loader)
@@ -340,9 +370,13 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--compile",
+        "--curriculum",
         action="store_true",
-        help="Use torch.compile() to optimize model for speeding up computation.",
+        help=(
+            "Curriculum learning mode: Load model weights from --resume checkpoint but "
+            "reset optimizer state and epoch counter. Use this when increasing datasets "
+            "(e.g., pretrain on MRNet, then continue with MRNet+fastMRI). "
+        ),
     )
     args = parser.parse_args()
     

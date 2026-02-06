@@ -44,9 +44,9 @@ def load_pretrained_cobra(
     
     state_dict = torch.load(checkpoint_path, map_location=accelerator.device, weights_only=False)
     if sequence_encoder is None:
-        sequence_encoder = state_dict["sequence_encoder"]
+        sequence_encoder = state_dict.get("sequence_encoder", "mamba2")  # Default for older checkpoints
     if slice_pooling is None:
-        slice_pooling = state_dict["pooling"]
+        slice_pooling = state_dict.get("pooling", "abmil")  # Default for older checkpoints
     logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}")
     
     # Build encoder-specific kwargs
@@ -90,11 +90,27 @@ def load_pretrained_cobra(
         raise ValueError(f"`state_dict` key not found in saved model checkpoint {checkpoint_path}.")
     
     chkpt = state_dict["state_dict"]
-    cobra_weights = {
-        k.split(f"{encoder_type}_encoder.")[-1]: v 
-        for k, v in chkpt.items() 
-        if f"{encoder_type}_encoder" in k and f"{encoder_type}_encoder.proj" not in k
-    }
+    # cobra_weights = {
+    #     k.split(f"{encoder_type}_encoder.")[-1]: v 
+    #     for k, v in chkpt.items() 
+    #     if f"{encoder_type}_encoder" in k and f"{encoder_type}_encoder.proj" not in k
+    # }
+    # TODO: Remove this once all checkpoints are updated
+    # Handle legacy checkpoint key names (mamba_enc -> seq_enc)
+    has_legacy_mamba = any("mamba_enc" in k for k in chkpt.keys())
+    
+    if has_legacy_mamba:
+        logger.info("Detected legacy checkpoint format, remapping keys: mamba_enc -> seq_enc")
+    
+    cobra_weights = {}
+    for k, v in chkpt.items():
+        if f"{encoder_type}_encoder" in k and f"{encoder_type}_encoder.proj" not in k:
+            # Remove encoder prefix (e.g., "base_encoder." or "momentum_encoder.")
+            new_key = k.split(f"{encoder_type}_encoder.")[-1]
+            # Remap legacy key names
+            if has_legacy_mamba:
+                new_key = new_key.replace("mamba_enc", "seq_enc")
+            cobra_weights[new_key] = v
     
     if len(cobra_weights) == 0:
         raise ValueError(f"No {encoder_type} encoder weights found in checkpoint.")

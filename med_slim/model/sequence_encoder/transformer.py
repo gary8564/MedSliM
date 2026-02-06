@@ -676,11 +676,12 @@ class VarlenMultiheadAttention(nn.Module):
         # Each slice's positions start from 0, not global positions
         if self.rotary_emb is not None:
             # Compute per-slice positions for packed sequences
-            positions = torch.zeros(total_seq_len, device=x.device, dtype=torch.float32)
-            for i in range(batch_size):
-                start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
-                seq_len = end - start
-                positions[start:end] = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+            # For each token: position = global_index - cu_seqlens[batch_idx]
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]  # [batch_size]
+            positions = (
+                torch.arange(total_seq_len, device=x.device, dtype=torch.float32) 
+                - cu_seqlens[:-1].to(x.device, dtype=torch.float32).repeat_interleave(lengths)
+            )
             
             # Generate frequencies for these positions: [total_seq_len, head_dim]
             freqs = self.rotary_emb.forward(positions, seq_len=total_seq_len)

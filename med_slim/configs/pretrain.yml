@@ -1,10 +1,13 @@
 feat_dataset:
-  # Directory structure: {feat_dir}/{model}/{split}/{plane}/*.safetensors
+  # Directory structure (with spatial_modes): {feat_dir}/{spatial_mode}/{model}/{split}/{plane}/*.safetensors
+  # Directory structure (without spatial_modes): {feat_dir}/{model}/{split}/{plane}/*.safetensors
   datasets:
     - name: mrnet
-      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw"
-    - name: fastMRI
-      feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+    # - name: fastMRI
+    #   feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw"
+    # - name: kmar-50k
+    #   feat_dir: "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw"
   model_name: 
     - "dinov2"
     - "rad-dino"
@@ -16,6 +19,12 @@ feat_dataset:
     - "sagittal"
     - "coronal"
     - "axial"
+  # Preprocessing methods as positive pair augmentation (optional)
+  # If specified, enables cross-preprocessing positive pairs in SSL
+  # Comment out to disable preprocessing augmentation
+  # spatial_modes:
+  #   - "resize"
+  #   - "crop"
 
 model:
   slice_encoder_models:
@@ -74,13 +83,13 @@ model:
 train:
   momentum: 0.99
   temperature: 0.2
-  batch_size: 512
+  batch_size: 256 # 1024
   num_epochs: 2000
-  learning_rate: 5e-4
+  learning_rate: 5e-4 
   warmup_epochs: 50
   weight_decay: 0.1
-  num_workers: 4
+  num_workers: 4 # 8 
   early_stopping: 
     patience: 10
-  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI"
+  save_ckpt_path: /hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet # "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K"
 

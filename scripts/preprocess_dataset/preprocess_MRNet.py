@@ -12,6 +12,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Zero-pad IDs to match filenames (e.g. 0 -> 0000)
+ID_WIDTH = 4
+
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     handler = logging.StreamHandler(sys.stdout)
@@ -35,7 +38,9 @@ def npy2nifti(path_file, save_dir, data_dir):
     img = tio.ScalarImage(tensor=data[None])
 
     # Write
-    file_stem = path_file.stem 
+    file_stem = path_file.stem
+    if file_stem.isdigit():
+        file_stem = f"{int(file_stem):0{ID_WIDTH}d}"
     rel_path = path_file.parent.relative_to(data_dir)
     # Replace "valid" with "test" in the output path
     if rel_path.parts[0] == "valid":
@@ -82,9 +87,12 @@ def main():
         
     logger.info("================================================")
     logger.info("Step 2: Annotation preprocessing: Combine different annotation csv files into one")
-    logger.info("================================================") 
+    logger.info("================================================")
     df_train = combine_annotation_csv(data_dir, 'train')
     df_val = combine_annotation_csv(data_dir, 'valid')
+    # Zero-pad ID column to match NIfTI filenames (e.g. 0 -> 0000)
+    for df in (df_train, df_val):
+        df['ID'] = df['ID'].apply(lambda x: f"{int(x):0{ID_WIDTH}d}" if str(x).isdigit() else x)
     df_train.to_csv(save_dir/'train.csv', index=False)
     df_val.to_csv(save_dir/'test.csv', index=False)
     

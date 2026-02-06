@@ -5,16 +5,80 @@ Müller-Franzes, Gustav, Firas Khader, Robert Siepmann, Tianyu Han, Jakob Nikola
 ArXiv abs/2411.15802 (2024).
 """
 import torchio as tio 
-from typing import Iterable, Tuple, Union, List, Optional, Sequence, Dict, Callable
-from numbers import Number
+import torch.nn.functional as F
+import torch 
 import nibabel as nib 
 import numpy as np
+from typing import Iterable, Tuple, Union, List, Optional, Sequence, Dict, Callable
+from numbers import Number
 from torchio.transforms.transform import TypeMaskingMethod 
 from torchio import Subject, Image
-import torch 
 
 TypeRangeFloat = Tuple[float, float]  # type: ignore
 TypeTripletInt = Union[int, Tuple[int, int, int], Sequence[int]]  # type: ignore
+
+
+def _slice_axis_from_subject(subject: tio.Subject) -> int:
+    """
+    Identify slice (through-plane) axis by largest spacing (thick slices)
+    or smallest dimension.
+
+    For RAS+ oriented images (after ToCanonical):
+    - Axial scans: slice axis = 2 (I-S direction)
+    - Sagittal scans: slice axis = 0 (R-L direction)  
+    - Coronal scans: slice axis = 1 (A-P direction)
+    """
+    current_spacing = np.array(subject.spacing)
+    # Use spacing to detect slice axis (slice thickness = through-plane direction)
+    if np.std(current_spacing) > 1e-6:
+        return int(np.argmax(current_spacing))
+    return int(np.argmin(subject.spatial_shape))
+
+
+def _permute_slice_to_last(subject: tio.Subject, slice_axis: int) -> tio.Subject:
+    """
+    Permute spatial axes so slice dimension moves to last position (D).
+    Ensures ImageOrSubjectToTensor's swapaxes(1,-1) produces (C, D, H, W) with D=slices.
+    Also updates the affine matrix to maintain correct physical coordinates.
+    """
+    if slice_axis == 2:
+        return subject
+    
+    # Build permutation
+    perm = [i for i in range(3) if i != slice_axis] + [slice_axis]
+    data_perm = (0,) + tuple(p + 1 for p in perm)
+    
+    for image in subject.get_images_dict().values():
+        data = image.data
+        if isinstance(data, torch.Tensor):
+            permuted = data.permute(data_perm)
+            image.set_data(permuted)
+        
+        # Update affine: reorder columns to match new axis order
+        aff = np.array(image.affine, copy=True)
+        new_aff = np.eye(4)
+        new_aff[:3, :3] = aff[:3, perm]  # Reorder columns
+        new_aff[:3, 3] = aff[:3, 3]      # Keep translation
+        image.affine = new_aff
+    
+    return subject
+
+
+class EnsureSliceAxisLast(tio.Transform):
+    """
+    Ensure the slice (through-plane) axis is always at position 2 (last spatial dimension).
+    Should be applied after ToCanonical() to ensure consistent axis ordering
+    regardless of the original acquisition plane (axial, sagittal, coronal).
+    Crucial for applying other transforms that require a specific axis ordering
+    
+    After this transform:
+    - Image shape is (C, W, H, D)
+    - Spacing order matches the data order
+    - The affine matrix is updated to maintain physical coordinates
+    """
+    def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        slice_axis = _slice_axis_from_subject(subject)
+        return _permute_slice_to_last(subject, slice_axis)
 
 class SubjectToTensor(object):
     """Transforms TorchIO Subjects into a Python dict and changes axes order from TorchIO to Torch"""
@@ -87,7 +151,6 @@ class ZNormalization(tio.ZNormalization):
                 for chs in per_channel
             ])
         )
-  
 
     def _znorm(self, image_data, mask, image_name, image_path, mean, std):
         # torch.quantile() fails for tensors > ~16M elements, use numpy for large volumes
@@ -192,12 +255,66 @@ class CropOrPad(tio.CropOrPad):
         return subject
 
 
-class CropOrPad2D(tio.Transform):
+class CropOrPad3D(tio.Transform):
     """
-    Crop or pad only the first two spatial dimensions (W and H), leaving the third dimension (D) unchanged.
+    Crop or pad all three dimensions with automatic slice axis detection.
+    
+    Handles ToCanonical() reorientation by detecting the slice axis from spacing
+    and mapping the target (W, H, D) to the correct physical axes.
     
     Args:
-        target_shape_2d: Target shape for (W, H) dimensions
+        target_shape: Target shape as (W_inplane, H_inplane, D_slices)
+        padding_mode: Padding mode (see tio.Pad for options)
+        random_center: randomly center the crop/pad if set to True; otherwise, center crop or pad
+    """
+
+    def __init__(
+        self,
+        target_shape: Tuple[int, int, int],
+        padding_mode: Union[str, float] = 0,
+        random_center: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.target_w, self.target_h, self.target_d = target_shape
+        self.padding_mode = padding_mode
+        self.random_center = random_center
+
+    def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        subject.check_consistent_space()
+        
+        # Detect slice axis 
+        slice_axis = _slice_axis_from_subject(subject)
+        in_plane_axes = [i for i in range(3) if i != slice_axis]
+        
+        # Build target shape mapping: user's (W, H, D) -> actual axes
+        actual_target = [0, 0, 0]
+        actual_target[in_plane_axes[0]] = self.target_w
+        actual_target[in_plane_axes[1]] = self.target_h
+        actual_target[slice_axis] = self.target_d
+        
+        # Apply CropOrPad with correctly mapped target shape
+        crop_or_pad = CropOrPad(
+            target_shape=tuple(actual_target),
+            padding_mode=self.padding_mode,
+            random_center=self.random_center,
+        )
+        subject = crop_or_pad(subject)
+        
+        # Permute so slice dimension is last (D) for ImageOrSubjectToTensor compatibility
+        subject = _permute_slice_to_last(subject, slice_axis)
+        
+        return subject
+
+
+class CropOrPad2D(tio.Transform):
+    """
+    Crop or pad only the in-plane dimensions, leaving the slice (through-plane) dimension unchanged.
+    
+    Handles ToCanonical() reorientation by detecting the slice axis from spacing.
+    
+    Args:
+        target_shape_2d: Target shape for in-plane (W, H) dimensions
         padding_mode: Padding mode (see tio.Pad for options)
         random_center: If True, randomly center the crop/pad; if False, center crop/pad
     """
@@ -210,25 +327,308 @@ class CropOrPad2D(tio.Transform):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.target_w, self.target_h = target_shape_2d
+        if isinstance(target_shape_2d, int):
+            target_shape_2d = (target_shape_2d, target_shape_2d)
+        self.target_size = target_shape_2d
         self.padding_mode = padding_mode
         self.random_center = random_center
 
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
         subject.check_consistent_space()
         
-        # Get current spatial shape (W, H, D)
-        current_shape = subject.spatial_shape
-        current_w, current_h, current_d = current_shape
+        # Get current spatial shape
+        current_shape = np.array(subject.spatial_shape)
         
-        # Create target shape keeping D unchanged
-        target_shape = (self.target_w, self.target_h, current_d)
+        # Detect slice axis 
+        slice_axis = _slice_axis_from_subject(subject)
+        
+        # Build target shape: crop in-plane dims to (target_w, target_h), keep slice dim unchanged
+        target_shape = np.array(current_shape, copy=True)
+        in_plane_axes = [i for i in range(3) if i != slice_axis]
+        target_shape[in_plane_axes[0]] = self.target_size[0]
+        target_shape[in_plane_axes[1]] = self.target_size[1]
+        target_shape = tuple(target_shape.tolist())
         
         # Use CropOrPad with the computed target shape
         crop_or_pad = CropOrPad(
-            target_shape=target_shape,
+            target_shape=tuple(target_shape),
             padding_mode=self.padding_mode,
             random_center=self.random_center,
         )
+        subject = crop_or_pad(subject)
         
-        return crop_or_pad(subject)
+        # Permute so slice dimension is last (D) for ImageOrSubjectToTensor compatibility
+        subject = _permute_slice_to_last(subject, slice_axis)
+        
+        return subject
+    
+class ResampleInPlane(tio.Transform):
+    """
+    Resample the in-plane dimensions (W, H) to a target size while optionally
+    adjusting the number of slices (D).
+    
+    This preserves all anatomical information by interpolation rather than cropping.
+    
+    Args:
+        target_shape_2d: Target (W, H) size for in-plane dimensions
+        num_slices: Optional target number of slices. If None, keeps original slice count.
+        image_interpolation: Interpolation mode for image data ('linear', 'nearest', 'bspline')
+    """
+    
+    def __init__(
+        self,
+        target_shape_2d: Tuple[int, int],
+        num_slices: Optional[int] = None,
+        image_interpolation: str = 'linear',
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if isinstance(target_shape_2d, int):
+            target_shape_2d = (target_shape_2d, target_shape_2d)
+        self.target_w, self.target_h = target_shape_2d
+        self.num_slices = num_slices
+        self.image_interpolation = image_interpolation
+    
+    def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        # Get current shape and spacing
+        current_shape = np.array(subject.spatial_shape)  # (W, H, D)
+        current_spacing = np.array(subject.spacing)  # (sw, sh, sd)
+        # Find the slice axis
+        slice_axis = _slice_axis_from_subject(subject)
+        in_plane_axes = [i for i in range(3) if i != slice_axis]
+        
+        # Calculate new spacing to achieve target in-plane shape
+        # new_spacing = current_spacing * (current_shape / target_shape)
+        new_spacing = current_spacing.copy()
+        
+        # For in-plane dimensions
+        target_inplane = [self.target_w, self.target_h]
+        for idx, axis in enumerate(in_plane_axes):
+            new_spacing[axis] = current_spacing[axis] * current_shape[axis] / target_inplane[idx]
+        
+        # For slice dimension
+        if self.num_slices is not None:
+            new_spacing[slice_axis] = current_spacing[slice_axis] * current_shape[slice_axis] / self.num_slices
+        
+        # Apply resampling
+        resample = tio.Resample(target=tuple(new_spacing), image_interpolation=self.image_interpolation)
+        subject = resample(subject)
+        
+        # Due to floating point precision, we might be off by 1 voxel
+        # Use CropOrPad to ensure exact target shape
+        target_shape = [0, 0, 0]
+        target_shape[in_plane_axes[0]] = self.target_w
+        target_shape[in_plane_axes[1]] = self.target_h
+        target_shape[slice_axis] = self.num_slices if self.num_slices else current_shape[slice_axis]
+        
+        crop_or_pad = tio.CropOrPad(target_shape=tuple(target_shape), padding_mode='minimum')
+        subject = crop_or_pad(subject)
+        
+        # Permute so slice dimension is last for ImageOrSubjectToTensor compatibility
+        subject = _permute_slice_to_last(subject, slice_axis)
+        
+        return subject
+    
+    
+class ResizeInPlane(tio.Transform):
+    """
+    Resize only the in-plane dimensions (W, H) while keeping the slice dimension unchanged.
+        
+    Unlike Resample (which maintains physical spacing) or CropOrPad (which loses/adds data),
+    this preserves all anatomical information by scaling.
+    
+    Args:
+        target_size: Target (W, H) size for in-plane dimensions
+        mode: Interpolation mode ('bilinear', 'bicubic', 'nearest')
+        align_corners: If True, align corner pixels. Only used for bilinear/bicubic.
+    
+    Note:
+        - This changes the effective pixel spacing (mm/pixel) in the in-plane dimensions
+        - The slice (through-plane) dimension and spacing remain unchanged
+    """
+    
+    def __init__(
+        self,
+        target_size: Union[int, Tuple[int, int]],
+        mode: str = 'bilinear',
+        align_corners: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if isinstance(target_size, int):
+            target_size = (target_size, target_size)
+        self.target_h, self.target_w = target_size  # Follow (H, W) convention for F.interpolate
+        self.mode = mode
+        self.align_corners = align_corners if mode in ('bilinear', 'bicubic') else None
+    
+    def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        # Permute so slice dimension is last first (resolves ToCanonical axis reordering)
+        # Find the slice axis
+        slice_axis = _slice_axis_from_subject(subject)
+        subject = _permute_slice_to_last(subject, slice_axis)
+        
+        for image_name, image in subject.get_images_dict().items():
+            # Get image data: (C, W, H, D) in TorchIO convention
+            data = image.data  # torch.Tensor
+            C, W, H, D = data.shape
+            
+            # Reshape for F.interpolate: need (N, C, H, W) format
+            # Process each slice independently
+            # Reshape from (C, W, H, D) to (D, C, H, W) - treat slices as batch
+            data = data.permute(3, 0, 2, 1)  # (D, C, H, W)
+            
+            # Resize in-plane
+            if self.align_corners is not None:
+                resized = F.interpolate(
+                    data.float(),
+                    size=(self.target_h, self.target_w),
+                    mode=self.mode,
+                    align_corners=self.align_corners,
+                )
+            else:
+                resized = F.interpolate(
+                    data.float(),
+                    size=(self.target_h, self.target_w),
+                    mode=self.mode,
+                )
+            
+            # Reshape back to TorchIO convention: (D, C, H, W) -> (C, W, H, D)
+            resized = resized.permute(1, 3, 2, 0)  # (C, W, H, D)
+            
+            # Update affine matrix to reflect new spacing
+            # New in-plane spacing = old_spacing * (old_size / new_size)
+            old_affine = image.affine.copy()
+            new_affine = old_affine.copy()
+            
+            # Scale factors for in-plane dimensions
+            scale_w = W / self.target_w
+            scale_h = H / self.target_h
+            
+            # Update the affine matrix scaling (first 3x3 block contains rotation and scaling)
+            # For simplicity, we scale the voxel sizes in the affine
+            new_affine[0, 0] *= scale_w  # X spacing
+            new_affine[1, 1] *= scale_h  # Y spacing
+            # Z spacing (slice) unchanged
+            
+            # Create new image with updated data and affine
+            new_image = tio.ScalarImage(tensor=resized.to(data.dtype), affine=new_affine)
+            subject[image_name] = new_image
+        
+        return subject
+
+class AdaptivePreprocessing(tio.Transform):
+    """
+    Adaptive preprocessing that chooses optimal strategy based on 
+    source resolution and target FM requirements.
+    
+    Strategy:
+    - Upsampling needed (target > source): Use Resample (no choice)
+    - Minor downsampling (0.7 < scale < 1.0): Use CropOrPad (preserve native resolution)
+    - Major downsampling (scale < 0.7): Use Resample then CropOrPad (preserve anatomy + sharpness)
+    """
+    
+    def __init__(
+        self,
+        target_size: Tuple[int, int],
+        num_slices: Optional[int] = None,
+        padding_mode: str = 'minimum',
+        resample_interpolation: str = 'linear',
+        resize_mode: str = 'area', 
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        if isinstance(target_size, int):
+            target_size = (target_size, target_size)
+        self.target_w, self.target_h = target_size
+        self.num_slices = num_slices
+        self.padding_mode = padding_mode
+        self.resample_interpolation = resample_interpolation
+        self.resize_mode = resize_mode
+    
+    def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        # Get current shape
+        current_shape = np.array(subject.spatial_shape)  # (W, H, D)
+        current_spacing = np.array(subject.spacing)
+        
+        # Detect slice axis
+        slice_axis = int(np.argmin(current_shape))
+        in_plane_axes = [i for i in range(3) if i != slice_axis]
+        
+        W_source = current_shape[in_plane_axes[0]]
+        H_source = current_shape[in_plane_axes[1]]
+        D_source = current_shape[slice_axis]
+        
+        # Calculate scale factors
+        scale_w = self.target_w / W_source
+        scale_h = self.target_h / H_source
+        avg_scale = (scale_w + scale_h) / 2
+        
+        target_d = self.num_slices if self.num_slices else D_source
+        
+        # Choose strategy based on scale
+        if avg_scale > 1.0:
+            # UPSAMPLING: Resample (interpolation required)
+            strategy = 'resample'
+        elif avg_scale > 0.7:
+            # MINOR DOWNSAMPLING: CropOrPad preserves native resolution
+            strategy = 'crop'
+        else:
+            # MAJOR DOWNSAMPLING: Resample first, then CropOrPad
+            strategy = 'resample_then_crop'
+        
+        # Build target shape
+        target_shape = [0, 0, 0]
+        target_shape[in_plane_axes[0]] = self.target_w
+        target_shape[in_plane_axes[1]] = self.target_h
+        target_shape[slice_axis] = target_d
+        
+        # Apply strategy
+        if strategy == 'crop':
+            # Direct CropOrPad
+            transform = tio.CropOrPad(
+                target_shape=tuple(target_shape),
+                padding_mode=self.padding_mode
+            )
+            subject = transform(subject)
+            
+        elif strategy == 'resample':
+            # Calculate target spacing for resampling
+            new_spacing = current_spacing * (current_shape / np.array(target_shape))
+            
+            resample = tio.Resample(
+                target=tuple(new_spacing),
+                image_interpolation=self.resample_interpolation
+            )
+            subject = resample(subject)
+            
+            # Ensure exact shape (floating point rounding)
+            crop_or_pad = tio.CropOrPad(
+                target_shape=tuple(target_shape),
+                padding_mode=self.padding_mode
+            )
+            subject = crop_or_pad(subject)
+            
+        else: 
+            # Step 1: Resample to intermediate size (10-15% larger than target)
+            intermediate_scale = 1.15
+            intermediate_shape = [0, 0, 0]
+            intermediate_shape[in_plane_axes[0]] = int(self.target_w * intermediate_scale)
+            intermediate_shape[in_plane_axes[1]] = int(self.target_h * intermediate_scale)
+            intermediate_shape[slice_axis] = target_d
+            
+            intermediate_spacing = current_spacing * (current_shape / np.array(intermediate_shape))
+            
+            resample = tio.Resample(
+                target=tuple(intermediate_spacing),
+                image_interpolation=self.resample_interpolation
+            )
+            subject = resample(subject)
+            
+            # Step 2: CropOrPad to exact target (preserves sharpness)
+            crop_or_pad = tio.CropOrPad(
+                target_shape=tuple(target_shape),
+                padding_mode=self.padding_mode
+            )
+            subject = crop_or_pad(subject)
+        
+        return subject

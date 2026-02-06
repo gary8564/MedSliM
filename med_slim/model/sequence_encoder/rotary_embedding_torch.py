@@ -356,7 +356,7 @@ class RotaryEmbedding(Module):
 
 
 def flat_to_skew(x, liere_block_size, axes_length, spacial_dims):
-    A = torch.zeros(liere_block_size, liere_block_size, axes_length, spacial_dims).to(x.device)
+    A = torch.zeros(liere_block_size, liere_block_size, axes_length, spacial_dims, dtype=x.dtype, device=x.device)
     for d in range(spacial_dims):
         i, j = torch.tril_indices(liere_block_size, liere_block_size, offset=-1)  # w/o diagonal
         A[i, j, :, d] = x[:, :, d]
