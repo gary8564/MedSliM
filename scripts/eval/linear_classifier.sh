@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G 
-#SBATCH --time=1:00:00                 
+#SBATCH --time=2:00:00                 
 #SBATCH --job-name=lp_binary_classification_%j
 #SBATCH --output=stdout_lp_binary_classification_%j.txt    
 #SBATCH --account=rwth1833    
@@ -18,7 +18,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
 CONFIG_PATH="./med_slim/configs/linear_classifier.yml"
-CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-06-12:30/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
+CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-07-12:43/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
 FM_POOLING="mean"  # Options: "mean", "concat" (attention requires fine-tuning COBRA)
 SEQUENCE_ENCODER="mamba2"
 SLICE_POOLING="cls" # Only used when sequence encoder is transformer

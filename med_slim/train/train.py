@@ -130,6 +130,11 @@ def main(args, cfg):
         num_target_slices=num_target_slices,
     )
 
+    if dataset.has_annotations:
+        print(f"Semi-supervised mode: {dataset.num_labels} labels detected")
+    else:
+        print("Self-supervised mode: no annotations (pure InfoNCE)")
+
     # Optional: convert to SyncBatchNorm when training across processes for parity with DDP
     if accelerator.num_processes > 1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -210,12 +215,20 @@ def main(args, cfg):
             sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
             seq_lens = batch["seq_len"].to(dtype=torch.long)
             
+            # Semi-supervised mode: pass labels when available (SupCon for labeled, InfoNCE for unlabeled)
+            labels = batch.get("label", None)
+            has_label = batch.get("has_label", None)
+            if labels is not None:
+                labels = labels.to(dtype=torch.float32)
+            
             with accelerator.autocast():
                 loss = model(
                     x1, x2, 
                     input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
                     seq_lengths=seq_lens, 
                     m=curr_m,
+                    labels=labels,
+                    has_label=has_label,
                 )
             
             # NaN check
@@ -233,11 +246,15 @@ def main(args, cfg):
             # Log iteration-level metrics to WandB (every 10 steps to reduce overhead)
             if accelerator.is_main_process and i % 10 == 0:
                 global_step = e * iters_per_epoch + i
-                wandb.log({
+                log_dict = {
                     "train/step_loss": loss_val,
                     "train/lr": curr_lr,
                     "train/momentum": curr_m,
-                }, step=global_step)
+                }
+                if has_label is not None:
+                    num_labeled = has_label.sum().item()
+                    log_dict["train/labeled_ratio"] = num_labeled / has_label.shape[0]
+                wandb.log(log_dict, step=global_step)
 
         # Synchronization barrier: ensure all ranks finished the epoch before logging/checkpointing
         # This helps catch GPU desync issues early rather than hanging during the next epoch

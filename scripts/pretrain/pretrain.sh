@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G 
-#SBATCH --time=6:00:00                 
+#SBATCH --time=12:00:00                 
 #SBATCH --job-name=pretrain_MRNet
 #SBATCH --output=logs/pretrain/stdout_pretrain_MRNet_%j.txt    
 #SBATCH --account=rwth1833    
