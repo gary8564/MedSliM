@@ -1,5 +1,5 @@
 # Path to pretrained MedSliM checkpoint
-checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-07-14:10/medslim-epoch2000.pth.tar"
+checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-KMAR/2026-02-07-22:06/medslim-epoch2000.pth.tar"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
 
