@@ -110,6 +110,10 @@ def load_pretrained_cobra(
             # Remap legacy key names
             if has_legacy_mamba:
                 new_key = new_key.replace("mamba_enc", "seq_enc")
+            #TODO: remove this once all checkpoints are updated
+            # Skip removed varlen_seq_enc keys from old checkpoints
+            if "varlen_seq_enc" in new_key:
+                continue
             cobra_weights[new_key] = v
     
     if len(cobra_weights) == 0:

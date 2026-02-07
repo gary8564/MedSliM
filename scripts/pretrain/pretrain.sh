@@ -34,8 +34,6 @@ NUM_GPUS=1
 ### Run script with Accelerate for multi-GPU training
 # Use bf16 instead of fp16 for numerical stability
 # Available options:
-#   --collate-mode padded    # Default: pad sequences to max length
-#   --collate-mode packed    # Packed sequences without padding (more memory efficient)
 #   --sequence-encoder mamba2/transformer
 #   --pooling abmil          # abmil (default) or cls (requires transformer encoder)
 #   --resume "${RESUME_PATH}"              # Continue training from checkpoint (keeps the state of optimizer and epoch)
@@ -43,5 +41,4 @@ NUM_GPUS=1
 #   --planes ${PLANES}
 
 accelerate launch --num_processes=$NUM_GPUS --mixed_precision=bf16 \
-    ./med_slim/train/train.py \
-    --collate-mode packed
+    ./med_slim/train/train.py

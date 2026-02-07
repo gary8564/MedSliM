@@ -1,6 +1,5 @@
 feat_dataset:
-  # Directory structure (with spatial_modes): {feat_dir}/{spatial_mode}/{model}/{split}/{plane}/*.safetensors
-  # Directory structure (without spatial_modes): {feat_dir}/{model}/{split}/{plane}/*.safetensors
+  # Directory structure: {feat_dir}/{model}/{split}/{plane}/*.safetensors
   datasets:
     - name: mrnet
       feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
@@ -19,12 +18,7 @@ feat_dataset:
     - "sagittal"
     - "coronal"
     - "axial"
-  # Preprocessing methods as positive pair augmentation (optional)
-  # If specified, enables cross-preprocessing positive pairs in SSL
-  # Comment out to disable preprocessing augmentation
-  # spatial_modes:
-  #   - "resize"
-  #   - "crop"
+  num_target_slices: 32
 
 model:
   slice_encoder_models:

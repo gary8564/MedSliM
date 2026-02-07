@@ -25,7 +25,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 from med_slim.model.ssl import MoCo
-from med_slim.data import PrecomputedFeatPairDataset, ssl_collate_fn, ssl_packed_collate_fn
+from med_slim.data import PrecomputedFeatPairDataset
 
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 
@@ -34,7 +34,6 @@ def validate_args(args) -> None:
     """Validate arguments parser."""
     valid_encoders = ["mamba2", "transformer"]
     valid_poolings = ["abmil", "cls"]
-    valid_collate_modes = ["padded", "packed"]
     
     if args.sequence_encoder not in valid_encoders:
         raise ValueError(f"Invalid sequence_encoder '{args.sequence_encoder}'. Must be one of {valid_encoders}")
@@ -47,15 +46,6 @@ def validate_args(args) -> None:
             "Invalid configuration: mamba2 encoder cannot use 'cls' pooling. "
             "CLS token pooling requires transformer encoder. "
         )
-    
-    if args.collate_mode not in valid_collate_modes:
-        raise ValueError(f"Invalid collate_mode '{args.collate_mode}'. Must be one of {valid_collate_modes}")
-    
-    if args.collate_mode == "packed" and args.pooling == "cls":
-        raise NotImplementedError(
-            "Packed sequences currently don't support CLS pooling. "
-            "Use --pooling abmil with --collate-mode packed."
-        )
 
 def main(args, cfg):
 
@@ -63,7 +53,6 @@ def main(args, cfg):
     # Needed because COBRA uses nn.ModuleDict with embedding layers for each input dim, but only one is used per forward pass
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
-    device = accelerator.device
 
     if not accelerator.is_main_process:
         def print_pass(*_args, **_kwargs):
@@ -115,7 +104,8 @@ def main(args, cfg):
     )
 
     model_params = sum(p.numel() for p in model.parameters())
-
+    print(f"Number of model parameters: {model_params}")
+    
     # Learning rate scaling rule 
     base_lr = float(cfg["train"]["learning_rate"])
     global_batch_size = cfg["train"]["batch_size"]
@@ -129,28 +119,24 @@ def main(args, cfg):
     feat_dirs = feat_cfg["datasets"]
     slice_encoder_models = feat_cfg["model_name"]
     view_planes = args.planes if args.planes else feat_cfg["plane"]
-    spatial_modes = feat_cfg.get("spatial_modes", None)  # Optional: preprocessing methods as augmentation
+    num_target_slices = feat_cfg.get("num_target_slices", 32)
+    print(f"Slice sampling: all sequences will be sampled/padded to {num_target_slices} slices")
     dataset = PrecomputedFeatPairDataset(
         feat_dirs=feat_dirs,
         slice_encoder_models=slice_encoder_models,
         view_planes=view_planes,
         split="train",
         max_feature_dim=max_feature_dim,
-        spatial_modes=spatial_modes,
+        num_target_slices=num_target_slices,
     )
 
     # Optional: convert to SyncBatchNorm when training across processes for parity with DDP
     if accelerator.num_processes > 1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    # DataLoader with configurable collate function
+    # DataLoader
     per_device_batch_size = max(1, int(global_batch_size / max(1, accelerator.num_processes)))
     print(f"Batch size per device: {per_device_batch_size}")
-    
-    # Select collate function based on mode
-    use_packed = args.collate_mode == "packed"
-    collate_fn = ssl_packed_collate_fn if use_packed else ssl_collate_fn
-    print(f"Using {'packed' if use_packed else 'padded'} sequence collation")
     
     loader = DataLoader(
         dataset,
@@ -159,7 +145,6 @@ def main(args, cfg):
         num_workers=cfg["train"]["num_workers"],
         drop_last=True,
         pin_memory=True,
-        collate_fn=collate_fn,
         persistent_workers=True,  # Keep workers alive between epochs
         prefetch_factor=2,  # Prefetch more batches per worker
     )
@@ -184,6 +169,10 @@ def main(args, cfg):
             # Remap legacy mamba_enc -> seq_enc
             if "mamba_enc" in new_key:
                 new_key = new_key.replace("mamba_enc", "seq_enc")
+            # Skip removed varlen_seq_enc keys from old checkpoints
+            #TODO: remove this once all checkpoints are updated
+            if "varlen_seq_enc" in new_key:
+                continue
             remapped_state_dict[new_key] = value        
         if any("mamba_enc" in k for k in state_dict.keys()):
             print("Detected legacy checkpoint format, remapping keys: mamba_enc -> seq_enc")
@@ -215,46 +204,19 @@ def main(args, cfg):
 
             optimizer.zero_grad(set_to_none=True)
             
-            if use_packed:
-                # Packed sequence mode
-                x1 = batch["feats1"].to(dtype=torch.float32)
-                x2 = batch["feats2"].to(dtype=torch.float32)
-                cu_seqlens1 = batch["cu_seqlens1"].to(device=device)
-                cu_seqlens2 = batch["cu_seqlens2"].to(device=device)
-                max_seqlen1 = batch["max_seqlen1"]
-                max_seqlen2 = batch["max_seqlen2"]
-                sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
-                sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
-                seq_idx1 = batch["seq_idx1"].to(device=device)
-                seq_idx2 = batch["seq_idx2"].to(device=device)
-                
-                with accelerator.autocast():
-                    loss = model(
-                        x1, x2,
-                        input_feature_dims_1=sizes1, input_feature_dims_2=sizes2,
-                        m=curr_m,
-                        use_packed=True,
-                        cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
-                        max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
-                        seq_idx1=seq_idx1, seq_idx2=seq_idx2,
-                    )
-            else:
-                # Padded sequence mode
-                x1 = batch["feats1"].to(dtype=torch.float32)
-                x2 = batch["feats2"].to(dtype=torch.float32)
-                sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
-                sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
-                seq_lens1 = batch["seq_lens1"].to(dtype=torch.long)
-                seq_lens2 = batch["seq_lens2"].to(dtype=torch.long)
-                
-                with accelerator.autocast():
-                    loss = model(
-                        x1, x2, 
-                        input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
-                        seq_lengths_1=seq_lens1, seq_lengths_2=seq_lens2, 
-                        m=curr_m,
-                        use_packed=False,
-                    )
+            x1 = batch["feats1"].to(dtype=torch.float32)
+            x2 = batch["feats2"].to(dtype=torch.float32)
+            sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
+            sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
+            seq_lens = batch["seq_len"].to(dtype=torch.long)
+            
+            with accelerator.autocast():
+                loss = model(
+                    x1, x2, 
+                    input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
+                    seq_lengths=seq_lens, 
+                    m=curr_m,
+                )
             
             # NaN check
             if torch.isnan(loss) or torch.isinf(loss):
@@ -356,18 +318,6 @@ if __name__ == "__main__":
         choices=["abmil", "cls"],
         default="abmil",
         help="Pooling method: 'abmil' (default) or 'cls'. Note: 'cls' requires transformer encoder.",
-    )
-    parser.add_argument(
-        "--collate-mode",
-        type=str,
-        choices=["padded", "packed"],
-        default="padded",
-        dest="collate_mode",
-        help=(
-            "Sequence collation mode: "
-            "'padded' (default) pads all sequences to max length, "
-            "'packed' concatenates sequences without padding for better memory efficiency. "
-        ),
     )
     parser.add_argument(
         "--curriculum",

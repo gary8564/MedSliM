@@ -518,13 +518,13 @@ class ResizeInPlane(tio.Transform):
 
 class AdaptivePreprocessing(tio.Transform):
     """
-    Adaptive preprocessing that chooses optimal strategy based on 
-    source resolution and target FM requirements.
+    Adaptive preprocessing that chooses optimal strategy based on source resolution and target FM requirements.
     
     Strategy:
-    - Upsampling needed (target > source): Use Resample (no choice)
-    - Minor downsampling (0.7 < scale < 1.0): Use CropOrPad (preserve native resolution)
-    - Major downsampling (scale < 0.7): Use Resample then CropOrPad (preserve anatomy + sharpness)
+    - Upsampling needed (target > source): CropOrPad (pad preserves native pixels, no interpolation)
+    - Minor downsampling (0.7 < scale <= 1.0): CropOrPad (small crop, preserves native resolution)
+    - Major downsampling (scale <= 0.7): CropOrPad to intermediate size, 
+      then ResizeInPlane to exact target size
     """
     
     def __init__(
@@ -532,23 +532,32 @@ class AdaptivePreprocessing(tio.Transform):
         target_size: Tuple[int, int],
         num_slices: Optional[int] = None,
         padding_mode: str = 'minimum',
-        resample_interpolation: str = 'linear',
-        resize_mode: str = 'area', 
+        resize_mode: str = 'bilinear',
+        max_resize_ratio: float = 2,
         **kwargs
     ):
+        """
+        Args:
+            target_size: Target (W, H) in-plane size for the FM
+            num_slices: Target number of depth slices (None = keep original)
+            padding_mode: Padding mode for CropOrPad ('minimum', 'constant', etc.)
+            resize_mode: Interpolation mode for ResizeInPlane ('bilinear', 'bicubic', etc.)
+            max_resize_ratio: Maximum allowed resize ratio for major downsampling.
+                              The intermediate crop size = min(source, target * max_resize_ratio).
+                              Lower values favor pixel quality, higher values favor FOV preservation.
+        """
         super().__init__(**kwargs)
         if isinstance(target_size, int):
             target_size = (target_size, target_size)
         self.target_w, self.target_h = target_size
         self.num_slices = num_slices
         self.padding_mode = padding_mode
-        self.resample_interpolation = resample_interpolation
         self.resize_mode = resize_mode
+        self.max_resize_ratio = max_resize_ratio
     
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
         # Get current shape
         current_shape = np.array(subject.spatial_shape)  # (W, H, D)
-        current_spacing = np.array(subject.spacing)
         
         # Detect slice axis
         slice_axis = int(np.argmin(current_shape))
@@ -565,70 +574,42 @@ class AdaptivePreprocessing(tio.Transform):
         
         target_d = self.num_slices if self.num_slices else D_source
         
-        # Choose strategy based on scale
-        if avg_scale > 1.0:
-            # UPSAMPLING: Resample (interpolation required)
-            strategy = 'resample'
-        elif avg_scale > 0.7:
-            # MINOR DOWNSAMPLING: CropOrPad preserves native resolution
-            strategy = 'crop'
-        else:
-            # MAJOR DOWNSAMPLING: Resample first, then CropOrPad
-            strategy = 'resample_then_crop'
-        
-        # Build target shape
-        target_shape = [0, 0, 0]
-        target_shape[in_plane_axes[0]] = self.target_w
-        target_shape[in_plane_axes[1]] = self.target_h
-        target_shape[slice_axis] = target_d
-        
-        # Apply strategy
-        if strategy == 'crop':
-            # Direct CropOrPad
+        if avg_scale > 0.7:
+            target_shape = [0, 0, 0]
+            target_shape[in_plane_axes[0]] = self.target_w
+            target_shape[in_plane_axes[1]] = self.target_h
+            target_shape[slice_axis] = target_d
+            
             transform = tio.CropOrPad(
                 target_shape=tuple(target_shape),
                 padding_mode=self.padding_mode
             )
             subject = transform(subject)
+        else:
+            # Inspired by torchvision's RandomResizedCrop concept:
+            # Step 1: CropOrPad to intermediate in-plane resolution and target depth.
+            #         large sources get more crop, small sources get less.
+            # Step 2: Resize from intermediate to exact target.
+            intermediate_w = min(W_source, int(self.target_w * self.max_resize_ratio))
+            intermediate_h = min(H_source, int(self.target_h * self.max_resize_ratio))
             
-        elif strategy == 'resample':
-            # Calculate target spacing for resampling
-            new_spacing = current_spacing * (current_shape / np.array(target_shape))
-            
-            resample = tio.Resample(
-                target=tuple(new_spacing),
-                image_interpolation=self.resample_interpolation
-            )
-            subject = resample(subject)
-            
-            # Ensure exact shape (floating point rounding)
-            crop_or_pad = tio.CropOrPad(
-                target_shape=tuple(target_shape),
-                padding_mode=self.padding_mode
-            )
-            subject = crop_or_pad(subject)
-            
-        else: 
-            # Step 1: Resample to intermediate size (10-15% larger than target)
-            intermediate_scale = 1.15
             intermediate_shape = [0, 0, 0]
-            intermediate_shape[in_plane_axes[0]] = int(self.target_w * intermediate_scale)
-            intermediate_shape[in_plane_axes[1]] = int(self.target_h * intermediate_scale)
+            intermediate_shape[in_plane_axes[0]] = intermediate_w
+            intermediate_shape[in_plane_axes[1]] = intermediate_h
             intermediate_shape[slice_axis] = target_d
             
-            intermediate_spacing = current_spacing * (current_shape / np.array(intermediate_shape))
-            
-            resample = tio.Resample(
-                target=tuple(intermediate_spacing),
-                image_interpolation=self.resample_interpolation
-            )
-            subject = resample(subject)
-            
-            # Step 2: CropOrPad to exact target (preserves sharpness)
+            # Step 1: CropOrPad to intermediate size (handles both in-plane and depth)
             crop_or_pad = tio.CropOrPad(
-                target_shape=tuple(target_shape),
+                target_shape=tuple(intermediate_shape),
                 padding_mode=self.padding_mode
             )
             subject = crop_or_pad(subject)
+            
+            # Step 2: Resize to exact FM target size (capped at max_resize_ratio)
+            resize = ResizeInPlane(
+                target_size=(self.target_h, self.target_w),
+                mode=self.resize_mode,
+            )
+            subject = resize(subject)
         
         return subject

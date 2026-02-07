@@ -59,7 +59,7 @@ def test_moco_transformer_forward_loss():
     seq_lens = torch.full((batch_size,), num_slices, dtype=torch.long, device=DEVICE)
     
     with torch.no_grad():
-        loss = model(x1, x2, seq_lengths_1=seq_lens, seq_lengths_2=seq_lens, m=0.99)
+        loss = model(x1, x2, seq_lengths=seq_lens, m=0.99)
     assert isinstance(loss, torch.Tensor)
     assert loss.ndim == 0
     assert torch.isfinite(loss).all()

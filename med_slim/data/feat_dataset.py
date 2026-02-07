@@ -4,116 +4,16 @@ import torch
 import random
 import os
 import logging
-from typing import List, Tuple, Dict, Optional, Union
+from typing import List, Tuple, Dict
 from torch.utils.data import Dataset
 from glob import glob
 from tqdm import tqdm
 from safetensors import safe_open
 from collections import defaultdict
-from torch.nn.utils.rnn import pad_sequence
 
 from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
-
-def ssl_collate_fn(batch):
-    """
-    Custom collate function for PrecomputedFeatPairDataset when traditional zero-padding approach is considered in SSL pretraining.    
-    """
-    feats1_list = [item["feats1"] for item in batch]
-    feats2_list = [item["feats2"] for item in batch]
-    orig_embed_dims1 = torch.stack([item["orig_embed_dim1"].to(dtype=torch.long) for item in batch], dim=0)
-    orig_embed_dims2 = torch.stack([item["orig_embed_dim2"].to(dtype=torch.long) for item in batch], dim=0)
-    seq_lens1 = torch.stack([item["seq_len1"].to(dtype=torch.long) for item in batch], dim=0)
-    seq_lens2 = torch.stack([item["seq_len2"].to(dtype=torch.long) for item in batch], dim=0)
-
-    # Vectorized padding using pad_sequence (batch_first=True gives [B, max_seq_len, embed_dim])
-    feats1_padded = pad_sequence(feats1_list, batch_first=True, padding_value=0.0)
-    feats2_padded = pad_sequence(feats2_list, batch_first=True, padding_value=0.0)
-    
-    # Ensure both have same max_seq_len (pad the shorter one if needed)
-    max_seq_len = max(feats1_padded.shape[1], feats2_padded.shape[1])
-    if feats1_padded.shape[1] < max_seq_len:
-        pad_size = max_seq_len - feats1_padded.shape[1]
-        feats1_padded = torch.nn.functional.pad(feats1_padded, (0, 0, 0, pad_size))
-    if feats2_padded.shape[1] < max_seq_len:
-        pad_size = max_seq_len - feats2_padded.shape[1]
-        feats2_padded = torch.nn.functional.pad(feats2_padded, (0, 0, 0, pad_size))
-
-    return {
-        "feats1": feats1_padded, # [B, max_seq_len, max_feat_dim]
-        "feats2": feats2_padded,
-        "orig_embed_dim1": orig_embed_dims1, # [B]
-        "orig_embed_dim2": orig_embed_dims2,
-        "seq_lens1": seq_lens1, # [B]
-        "seq_lens2": seq_lens2, # [B]
-    }
-
-
-def ssl_packed_collate_fn(batch):
-    """
-    Packed sequence collate function for PrecomputedFeatPairDataset.
-    
-    Instead of padding all sequences to max_seq_len (wasting memory/compute),
-    concatenates all sequences and uses cumulative sequence lengths (cu_seqlens)
-    to track document boundaries.
-    
-    Efficient for:
-    - Mamba2: Uses seq_idx or cu_seqlens to avoid passing states in between
-    - Transformer with FlashAttention/varlen_attn: Uses cu_seqlens for variable-length attention
-    
-    Returns:
-        dict with keys:
-            - feats1: packed features with shape [total_seq_len, max_feat_dim]
-            - feats2: packed features with shape [total_seq_len, max_feat_dim]  
-            - cu_seqlens1: cumulative sequence lengths for view 1 with shape [B+1]
-            - cu_seqlens2: cumulative sequence lengths for view 2 with shape [B+1]
-            - max_seqlen1: max sequence length in batch for view 1
-            - max_seqlen2: max sequence length in batch for view 2
-            - seq_idx1: index for each token with shape [total_seq_len] (needed for Mamba2)
-            - seq_idx2: index for each token with shape [total_seq_len] (needed for Mamba2)
-            - orig_embed_dim1: original embedding dimensions with shape [B]
-            - orig_embed_dim2: original embedding dimensions with shape [B]
-    """
-    feats1_list = [item["feats1"] for item in batch]
-    feats2_list = [item["feats2"] for item in batch]
-    orig_embed_dims1 = torch.stack([item["orig_embed_dim1"].to(dtype=torch.long) for item in batch], dim=0)
-    orig_embed_dims2 = torch.stack([item["orig_embed_dim2"].to(dtype=torch.long) for item in batch], dim=0)
-    
-    batch_size = len(batch)
-    
-    # Get sequence lengths
-    seq_lens1 = torch.tensor([feat.shape[0] for feat in feats1_list], dtype=torch.int32)
-    seq_lens2 = torch.tensor([feat.shape[0] for feat in feats2_list], dtype=torch.int32)
-    
-    # Compute cumulative sequence lengths (cu_seqlens)
-    cu_seqlens1 = torch.zeros(batch_size + 1, dtype=torch.int32)
-    cu_seqlens2 = torch.zeros(batch_size + 1, dtype=torch.int32)
-    cu_seqlens1[1:] = torch.cumsum(seq_lens1, dim=0)
-    cu_seqlens2[1:] = torch.cumsum(seq_lens2, dim=0)
-    
-    # Pack features: concatenate all sequences along sequence length dimension
-    feats1_packed = torch.cat(feats1_list, dim=0)  # [total_seq_len1, max_feat_dim]
-    feats2_packed = torch.cat(feats2_list, dim=0)  # [total_seq_len2, max_feat_dim]
-    
-    # Vectorized building seq_idx: repeat each batch index by its sequence length
-    seq_idx1 = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens1)
-    seq_idx2 = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens2)
-    
-    return {
-        "feats1": feats1_packed,  # [total_seq_len, max_feat_dim]
-        "feats2": feats2_packed,
-        "cu_seqlens1": cu_seqlens1,  # [B+1]
-        "cu_seqlens2": cu_seqlens2,
-        "max_seqlen1": seq_lens1.max().item(),
-        "max_seqlen2": seq_lens2.max().item(),
-        "seq_idx1": seq_idx1,  # [total_seq_len] 
-        "seq_idx2": seq_idx2,
-        "orig_embed_dim1": orig_embed_dims1,  # [B]
-        "orig_embed_dim2": orig_embed_dims2,
-        "batch_size": batch_size,
-    }
-
 
 def linear_classifier_collate_fn(batch):
     """
@@ -215,141 +115,6 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
         "sample_ids": sample_ids,
     }
 
-def linear_classifier_packed_collate_fn(batch):
-    """
-    Custom collate function for FeatClassificationDataset with packed sequences.
-    
-    Returns:
-        dict with keys:
-            - features: List of K tensors, each [total_seq_len, embed_dim]
-            - cu_seqlens: Cumulative sequence lengths [B+1], int32
-            - max_seqlen: Maximum sequence length in batch
-            - seq_idx: Document index for each token [total_seq_len], int32
-            - labels: [B] tensor of labels
-            - sample_ids: List of sample IDs
-            - batch_size: Number of samples in batch
-    """
-    labels = torch.stack([item["label"] for item in batch])
-    sample_ids = [item["sample_id"] for item in batch]
-    seq_lengths = [item["seq_length"] for item in batch]
-    
-    all_feats_list = [item["feature_embeds"] for item in batch]
-    K = len(all_feats_list[0])  # Number of slice encoders
-    batch_size = len(batch)
-    max_seqlen = max(seq_lengths)
-    
-    # Compute cumulative sequence lengths: [0, len1, len1+len2, ...]
-    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
-    cu_seqlens[1:] = torch.cumsum(torch.tensor(seq_lengths, dtype=torch.int32), dim=0)
-    total_seq_len = cu_seqlens[-1].item()
-    
-    # Build seq_idx: document index for each token
-    seq_idx = torch.repeat_interleave(
-        torch.arange(batch_size, dtype=torch.int32),
-        torch.tensor(seq_lengths, dtype=torch.int32)
-    )
-    
-    # Pack features for each encoder: List of K [total_seq_len, embed_dim]
-    features_list = []
-    for k in range(K):
-        kth_feats = [sample_feats[k] for sample_feats in all_feats_list]
-        embed_dim = kth_feats[0].shape[-1]
-        
-        # Concatenate all sequences
-        packed = torch.zeros(total_seq_len, embed_dim)
-        for i, feat in enumerate(kth_feats):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
-            packed[start:end] = feat
-        
-        features_list.append(packed)
-    
-    return {
-        "features": features_list,  # List of K [total_seq_len, embed_dim]
-        "cu_seqlens": cu_seqlens,   # [B+1]
-        "max_seqlen": max_seqlen,
-        "seq_idx": seq_idx,         # [total_seq_len]
-        "labels": labels,
-        "sample_ids": sample_ids,
-        "batch_size": batch_size,
-    }
-
-
-def multiview_classifier_packed_collate_fn(batch: List[Dict]) -> Dict:
-    """
-    Packed sequence collate function for MultiViewFeatClassificationDataset.
-    
-    Returns:
-        Dict with keys:
-            - features: {view_plane: List of K tensors [total_seq_len, embed_dim]}
-            - cu_seqlens: {view_plane: tensor [B+1]}
-            - max_seqlen: {view_plane: int}
-            - seq_idx: {view_plane: tensor [total_seq_len]}
-            - labels: tensor [B] or [B, num_labels]
-            - sample_ids: list of sample IDs
-            - batch_size: Number of samples in batch
-    """
-    view_planes = list(batch[0]["feature_embeds"].keys())
-    batch_size = len(batch)
-    
-    collated_features = {}
-    collated_cu_seqlens = {}
-    collated_max_seqlens = {}
-    collated_seq_idx = {}
-    
-    for view_plane in view_planes:
-        # Get all slice encoder features for this view plane
-        all_feats_list = [item["feature_embeds"][view_plane] for item in batch]
-        all_seq_lengths = [item["seq_length"][view_plane] for item in batch]
-        
-        K = len(all_feats_list[0])  # Number of slice encoders
-        max_seqlen = max(all_seq_lengths)
-        
-        # Compute cumulative sequence lengths
-        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
-        cu_seqlens[1:] = torch.cumsum(torch.tensor(all_seq_lengths, dtype=torch.int32), dim=0)
-        total_seq_len = cu_seqlens[-1].item()
-        
-        # Build seq_idx
-        seq_idx = torch.repeat_interleave(
-            torch.arange(batch_size, dtype=torch.int32),
-            torch.tensor(all_seq_lengths, dtype=torch.int32)
-        )
-        
-        # Pack features for each encoder
-        features_list = []
-        for k in range(K):
-            kth_feats = [sample_feats[k] for sample_feats in all_feats_list]
-            embed_dim = kth_feats[0].shape[-1]
-            
-            packed = torch.zeros(total_seq_len, embed_dim)
-            for i, feat in enumerate(kth_feats):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                packed[start:end] = feat
-            
-            features_list.append(packed)
-        
-        collated_features[view_plane] = features_list
-        collated_cu_seqlens[view_plane] = cu_seqlens
-        collated_max_seqlens[view_plane] = max_seqlen
-        collated_seq_idx[view_plane] = seq_idx
-    
-    # Collate labels
-    labels = torch.stack([item["label"] for item in batch])
-    sample_ids = [item["sample_id"] for item in batch]
-    
-    return {
-        "features": collated_features,
-        "cu_seqlens": collated_cu_seqlens,
-        "max_seqlen": collated_max_seqlens,
-        "seq_idx": collated_seq_idx,
-        "labels": labels,
-        "sample_ids": sample_ids,
-        "batch_size": batch_size,
-    }
-
-
 class PrecomputedFeatPairDataset(Dataset):
     """
     Dataset of constructing precomputed feature positive pairs at the exam level, which are used for contrastive learning.
@@ -357,24 +122,23 @@ class PrecomputedFeatPairDataset(Dataset):
     when forming a pair, enforce both views to be from the same plane; 
     use all planes across the dataset but don't mix within a pair.
     
-    Supports three dimensions of augmentation for positive pairs:
-    1. Different foundation models (slice_encoder_models)
-    2. Different preprocessing methods (spatial_modes)
+    Positive pairs are constructed from different foundation models applied to the same exam and view plane.
     
-    Directory structure (with spatial_modes):
-        {feat_dir}/{spatial_mode}/{model}/{split}/{plane}/*.safetensors
+    Slice sampling: When raw-resolution features are precomputed (variable-length slices),
+    this dataset samples or pads to a fixed num_target_slices at training time.
+    - Volumes with more slices: uniformly subsample (preserving anatomical order)
+    - Volumes with fewer slices: zero-pad and track actual length for masking
     
-    Directory structure (without spatial_modes):
+    Directory structure:
         {feat_dir}/{model}/{split}/{plane}/*.safetensors
     """
-    #TODO: change the directory structure to be consistent (remove legacy directory structure)
     def __init__(self, 
                  feat_dirs: List[Dict[str, str]], 
                  slice_encoder_models: List[str], 
                  view_planes: List[str], 
                  split: str, 
                  max_feature_dim: int,
-                 spatial_modes: Optional[List[str]] = None):
+                 num_target_slices: int = 32):
         """
         Args:
             feat_dirs: List of dicts with keys "name" (dataset name) and "feat_dir" (path to features)
@@ -382,16 +146,16 @@ class PrecomputedFeatPairDataset(Dataset):
             view_planes: List of view planes (e.g., ["axial", "sagittal", "coronal"])
             split: Data split ("train" or "val")
             max_feature_dim: Maximum feature dimension for padding
-            spatial_modes: Optional list of preprocessing modes (e.g., ["resize", "resample", "crop"])
-                           If provided, enables cross-preprocessing positive pairs as augmentation
-                           If None, uses directory structure without spatial_mode subdirectory
+            num_target_slices: Target number of slices for all outputs. Volumes with more slices 
+                               are uniformly subsampled (order-preserving); volumes with fewer are 
+                               zero-padded. Default: 32.
         """
         self.feat_dirs = feat_dirs
         self.slice_encoder_models = slice_encoder_models
         self.view_planes = view_planes
         self.split = split
         self.max_feature_dim = max_feature_dim
-        self.spatial_modes = spatial_modes
+        self.num_target_slices = num_target_slices
         
         self.feat_path_dict = self._get_feat_path_dict_by_study_id()
         self.study_ids = list(self.feat_path_dict.keys())
@@ -405,46 +169,29 @@ class PrecomputedFeatPairDataset(Dataset):
         feat_path_dict = defaultdict(lambda: defaultdict(list))
         logger.info(f'Selected slice encoder models: {self.slice_encoder_models}')
         logger.info(f'Selected view planes: {self.view_planes}')
-        if self.spatial_modes:
-            logger.info(f'Selected spatial modes: {self.spatial_modes}')
         
         for dataset in tqdm(self.feat_dirs, desc="Loading precomputed feature datasets...", leave=False):
             dataset_name = dataset["name"]
             feat_dir = dataset["feat_dir"]
             
-            # Determine preprocessing modes to iterate over
-            modes_to_load = self.spatial_modes if self.spatial_modes else [None]
-            
-            for spatial_mode in modes_to_load:
-                for model_name in tqdm(self.slice_encoder_models, desc=f"Loading {dataset_name} features from FMs...", leave=False):
-                    for view_plane in self.view_planes:
-                        # Build path based on whether spatial_modes is used
-                        if spatial_mode is not None:
-                            feat_path = os.path.join(
-                                feat_dir, spatial_mode, model_name, self.split, view_plane
-                            )
-                        else:
-                            feat_path = os.path.join(feat_dir, model_name, self.split, view_plane)
-                        
-                        if not os.path.exists(feat_path):
-                            raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
-                        
-                        feat_files = glob(os.path.join(feat_path, "*.safetensors"))
-                        assert len(feat_files) > 0, f"Couldn't find any feat files in path {feat_path}!"
-                        
-                        for feat_file in feat_files:
-                            exam_id = os.path.basename(feat_file).split(".")[0]
-                            study_id = f"{dataset_name}_{exam_id}"
-                            feat_path_dict[study_id][view_plane].append(feat_file)
+            for model_name in tqdm(self.slice_encoder_models, desc=f"Loading {dataset_name} features from FMs...", leave=False):
+                for view_plane in self.view_planes:
+                    feat_path = os.path.join(feat_dir, model_name, self.split, view_plane)
+                    
+                    if not os.path.exists(feat_path):
+                        raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
+                    
+                    feat_files = glob(os.path.join(feat_path, "*.safetensors"))
+                    assert len(feat_files) > 0, f"Couldn't find any feat files in path {feat_path}!"
+                    
+                    for feat_file in feat_files:
+                        exam_id = os.path.basename(feat_file).split(".")[0]
+                        study_id = f"{dataset_name}_{exam_id}"
+                        feat_path_dict[study_id][view_plane].append(feat_file)
         
         # Filter out studies that don't have valid feature files
         valid_studies = {}
-        
-        # Expected number of files per plane
-        if self.spatial_modes:
-            num_expected_files = len(self.slice_encoder_models) * len(self.spatial_modes)
-        else:
-            num_expected_files = len(self.slice_encoder_models)
+        num_expected_files = len(self.slice_encoder_models)
         
         for study_id, planes_dict in feat_path_dict.items():
             valid_planes = {
@@ -463,7 +210,7 @@ class PrecomputedFeatPairDataset(Dataset):
 
         return valid_studies
 
-    def _pad_feature_dim(self, x: torch.Tensor) -> torch.Tensor:
+    def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
         Pad the embedding dimension to the largest embedding dimension in the batch by padding with zeros if it is smaller than the target dimension.
         """
@@ -473,6 +220,35 @@ class PrecomputedFeatPairDataset(Dataset):
             pad_size = self.max_feature_dim - embed_dim
             x = torch.nn.functional.pad(x, (0, pad_size), mode='constant', value=0)
         return x, embed_dim
+    
+    def _sample_or_pad_slices(self, feats: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """
+        Sample or pad slices to the target number of slices.
+        
+        - More slices than target: uniformly subsample (preserving anatomical order).
+        - Fewer slices than target: zero-pad and return actual count for masking.
+        - Exactly target slices: return as-is.
+        
+        Args:
+            feats: Feature tensor [num_slices, embed_dim]
+        
+        Returns:
+            Tuple of (features [num_target_slices, embed_dim], actual_num_real_slices)
+        """
+        num_slices = feats.shape[0]
+        target = self.num_target_slices
+        
+        if num_slices == target:
+            return feats, target
+        elif num_slices > target:
+            # Uniformly subsample target indices, preserving anatomical order
+            indices = np.sort(np.random.choice(num_slices, size=target, replace=False))
+            return feats[indices], target
+        else:
+            # Zero-pad to target length
+            pad_size = target - num_slices
+            padded = torch.nn.functional.pad(feats, (0, 0, 0, pad_size), value=0.0)
+            return padded, num_slices  # actual number of slices for masking
     
     def _load_feats(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
         with safe_open(feat_path, framework="pt", device="cpu") as f:
@@ -493,17 +269,13 @@ class PrecomputedFeatPairDataset(Dataset):
         available_planes = list(self.feat_path_dict[study_id].keys())
         selected_view_plane = random.choice(available_planes)
         
-        # Get feature files for the selected plane
+        # Get feature files for the selected plane (one per FM)
         plane_feat_files = self.feat_path_dict[study_id][selected_view_plane]
         num_variants = len(plane_feat_files)
-        if self.spatial_modes:
-            num_models = num_variants // len(self.spatial_modes)
-        else:
-            num_models = num_variants
-        assert num_models == len(self.slice_encoder_models), \
-            f"Study {study_id} plane {selected_view_plane} has {num_models} feature files, expected {len(self.slice_encoder_models)}"
+        assert num_variants == len(self.slice_encoder_models), \
+            f"Study {study_id} plane {selected_view_plane} has {num_variants} feature files, expected {len(self.slice_encoder_models)}"
         
-        # Randomly select two feature files from different FMs/preprocessing
+        # Randomly select two feature files from different FMs
         idx1 = np.random.randint(0, num_variants)
         idx2 = np.random.randint(0, num_variants)
         feat_path1 = plane_feat_files[idx1]
@@ -514,14 +286,19 @@ class PrecomputedFeatPairDataset(Dataset):
         assert metadata1["plane"] == metadata2["plane"], \
             f"Expected plane to be equal, but got {metadata1['plane']} and {metadata2['plane']}!"
         
-        slice_seq_len1 = feats1.shape[0]
-        slice_seq_len2 = feats2.shape[0]
+        assert feats1.shape[0] == feats2.shape[0], (
+            f"Expected same number of slices for positive pair (same exam id and same plane), "
+            f"but got {feats1.shape[0]} and {feats2.shape[0]} for study {study_id}, "
+            f"plane {selected_view_plane}."
+        )
         
-        assert slice_seq_len1 == slice_seq_len2, \
-            f"Expected number of slices to be equal, but got {slice_seq_len1} and {slice_seq_len2} for study {study_id} and view plane {selected_view_plane}!"
+        # Sample or pad slices to fixed length
+        # Positive samples in a pair get independent subsampling
+        feats1, seq_len = self._sample_or_pad_slices(feats1)
+        feats2, _ = self._sample_or_pad_slices(feats2)
         
         with torch.no_grad():
-            # pad feature dimension to max_feature_dim
+            # Pad feature dimension to max_feature_dim
             feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
             feats2, orig_embed_dim2 = self._pad_feature_dim(feats2) 
         
@@ -529,12 +306,11 @@ class PrecomputedFeatPairDataset(Dataset):
             f"Expected embed_dim to be equal, but got {feats1.shape[1]} and {feats2.shape[1]}!"
         
         return {
-            "feats1": feats1,
-            "feats2": feats2,
+            "feats1": feats1,                # [num_target_slices, max_feature_dim]
+            "feats2": feats2,                # [num_target_slices, max_feature_dim]
             "orig_embed_dim1": torch.as_tensor(orig_embed_dim1, dtype=torch.long),
             "orig_embed_dim2": torch.as_tensor(orig_embed_dim2, dtype=torch.long),
-            "seq_len1": torch.as_tensor(slice_seq_len1, dtype=torch.long),
-            "seq_len2": torch.as_tensor(slice_seq_len2, dtype=torch.long),
+            "seq_len": torch.as_tensor(seq_len, dtype=torch.long),
         }
 
 class PrecomputedFeatSupConDataset(Dataset):

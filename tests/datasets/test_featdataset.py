@@ -9,11 +9,6 @@ from med_slim.data.feat_dataset import (
     FeatClassificationDataset,
     MultiViewFeatClassificationDataset,
     multiview_classifier_collate_fn,
-    ssl_collate_fn,
-    ssl_packed_collate_fn,
-    linear_classifier_collate_fn,
-    linear_classifier_packed_collate_fn,
-    multiview_classifier_packed_collate_fn,
 )
 from torch.utils.data import DataLoader
 
@@ -49,19 +44,28 @@ def test_precomputed_feat_pair_dataset_loads_and_shapes():
         view_planes=VIEW_PLANES,
         split=SPLIT,
         max_feature_dim=MAX_FEATURE_DIM,
+        num_target_slices=NUM_SLICES,
     )
 
     assert len(ds) > 0
 
-    feats1, orig_dim1, seq_len1, feats2, orig_dim2, seq_len2 = ds[0]
+    item = ds[0]
+    feats1 = item["feats1"]
+    feats2 = item["feats2"]
+    orig_dim1 = item["orig_embed_dim1"]
+    orig_dim2 = item["orig_embed_dim2"]
+    seq_len = item["seq_len"]
+    
     assert isinstance(feats1, torch.Tensor) and isinstance(feats2, torch.Tensor)
     assert feats1.ndim == 2 and feats2.ndim == 2
-    assert feats1.shape == feats2.shape == (NUM_SLICES, MAX_FEATURE_DIM) # Shape: [num_slices, padded_embed_dim]
+    # Slice sampling ensures fixed output shape: [num_target_slices, padded_embed_dim]
+    assert feats1.shape == (NUM_SLICES, MAX_FEATURE_DIM)
+    assert feats2.shape == (NUM_SLICES, MAX_FEATURE_DIM)
     assert isinstance(orig_dim1.item(), int) and isinstance(orig_dim2.item(), int)
     assert 1 <= orig_dim1.item() <= MAX_FEATURE_DIM # Original embedding dims are <= MAX_FEATURE_DIM
     assert 1 <= orig_dim2.item() <= MAX_FEATURE_DIM
-    assert isinstance(seq_len1.item(), int) and isinstance(seq_len2.item(), int)
-    assert seq_len1.item() == seq_len2.item()  # Both views should have same sequence length
+    assert isinstance(seq_len.item(), int)
+    assert 1 <= seq_len.item() <= NUM_SLICES
 
 
 # -------------------- FeatClassificationDataset --------------------
@@ -252,12 +256,15 @@ def test_dataloader_matches_number_of_studies():
     
     feat_dirs = [{"name": d["name"], "feat_dir": d["feat_dir"]} for d in datasets_cfg]
     
+    num_target_slices = cfg["feat_dataset"].get("num_target_slices", 32)
+    
     ds = PrecomputedFeatPairDataset(
         feat_dirs=feat_dirs,
         slice_encoder_models=models,
         view_planes=planes,
         split=split,
         max_feature_dim=max_feature_dim,
+        num_target_slices=num_target_slices,
     )
     
     loader = DataLoader(
@@ -267,7 +274,6 @@ def test_dataloader_matches_number_of_studies():
         num_workers=0,
         drop_last=False,
         pin_memory=False,
-        collate_fn=ssl_collate_fn,
     )
     
     print(f"Dataset length: {len(ds)}")
@@ -278,163 +284,3 @@ def test_dataloader_matches_number_of_studies():
         f"Dataset has {len(ds)} studies but expected {total_expected} studies"
 
 
-# -------------------- Packed Collate Functions --------------------
-def test_ssl_packed_collate_fn():
-    """Test ssl_packed_collate_fn produces correct packed batch format."""
-    assert FEAT_ROOT.exists(), f"Feature root not found: {FEAT_ROOT}"
-    
-    feat_dirs = [{"name": "mrnet", "feat_dir": str(FEAT_ROOT)}]
-    
-    ds = PrecomputedFeatPairDataset(
-        feat_dirs=feat_dirs,
-        slice_encoder_models=SLICE_ENCODER_MODELS[:1],  # Single encoder for simplicity
-        view_planes=VIEW_PLANES,
-        split=SPLIT,
-        max_feature_dim=EMBED_DIMS[0],
-    )
-    
-    if len(ds) < 4:
-        pytest.skip("Need at least 4 samples for packed collate test.")
-    
-    batch = [ds[i] for i in range(4)]
-    collated = ssl_packed_collate_fn(batch)
-    
-    # Check all expected keys
-    expected_keys = {
-        "feats1", "feats2",
-        "cu_seqlens1", "cu_seqlens2",
-        "max_seqlen1", "max_seqlen2",
-        "seq_idx1", "seq_idx2",
-        "orig_embed_dim1", "orig_embed_dim2",
-        "batch_size",
-    }
-    assert set(collated.keys()) == expected_keys
-    
-    batch_size = collated["batch_size"]
-    assert batch_size == 4
-    
-    # Verify packed tensor shapes
-    total_tokens1 = collated["cu_seqlens1"][-1].item()
-    total_tokens2 = collated["cu_seqlens2"][-1].item()
-    
-    # feats should be [total_tokens, max_feature_dim]
-    assert collated["feats1"].ndim == 2
-    assert collated["feats2"].ndim == 2
-    assert collated["feats1"].shape[0] == total_tokens1
-    assert collated["feats2"].shape[0] == total_tokens2
-    
-    # cu_seqlens should be [batch_size + 1]
-    assert collated["cu_seqlens1"].shape == (batch_size + 1,)
-    assert collated["cu_seqlens2"].shape == (batch_size + 1,)
-    
-    # cu_seqlens should start at 0 and be monotonically increasing
-    assert collated["cu_seqlens1"][0] == 0
-    assert collated["cu_seqlens2"][0] == 0
-    
-    # seq_idx should match total_tokens
-    assert collated["seq_idx1"].shape == (total_tokens1,)
-    assert collated["seq_idx2"].shape == (total_tokens2,)
-    
-    # Verify seq_idx values are in range [0, batch_size)
-    assert collated["seq_idx1"].min() >= 0
-    assert collated["seq_idx1"].max() < batch_size
-
-
-def test_linear_classifier_packed_collate_fn():
-    """Test linear_classifier_packed_collate_fn produces correct packed format."""
-    ds = FeatClassificationDataset(
-        feat_dir=str(FEAT_ROOT),
-        slice_encoder_models=SLICE_ENCODER_MODELS,
-        view_plane="sagittal",
-        split="train",
-        annotations_path=str(ANNOTATIONS_DIR / "train.csv"),
-        task="binary",
-        target_columns=["abnormal"],
-    )
-    
-    if len(ds) < 4:
-        pytest.skip("Need at least 4 samples for packed collate test.")
-    
-    batch = [ds[i] for i in range(4)]
-    collated = linear_classifier_packed_collate_fn(batch)
-    
-    # Check keys
-    expected_keys = {
-        "features", "cu_seqlens", "max_seqlen", "seq_idx",
-        "labels", "sample_ids", "batch_size",
-    }
-    assert set(collated.keys()) == expected_keys
-    
-    batch_size = collated["batch_size"]
-    K = len(SLICE_ENCODER_MODELS)
-    
-    # features should be List of K tensors [total_tokens, embed_dim]
-    assert len(collated["features"]) == K
-    
-    total_tokens = collated["cu_seqlens"][-1].item()
-    for i, feat in enumerate(collated["features"]):
-        assert feat.shape == (total_tokens, EMBED_DIMS[i])
-    
-    # cu_seqlens should be [batch_size + 1]
-    assert collated["cu_seqlens"].shape == (batch_size + 1,)
-    assert collated["cu_seqlens"][0] == 0
-    
-    # seq_idx should be [total_tokens]
-    assert collated["seq_idx"].shape == (total_tokens,)
-    
-    # labels should be [batch_size]
-    assert collated["labels"].shape == (batch_size,)
-
-
-def test_multiview_classifier_packed_collate_fn():
-    """Test multiview_classifier_packed_collate_fn produces correct packed format."""
-    view_planes = _get_available_views(min_views=2)
-    if not view_planes:
-        pytest.skip("Not enough view planes available on disk for multi-view test.")
-    
-    ds = MultiViewFeatClassificationDataset(
-        feat_dir=str(FEAT_ROOT),
-        slice_encoder_models=SLICE_ENCODER_MODELS,
-        view_planes=view_planes,
-        split="train",
-        annotations_path=str(ANNOTATIONS_DIR / "train.csv"),
-        task="binary",
-        target_columns=["abnormal"],
-    )
-    
-    if len(ds) < 4:
-        pytest.skip("Need at least 4 samples for packed collate test.")
-    
-    batch = [ds[i] for i in range(4)]
-    collated = multiview_classifier_packed_collate_fn(batch)
-    
-    # Check keys
-    expected_keys = {
-        "features", "cu_seqlens", "max_seqlen", "seq_idx",
-        "labels", "sample_ids", "batch_size",
-    }
-    assert set(collated.keys()) == expected_keys
-    
-    batch_size = collated["batch_size"]
-    K = len(SLICE_ENCODER_MODELS)
-    
-    # Each view should have packed features
-    for view in view_planes:
-        assert view in collated["features"]
-        assert view in collated["cu_seqlens"]
-        assert view in collated["seq_idx"]
-        
-        features_list = collated["features"][view]
-        cu_seqlens = collated["cu_seqlens"][view]
-        seq_idx = collated["seq_idx"][view]
-        
-        assert len(features_list) == K
-        
-        total_tokens = cu_seqlens[-1].item()
-        for i, feat in enumerate(features_list):
-            assert feat.shape == (total_tokens, EMBED_DIMS[i])
-        
-        assert cu_seqlens.shape == (batch_size + 1,)
-        assert seq_idx.shape == (total_tokens,)
-    
-    assert collated["labels"].shape == (batch_size,)
