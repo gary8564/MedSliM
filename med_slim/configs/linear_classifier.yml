@@ -1,11 +1,11 @@
 # Path to pretrained MedSliM checkpoint
-checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-06-12:30/medslim-epoch2000.pth.tar"
+checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-07-14:10/medslim-epoch2000.pth.tar"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
 
 feat_dataset:
   dataset_name: "MRNet"
-  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32/crop"
   plane:
     - "sagittal"
     # - "coronal"

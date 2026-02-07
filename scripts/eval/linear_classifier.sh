@@ -18,11 +18,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
 CONFIG_PATH="./med_slim/configs/linear_classifier.yml"
-CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-06-12:30/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
+CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-07-14:10/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
 FM_POOLING="mean"  # Options: "mean", "concat" (attention requires fine-tuning COBRA)
 SEQUENCE_ENCODER="mamba2"
 SLICE_POOLING="cls" # Only used when sequence encoder is transformer
-FM_MODEL_NAMES="dinov2 medsiglip ark"  # dinov3 not in old checkpoint
+FM_MODEL_NAMES="dinov2 medsiglip ark" 
 
 EXTRA_ARGS=""
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
