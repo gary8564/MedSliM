@@ -93,9 +93,9 @@ def main():
     parser.add_argument("--num-slices", type=int, default=None, help="Number of slices along depth used by transforms.")
     parser.add_argument("--amp", type=str, default=None, choices=["fp16", "bf16"], 
                         help="Use automatic mixed precision: 'fp16' (faster but can overflow) or 'bf16' (safer, recommended)")
-    parser.add_argument("--model-name", type=str, default="dinov2", choices=["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip"], help="Slice encoder backbone.")
+    parser.add_argument("--model-name", type=str, default="dinov2", choices=["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core"], help="Slice encoder backbone.")
     parser.add_argument("--model-repo", type=str, default=None, help="Optional HF repo override for DINO/MedSigLIP/CLIP.")
-    parser.add_argument("--ark-checkpoint", type=str, default=None, help="Ark checkpoint path (required if --model-name ark).")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Local checkpoint path (required for --model-name ark or mri-core).")
     parser.add_argument("--local-cache-dir", type=str, default=None, help="Local cache directory to store the model.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Dataset split to precompute.")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader workers")
@@ -115,7 +115,7 @@ def main():
         raise ValueError(f"Unknown spatial_mode: {spatial_mode}. Choose from {SPATIAL_MODES}")
 
     # Build slice encoder (expects [B, C, W, H, D] with C=1 grayscale)
-    slice_encoder = build_slice_encoder(name=args.model_name, model_repo=args.model_repo, checkpoint=args.ark_checkpoint, local_cache_dir=args.local_cache_dir, freeze=True).to(device).eval()
+    slice_encoder = build_slice_encoder(name=args.model_name, model_repo=args.model_repo, checkpoint=args.checkpoint, local_cache_dir=args.local_cache_dir, freeze=True).to(device).eval()
     
     # Optional: compile model for faster inference
     if args.compile:

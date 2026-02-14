@@ -259,6 +259,70 @@ class MultiViewClassifier(nn.Module):
 # =============================================================================
 # Utility Functions
 # =============================================================================
+def _build_optimizer(
+    model: nn.Module,
+    hyperparams: Dict,
+    accelerator: Accelerator,
+) -> torch.optim.Optimizer:
+    """
+    Build AdamW optimizer with optional differential learning rates for fine-tuning.
+
+    When COBRA is frozen (linear probing):
+        Single LR for all trainable params (classifier head only).
+
+    When COBRA is unfrozen (fine-tuning):
+        - base_lr for new / randomly-initialised modules:
+            classifier head, fm_attn (FM-attention ABMIL),
+            attention_aggregator (multi-view only).
+        - base_lr * backbone_lr_scale for the pretrained COBRA backbone
+            (embed layers, sequence encoder, ABMIL pooling, norms, cls_token).
+
+    Args:
+        model: SingleViewClassifier or MultiViewClassifier
+        hyperparams: hyperparams section from config
+        accelerator: HuggingFace Accelerator (for gated logging)
+
+    Returns:
+        Configured AdamW optimizer
+    """
+    base_lr = float(hyperparams.get("base_lr", 1e-5))
+    weight_decay = float(hyperparams.get("weight_decay", 1e-3))
+
+    # Linear probing: COBRA frozen
+    if model.freeze_cobra:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        return torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=weight_decay)
+
+    # Fine-tuning: differential learning rates
+    backbone_lr_scale = float(hyperparams.get("backbone_lr_scale", 0.1))
+    backbone_lr = base_lr * backbone_lr_scale
+
+    # Pretrained COBRA backbone params: base_lr * backbone_lr_scale
+    pretrained_param_ids = set()
+    pretrained_params = []
+    for name, param in model.cobra.named_parameters():
+        if not param.requires_grad:
+            continue
+        # fm_attn is randomly initialised → full LR (handled below)
+        if "fm_attn" in name:
+            continue
+        pretrained_params.append(param)
+        pretrained_param_ids.add(id(param))
+
+    # Everything else: base_lr (classifier head, fm_attn, attention_aggregator for multi-view)
+    new_params = [
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in pretrained_param_ids
+    ]
+
+    param_groups = []
+    if new_params:
+        param_groups.append({"params": new_params, "lr": base_lr})
+    if pretrained_params:
+        param_groups.append({"params": pretrained_params, "lr": backbone_lr})
+        
+    return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
 
 def _compute_loss(logits: torch.Tensor, labels: torch.Tensor, task: str, criterion: nn.Module) -> torch.Tensor:
     """Compute task-specific loss."""
@@ -470,14 +534,8 @@ def train_single_view_classifier(
     hyperparams = cfg["hyperparams"]
     task = cfg["task"]
     
-    # Setup optimizer (only train unfrozen parameters)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    weight_decay = float(hyperparams.get("weight_decay", 1e-4))
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=float(hyperparams.get("lr", 1e-4)),
-        weight_decay=weight_decay
-    )
+    # Setup optimizer (with different learning rates when fine-tuning)
+    optimizer = _build_optimizer(model, hyperparams, accelerator)
     
     # Setup scheduler
     max_epochs = hyperparams.get("max_epochs", 100)
@@ -504,7 +562,6 @@ def train_single_view_classifier(
     early_stopping = EarlyStopping(patience=patience, mode="max", ckpt_path=ckpt_path, accelerator=accelerator) if patience else None
     
     if accelerator.is_main_process:
-        logger.info(f"Optimizer: AdamW, lr={hyperparams.get('lr', 1e-4)}, weight_decay={weight_decay}")
         if patience:
             logger.info(f"Early stopping enabled with patience={patience}")
     
@@ -1306,14 +1363,8 @@ def train_multiview_classifier(
     hyperparams = cfg["hyperparams"]
     task = cfg["task"]
     
-    # Setup optimizer (only train unfrozen parameters)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    weight_decay = float(hyperparams.get("weight_decay", 1e-4))
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=float(hyperparams.get("lr", 1e-4)),
-        weight_decay=weight_decay
-    )
+    # Setup optimizer (with different learning rates when fine-tuning)
+    optimizer = _build_optimizer(model, hyperparams, accelerator)
     
     # Setup scheduler
     max_epochs = hyperparams.get("max_epochs", 100)
@@ -1340,7 +1391,6 @@ def train_multiview_classifier(
     early_stopping = EarlyStopping(patience=patience, mode="max", ckpt_path=ckpt_path, accelerator=accelerator) if patience else None
     
     if accelerator.is_main_process:
-        logger.info(f"Optimizer: AdamW, lr={hyperparams.get('lr', 1e-4)}, weight_decay={weight_decay}")
         if patience:
             logger.info(f"Early stopping enabled with patience={patience}")
     
@@ -1642,6 +1692,10 @@ def main(args):
     with open(args.linear_classifier_config, "r") as f:
         cfg = yaml.safe_load(f)
 
+    # CLI `--fine-tune` flag overrides `freeze_cobra` in config
+    if args.fine_tune:
+        cfg["freeze_cobra"] = not args.fine_tune
+
     # Get view plane(s) and model names from config
     view_planes = cfg["feat_dataset"]["plane"]
     if args.fm_model_names:
@@ -1711,7 +1765,7 @@ def main(args):
     if use_multiview:
         # Multi-view with logistic regression ensemble
         if accelerator.is_main_process:
-            logger.info(f"Using multi-view logistic regression ensemble")
+            logger.info("Using multi-view logistic regression ensemble")
             logger.info(f"View planes: {view_planes}")
         
         # Create datasets for all views once
@@ -1828,11 +1882,16 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument(
+        "--fine-tune",
+        action="store_true",
+        help="Unfreeze COBRA backbone. Overrides freeze_cobra in config."
+    )
+    parser.add_argument(
         "--fm-pooling",
         type=str,
-        choices=["mean", "concat"],
-        default="mean",
-        help="Foundation model pooling method: 'mean' (average) or 'concat' (concatenate)."
+        choices=["avg_pool", "attention"],
+        default="avg_pool",
+        help="Foundation model pooling method: 'avg_pool' (average pooling) or 'attention' (learned FM weighting, requires fine-tuning)."
         # NOTE: 'attention' pooling is not supported for linear probing since fm_attn weights 
         # are randomly initialized and frozen. Use 'attention' only when fine-tuning COBRA.
     )

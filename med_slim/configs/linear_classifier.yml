@@ -5,7 +5,7 @@ freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning 
 
 feat_dataset:
   dataset_name: "MRNet"
-  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32/crop"
+  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
   plane:
     - "sagittal"
     # - "coronal"
@@ -14,6 +14,7 @@ feat_dataset:
     - "dinov2"
     - "medsiglip"
     - "ark"
+    - "mri-core"
 
 train_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/train.csv"
 test_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/test.csv"
@@ -27,8 +28,9 @@ target_labels:
 # Hyperparameters
 # Note: For fine-tuning, use lower learning rate and enable early stopping
 hyperparams:
-  batch_size: 16
-  lr: 1e-5 # Linear probing: 5e-5, Fine-tuning: 1e-6 to 5e-6
+  batch_size: 1
+  base_lr: 1e-5 # Base learning rate for linear heads (and optionally for fm_attn)
+  backbone_lr_scale: 0.1 # COBRA backbone learning rate = base_lr * backbone_lr_scale when fine-tuning COBRA
   weight_decay: 0.01  # L2 regularization to prevent overfitting
   warmup_ratio: 0.1  
   max_epochs: 100

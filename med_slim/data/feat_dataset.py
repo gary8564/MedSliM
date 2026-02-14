@@ -1,3 +1,4 @@
+import re
 import numpy as np
 import pandas as pd
 import torch
@@ -117,20 +118,24 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
 
 class PrecomputedFeatPairDataset(Dataset):
     """
-    Dataset of constructing precomputed feature positive pairs at the exam level, which are used for contrastive learning.
-    For multi-plane views, the concept of "same-plane positives" is implemented:
-    when forming a pair, enforce both views to be from the same plane; 
-    use all planes across the dataset but don't mix within a pair.
+    Dataset for constructing cross-FM positive pairs at the patient-study level for contrastive learning.
     
-    Positive pairs are constructed from different foundation models applied to the same exam and view plane.
-    
-    Slice sampling: When raw-resolution features are precomputed (variable-length slices),
-    this dataset samples or pads to a fixed num_target_slices at training time.
-    - Volumes with more slices: uniformly subsample (preserving anatomical order)
-    - Volumes with fewer slices: zero-pad and track actual length for masking
+    Entries are grouped by patient study. 
+    For datasets with multiple MRI sequences per view plane, 
+    all MRI sequences from the same patient study are grouped together.
+    Each ``__getitem__`` call stochastically selects a plane and a series (UID),
+    then forms a cross-FM positive pair from that series.
+
+    To handle variable-length slices, we sample or pad to a fixed number of slices ``num_target_slices``:
+        - Volumes with more slices than ``num_target_slices`` are uniformly subsampled (preserving anatomical order).
+        - Volumes with fewer slices than ``num_target_slices`` are zero-padded.
     
     Directory structure:
         {feat_dir}/{model}/{split}/{plane}/*.safetensors
+    
+    Data structure:
+        feat_path_dict[study_id][plane] = [uid1, uid2, ...]    # one UID per MRI series
+        feat_dir_map[study_id] = feat_dir                      # base directory for path reconstruction
     """
     def __init__(self, 
                  feat_dirs: List[Dict[str, str]], 
@@ -157,58 +162,118 @@ class PrecomputedFeatPairDataset(Dataset):
         self.max_feature_dim = max_feature_dim
         self.num_target_slices = num_target_slices
         
+        self.feat_dir_map: Dict[str, str] = {}
         self.feat_path_dict = self._get_feat_path_dict_by_study_id()
         self.study_ids = list(self.feat_path_dict.keys())
+    
+    @staticmethod
+    def _extract_exam_id(uid: str) -> str:
+        """Extract patient exam ID from UID.
+        
+        Groups multiple MRI series from the same patient study together.
+        
+        For multi-series datasets, the UID follows the format: '{patient_id}_{series_name}'
+            e.g., 'patient_123_MR4_0b2ac15c' → 'patient_123'
+        For single-series datasets, the UID is simply the patient ID.
+            e.g., 'patient_123' → 'patient_123'
+
+        Returns:
+            The patient exam ID from the UID.
+        """
+        mr_match = re.search(r'_MR\d+', uid)
+        if mr_match:
+            return uid[:mr_match.start()]
+        return uid
         
     def _get_feat_path_dict_by_study_id(self):
         """
-        Build a dictionary mapping study_id -> view_plane -> list of feature file paths.
+        Build a dictionary mapping study_id -> view_plane -> list of MRI sequence UIDs.
         
-        study_id format: "{dataset_name}_{exam_id}"
+        Returns:
+            Dict[str, Dict[str, List[str]]]:
+                study_id -> plane -> [uid1, uid2, ...]
         """
-        feat_path_dict = defaultdict(lambda: defaultdict(list))
         logger.info(f'Selected slice encoder models: {self.slice_encoder_models}')
         logger.info(f'Selected view planes: {self.view_planes}')
+        
+        ref_fm = self.slice_encoder_models[0]
+        feat_path_dict = defaultdict(lambda: defaultdict(list))
         
         for dataset in tqdm(self.feat_dirs, desc="Loading precomputed feature datasets...", leave=False):
             dataset_name = dataset["name"]
             feat_dir = dataset["feat_dir"]
             
-            for model_name in tqdm(self.slice_encoder_models, desc=f"Loading {dataset_name} features from FMs...", leave=False):
-                for view_plane in self.view_planes:
-                    feat_path = os.path.join(feat_dir, model_name, self.split, view_plane)
-                    
-                    if not os.path.exists(feat_path):
-                        raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
-                    
-                    feat_files = glob(os.path.join(feat_path, "*.safetensors"))
-                    assert len(feat_files) > 0, f"Couldn't find any feat files in path {feat_path}!"
-                    
-                    for feat_file in feat_files:
-                        exam_id = os.path.basename(feat_file).split(".")[0]
-                        study_id = f"{dataset_name}_{exam_id}"
-                        feat_path_dict[study_id][view_plane].append(feat_file)
+            for view_plane in self.view_planes:
+                feat_path = os.path.join(feat_dir, ref_fm, self.split, view_plane)
+                
+                if not os.path.exists(feat_path):
+                    raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
+                
+                feat_files = glob(os.path.join(feat_path, "*.safetensors"))
+                assert len(feat_files) > 0, f"Couldn't find any feat files in path {feat_path}!"
+                
+                for feat_file in feat_files:
+                    uid = os.path.basename(feat_file).split(".")[0]
+                    exam_id = self._extract_exam_id(uid)
+                    study_id = f"{dataset_name}_{exam_id}"
+                    feat_path_dict[study_id][view_plane].append(uid)
+                    self.feat_dir_map[study_id] = feat_dir
         
-        # Filter out studies that don't have valid feature files
-        valid_studies = {}
-        num_expected_files = len(self.slice_encoder_models)
+        # Validate all FMs have consistent feature files with the reference FM
+        for dataset in self.feat_dirs:
+            feat_dir = dataset["feat_dir"]
+            for view_plane in self.view_planes:
+                ref_path = os.path.join(feat_dir, ref_fm, self.split, view_plane)
+                ref_uids = {os.path.basename(f).split(".")[0] 
+                            for f in glob(os.path.join(ref_path, "*.safetensors"))}
+                
+                for fm in self.slice_encoder_models[1:]:
+                    fm_path = os.path.join(feat_dir, fm, self.split, view_plane)
+                    if not os.path.exists(fm_path):
+                        raise FileNotFoundError(
+                            f"Feature path {fm_path} does not exist! "
+                            f"Make sure to precompute features for FM '{fm}'."
+                        )
+                    fm_uids = {os.path.basename(f).split(".")[0] 
+                               for f in glob(os.path.join(fm_path, "*.safetensors"))}
+                    missing = ref_uids - fm_uids
+                    if missing:
+                        raise FileNotFoundError(
+                            f"FM '{fm}' is missing {len(missing)} feature files in {fm_path} "
+                            f"that exist for reference FM '{ref_fm}'. "
+                            f"Examples: {sorted(missing)[:5]}"
+                        )
+                    extra = fm_uids - ref_uids
+                    if extra:
+                        raise FileNotFoundError(
+                            f"FM '{fm}' has {len(extra)} extra files in {fm_path} "
+                            f"not found for reference FM '{ref_fm}'. "
+                            f"Examples: {sorted(extra)[:5]}"
+                        )
         
-        for study_id, planes_dict in feat_path_dict.items():
-            valid_planes = {
-                plane: files for plane, files in planes_dict.items()
-                if len(files) >= num_expected_files
-            }
-            # Study is valid if it has at least one valid plane
-            if valid_planes:
-                valid_studies[study_id] = valid_planes
+        # Compute statistics
+        total_series = sum(
+            len(uid_list)
+            for planes in feat_path_dict.values()
+            for uid_list in planes.values()
+        )
+        studies_with_multi_series = sum(
+            1 for planes in feat_path_dict.values()
+            if any(len(uid_list) > 1 for uid_list in planes.values())
+        )
         
-        if len(valid_studies) == 0:
-            raise ValueError("No valid studies found!")
+        logger.info(
+            f"Found {len(feat_path_dict)} patient studies with {total_series} total series. "
+            f"{studies_with_multi_series} studies have multiple series per plane."
+        )
         
-        logger.info(f"Found {len(valid_studies)} valid studies with "
-                   f"{num_expected_files} feature variants per plane")
-
-        return valid_studies
+        return feat_path_dict
+    
+    def _get_feat_path(self, study_id: str, model_name: str, plane: str, uid: str) -> str:
+        """Reconstruct the full feature file path from components."""
+        return os.path.join(
+            self.feat_dir_map[study_id], model_name, self.split, plane, f"{uid}.safetensors"
+        )
 
     def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
@@ -265,21 +330,18 @@ class PrecomputedFeatPairDataset(Dataset):
     def __getitem__(self, idx):
         study_id = self.study_ids[idx]
         
-        # Select a random view plane from the study
+        # 1. Select a random view plane from the study
         available_planes = list(self.feat_path_dict[study_id].keys())
         selected_view_plane = random.choice(available_planes)
         
-        # Get feature files for the selected plane (one per FM)
-        plane_feat_files = self.feat_path_dict[study_id][selected_view_plane]
-        num_variants = len(plane_feat_files)
-        assert num_variants == len(self.slice_encoder_models), \
-            f"Study {study_id} plane {selected_view_plane} has {num_variants} feature files, expected {len(self.slice_encoder_models)}"
+        # 2. Select a random MRI sequence UID
+        uid_list = self.feat_path_dict[study_id][selected_view_plane]
+        selected_uid = random.choice(uid_list)
         
-        # Randomly select two feature files from different FMs
-        idx1 = np.random.randint(0, num_variants)
-        idx2 = np.random.randint(0, num_variants)
-        feat_path1 = plane_feat_files[idx1]
-        feat_path2 = plane_feat_files[idx2]
+        # 3. Cross-FM positive pair from the selected series
+        fm1, fm2 = random.sample(self.slice_encoder_models, 2)
+        feat_path1 = self._get_feat_path(study_id, fm1, selected_view_plane, selected_uid)
+        feat_path2 = self._get_feat_path(study_id, fm2, selected_view_plane, selected_uid)
         feats1, metadata1 = self._load_feats(feat_path1)
         feats2, metadata2 = self._load_feats(feat_path2)
         
@@ -287,7 +349,7 @@ class PrecomputedFeatPairDataset(Dataset):
             f"Expected plane to be equal, but got {metadata1['plane']} and {metadata2['plane']}!"
         
         assert feats1.shape[0] == feats2.shape[0], (
-            f"Expected same number of slices for positive pair (same exam id and same plane), "
+            f"Expected same number of slices for positive pair (same patient with same view plane and MRI sequence), "
             f"but got {feats1.shape[0]} and {feats2.shape[0]} for study {study_id}, "
             f"plane {selected_view_plane}."
         )

@@ -64,7 +64,7 @@ class Cobra(nn.Module):
         dropout: float = 0.25,
         mode: str = "train",
         sequence_encoder: str = "mamba2",
-        fm_pooling: str = "mean",
+        fm_pooling: str = "avg_pool",
         slice_pooling: str = "abmil",
         **kwargs
     ):
@@ -78,10 +78,9 @@ class Cobra(nn.Module):
             dropout: Dropout rate.
             mode: 'train' or 'inference'.
             sequence_encoder: 'mamba2' or 'transformer'.
-            fm_pooling: 'mean', 'concat', or 'attention' in inference mode.
-                - 'mean': Average embeddings across foundation models.
-                - 'concat': Concatenate FM embeddings along sequence dimension.
-                - 'attention': Learn attention weights to pool FM embeddings per slice.
+            fm_pooling: 'avg_pool' or 'attention' in inference mode.
+                - 'avg_pool': Average pool embeddings across foundation models.
+                - 'attention': Learn attention weights to pool FM embeddings per slice (requires fine-tuning).
             slice_pooling: 'abmil' or 'cls' (cls requires transformer).
             **kwargs: Additional encoder-specific parameters:
                 - d_state: Mamba2 state dimension (default: 128)
@@ -98,7 +97,7 @@ class Cobra(nn.Module):
         assert mode in ["train", "inference"]
         assert sequence_encoder in ["mamba2", "transformer"]
         if mode == "inference":
-            assert fm_pooling in ["mean", "concat", "attention"], f"Invalid fm_pooling '{fm_pooling}'. Must be one of 'mean', 'concat', 'attention'."
+            assert fm_pooling in ["avg_pool", "attention"], f"Invalid fm_pooling '{fm_pooling}'. Must be one of 'avg_pool', 'attention'."
         assert slice_pooling in ["abmil", "cls"], f"Invalid slice_pooling '{slice_pooling}'. Must be one of 'abmil', 'cls'."
         if slice_pooling == "cls" and sequence_encoder != "transformer":
                 raise ValueError(f"slice_pooling='cls' requires sequence_encoder='transformer'. Got {sequence_encoder}.")
@@ -175,9 +174,9 @@ class Cobra(nn.Module):
         
         # FM attention pooling for inference mode
         # Learns to weight different foundation model embeddings at each slice position
-        # TODO: fm_attn is randomly initialized in inference mode and not loaded from checkpoint.
-        #       This is intended for FINE-TUNING COBRA (where fm_attn will be trained).
-        #       For LINEAR PROBING (frozen COBRA), use fm_pooling='mean' or 'concat' instead.
+        # fm_attn is randomly initialized in inference mode and not loaded from checkpoint.
+        # This is intended for FINE-TUNING COBRA (where fm_attn will be trained).
+        # For LINEAR PROBING (frozen COBRA), use fm_pooling='avg_pool' instead.
         self.fm_attn = None
         if mode == "inference" and fm_pooling == "attention":
             self.fm_attn = BatchedABMIL(
@@ -313,10 +312,10 @@ class Cobra(nn.Module):
         assert fm_embs.shape[0]==len(x), f"Expected length of input x {len(x)}, got {fm_embs.shape[0]}"
         if fm_embs.shape[0] == 1:
             return fm_embs[0]
-        if self.fm_pooling == "mean":
+        if self.fm_pooling == "avg_pool":
             # Average embeddings across different slice encoders
             logits = fm_embs.mean(dim=0)  # [B, num_slices, embed_dim]
-        elif self.fm_pooling == "attention":
+        else:
             # Attention-weighted pooling across different slice encoders
             # For each slice position, learn to weight the K FM embeddings
             K, B, T, E = fm_embs.shape
@@ -328,9 +327,6 @@ class Cobra(nn.Module):
             pooled = torch.bmm(attn_weights_t, fm_embs).squeeze(1)  # [B*num_slices, embed_dim]
             # Reshape back: [B*num_slices, embed_dim] -> [B, num_slices, embed_dim]
             logits = rearrange(pooled, '(b t) e -> b t e', b=B, t=T)
-        else:
-            # Concatenate embeddings across different slice encoders
-            logits = rearrange(fm_embs, 'k b t e -> b (t k) e')  # [B, num_slices* K, embed_dim]
         return logits
 
     def _abmil_pooling(

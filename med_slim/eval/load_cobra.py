@@ -16,7 +16,7 @@ def load_pretrained_cobra(
     accelerator: Accelerator, 
     model_config: Dict,
     encoder_type: str = "momentum",
-    fm_pooling: str = "mean",
+    fm_pooling: str = "avg_pool",
     sequence_encoder: Optional[str] = None,
     slice_pooling: Optional[str] = None,
 ) -> Cobra:
@@ -28,7 +28,7 @@ def load_pretrained_cobra(
     - accelerator (Accelerator): HuggingFace Accelerator.
     - model_config (Dict): Dictionary containing the model configuration from pretrain config.
     - encoder_type (str): Choose between "base" and "momentum" encoder for downstream tasks. Default is "momentum".
-    - fm_pooling (str): Feature aggregation method. Default is "mean".
+    - fm_pooling (str): Feature aggregation method. Default is "avg_pool".
     - sequence_encoder (str, optional): Override sequence encoder type. If None, uses checkpoint or defaults to "mamba2".
     - slice_pooling (str, optional): Override slice pooling type. If None, uses saved checkpoint.
 

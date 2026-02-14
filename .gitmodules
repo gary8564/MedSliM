@@ -1,0 +1,3 @@
+[submodule "med_slim/model/slice_encoder/mri_foundation"]
+	path = med_slim/model/slice_encoder/mri_foundation
+	url = https://github.com/mazurowski-lab/mri_foundation.git

@@ -1,3 +1,4 @@
+#TODO: the scripts for naming convention needs to be merged into the whole preprocessing script instead of --rename flag when publishing. 
 """
 Preprocess KMAR-50K dataset for MedSliM SSL pretraining.
 
@@ -13,7 +14,8 @@ Filename format: {year}_{id}_{plane}_{version}.nii.gz
 - plane: sagittal, coronal, transection (→ axial)
 - version: 0.0, 1.0, etc. (multiple series per study)
 
-Output filename: {year}_{id}_{version}.nii.gz (study_id based)
+Output filename: {year}_{id}_MR{version_int}.nii.gz
+    e.g. 2020_104_MR0.nii.gz, 2021_130_MR0.nii.gz
 """
 import argparse
 import logging
@@ -89,14 +91,11 @@ def parse_filename(filename: str) -> dict | None:
     # study_id uses year + short numeric ID for grouping
     study_id = f"{year}_{short_id}"
     
-    # Output filename uses the full patient_id to preserve uniqueness
-    # Replace problematic characters for filesystem safety
-    safe_patient_id = patient_id.replace("-", "_").replace(".", "_")
-    output_filename = f"{year}_{safe_patient_id}_{version}.nii.gz"
+    version_int = version.split(".")[0]
+    output_filename = f"{study_id}_MR{version_int}.nii.gz"
     
     # Original filename key for CSV matching (try multiple formats)
     # CSV may use different formats, so we generate potential keys
-    version_int = version.split(".")[0]
     csv_key = f"{year}_{patient_id}_{plane_raw}_{version_int}.nii.gz"
     
     return {
@@ -172,6 +171,108 @@ def load_and_merge_csvs(train_csv: Path, test_csv: Path) -> pd.DataFrame:
     return df_merged
 
 
+def build_rename_map(csv_path: Path) -> tuple[dict[tuple[str, str], str], pd.DataFrame]:
+    df = pd.read_csv(csv_path)
+    rename_map: dict[tuple[str, str], str] = {}
+    collision_check: dict[tuple[str, str], str] = {}  # (new_id, plane) -> old_id
+
+    for _, row in df.iterrows():
+        old_id = str(row["ID"])
+        study_id = str(row["study_id"])
+        version = str(row["version"])
+        plane = str(row["plane"])
+        version_int = version.split(".")[0]  # "0.0" -> "0", "1.0" -> "1"
+        new_id = f"{study_id}_MR{version_int}"
+
+        # Collision detection
+        key = (new_id, plane)
+        if key in collision_check and collision_check[key] != old_id:
+            raise ValueError(
+                f"Naming collision: '{collision_check[key]}' and '{old_id}' "
+                f"both map to '{new_id}' in plane '{plane}'"
+            )
+        collision_check[key] = old_id
+        rename_map[(old_id, plane)] = new_id
+
+    n_changed = sum(1 for (old, _), new in rename_map.items() if old != new)
+    logger.info(f"Built rename map: {len(rename_map)} entries, {n_changed} will change")
+
+    return rename_map, df
+
+
+def rename_to_medslim_convention(
+    nifti_base_dir: Path,
+    feat_cache_dir: Path | None,
+    csv_path: Path,
+    dry_run: bool = False,
+) -> None:
+    rename_map, df = build_rename_map(csv_path)
+
+    logger.info("Renaming NIfTI files...")
+    renamed, skipped, missing = 0, 0, 0
+    for (old_id, plane), new_id in rename_map.items():
+        if old_id == new_id:
+            skipped += 1
+            continue
+        old_path = nifti_base_dir / "train" / plane / f"{old_id}.nii.gz"
+        new_path = nifti_base_dir / "train" / plane / f"{new_id}.nii.gz"
+        if old_path.exists():
+            if not dry_run:
+                old_path.rename(new_path)
+            logger.debug(f"  {plane}/{old_path.name} -> {new_path.name}")
+            renamed += 1
+        elif new_path.exists():
+            skipped += 1  # already renamed
+        else:
+            logger.warning(f"  NIfTI not found: {old_path}")
+            missing += 1
+    logger.info(f"  NIfTI: {renamed} renamed, {skipped} unchanged/done, {missing} missing")
+
+    if feat_cache_dir and feat_cache_dir.exists():
+        logger.info("Renaming safetensors files...")
+        model_dirs = sorted([d for d in feat_cache_dir.iterdir() if d.is_dir()])
+        for model_dir in model_dirs:
+            renamed_st, skipped_st, missing_st = 0, 0, 0
+            for (old_id, plane), new_id in rename_map.items():
+                if old_id == new_id:
+                    skipped_st += 1
+                    continue
+                old_path = model_dir / "train" / plane / f"{old_id}.safetensors"
+                new_path = model_dir / "train" / plane / f"{new_id}.safetensors"
+                if old_path.exists():
+                    if not dry_run:
+                        old_path.rename(new_path)
+                    renamed_st += 1
+                elif new_path.exists():
+                    skipped_st += 1
+                else:
+                    missing_st += 1
+            logger.info(
+                f"{model_dir.name}: {renamed_st} renamed, "
+                f"{skipped_st} unchanged/done, {missing_st} missing"
+            )
+    elif feat_cache_dir:
+        logger.warning(f"Feature cache dir not found: {feat_cache_dir}")
+
+    # Build a simple old_id to new_id map for CSV update
+    id_map = {old_id: new_id for (old_id, _), new_id in rename_map.items()}
+
+    if not dry_run:
+        logger.info("Updating train.csv...")
+        df["ID"] = df["ID"].map(lambda x: id_map.get(str(x), str(x)))
+        if "nifti_path" in df.columns:
+            df["nifti_path"] = df.apply(
+                lambda row: str(
+                    nifti_base_dir / "train" / str(row["plane"]) / f"{row['ID']}.nii.gz"
+                ),
+                axis=1,
+            )
+        df.to_csv(csv_path, index=False)
+        logger.info(f"  Updated {csv_path}")
+    else:
+        logger.info("[DRY RUN] No files were modified.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Preprocess KMAR-50K dataset for SSL pretraining")
     parser.add_argument(
@@ -187,12 +288,41 @@ def main():
         help="Output directory for organized NIfTI files",
     )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--rename", action="store_true",
+        help="Rename existing files to MedSliM-compatible naming convention "
+             "({study_id}_MR{version_int}) instead of running preprocessing",
+    )
+    parser.add_argument(
+        "--feat-cache-dir", type=str, default=None,
+        help="Path to precomputed feature cache dir for renaming safetensors "
+             "(e.g., /hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be renamed without actually modifying files",
+    )
     args = parser.parse_args()
 
     setup_logging(args.verbose)
 
-    data_root = Path(args.data_dir)
     save_dir = Path(args.save_dir)
+
+    if args.rename:
+        csv_path = save_dir / "train.csv"
+        if not csv_path.exists():
+            logger.error(f"CSV not found: {csv_path}. Run preprocessing first.")
+            return
+        feat_cache_dir = Path(args.feat_cache_dir) if args.feat_cache_dir else None
+        rename_to_medslim_convention(
+            nifti_base_dir=save_dir,
+            feat_cache_dir=feat_cache_dir,
+            csv_path=csv_path,
+            dry_run=args.dry_run,
+        )
+        return
+
+    data_root = Path(args.data_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Define GroundTruthData directories

@@ -5,12 +5,12 @@
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=16G 
-#SBATCH --time=6:00:00                 
-#SBATCH --job-name=pretrain_MRNet
-#SBATCH --output=logs/pretrain/stdout_pretrain_MRNet_%j.txt    
-#SBATCH --account=rwth1833    
+#SBATCH --cpus-per-task=24
+#SBATCH --mem-per-cpu=5G
+#SBATCH --time=72:00:00                 
+#SBATCH --job-name=pretrain_MRNet_fastMRI
+#SBATCH --output=logs/pretrain/stdout_pretrain_MRNet_fastMRI_%j.txt    
+#SBATCH --account=p0021834    
 
 ### Setup
 # Load Intel libraries (required by Triton for mamba_ssm kernels)
@@ -28,17 +28,35 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NUM_GPUS=1
 
 ### Configuration
-# RESUME_PATH="/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI/2026-01-31-16:40/medslim-epoch300.pth.tar"
-# PLANES="sagittal coronal axial"
+# Checkpoint to resume from (leave empty for training from scratch)
+RESUME_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-08-18:35/medslim-epoch2000.pth.tar"
 
-### Run script with Accelerate for multi-GPU training
-# Use bf16 instead of fp16 for numerical stability
-# Available options:
-#   --sequence-encoder mamba2/transformer
-#   --pooling abmil          # abmil (default) or cls (requires transformer encoder)
-#   --resume "${RESUME_PATH}"              # Continue training from checkpoint (keeps the state of optimizer and epoch)
-#   --resume "${RESUME_PATH}" --curriculum # Curriculum learning: load weights only, reset optimizer and epoch
-#   --planes ${PLANES}
+# Curriculum learning: load model weights only, reset optimizer and epoch.
+# Set to true when adding new datasets or adding new slice encoder models.
+CURRICULUM=true
 
+# Override slice encoder models from config
+# Available: dinov2, dinov3, rad-dino, medsiglip, biomedclip, ark, mri-core
+MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark mri-core"
+
+# Override view planes from config (space-separated, leave empty to use config defaults)
+# Available: axial, sagittal, coronal
+PLANES=""
+
+# Sequence encoder and pooling
+SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
+POOLING="abmil"             # abmil (default) or cls (requires transformer encoder)
+
+### Build command arguments
+EXTRA_ARGS=""
+[[ -n "${RESUME_PATH}" ]]  && EXTRA_ARGS+=" --resume ${RESUME_PATH}"
+[[ "${CURRICULUM}" == true ]] && EXTRA_ARGS+=" --curriculum"
+[[ -n "${MODEL_NAMES}" ]]  && EXTRA_ARGS+=" --model-names ${MODEL_NAMES}"
+[[ -n "${PLANES}" ]]       && EXTRA_ARGS+=" --planes ${PLANES}"
+
+### Run
 accelerate launch --num_processes=$NUM_GPUS --mixed_precision=bf16 \
-    ./med_slim/train/train.py
+    ./med_slim/train/train.py \
+    --sequence-encoder "${SEQUENCE_ENCODER}" \
+    --pooling "${POOLING}" \
+    ${EXTRA_ARGS}

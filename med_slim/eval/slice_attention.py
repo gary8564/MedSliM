@@ -47,7 +47,7 @@ def main():
     parser.add_argument("--target-labels", type=str, nargs="+", default=["Abnormal"], help="Target label columns")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-samples", type=int, default=None, help="Max samples to visualize (None = all)")
-    parser.add_argument("--fm-pooling", type=str, default="mean", choices=["mean", "concat"])
+    parser.add_argument("--fm-pooling", type=str, default="avg_pool", choices=["avg_pool", "attention"])
     parser.add_argument("--sequence-encoder", type=str, default="mamba2", choices=["mamba2", "transformer"])
     parser.add_argument("--slice-pooling", type=str, default="abmil", choices=["abmil", "cls"])
     

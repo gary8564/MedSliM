@@ -162,8 +162,8 @@ def main():
     parser.add_argument("--fm-model-names", type=str, default="dinov2", help="FM model names (space-separated)")
     parser.add_argument("--target-labels", type=str, nargs="+", required=True, help="Target label columns (e.g., ACL Meniscus)")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--fm-pooling", type=str, default="mean", choices=["mean", "concat"],
-                        help="FM pooling: 'mean' or 'concat'. Note: 'attention' not supported for frozen COBRA.")
+    parser.add_argument("--fm-pooling", type=str, default="avg_pool", choices=["avg_pool", "attention"],
+                        help="FM pooling: 'avg_pool' (average pooling) or 'attention' (requires fine-tuning).")
     parser.add_argument("--sequence-encoder", type=str, default="mamba2", choices=["mamba2", "transformer"])
     parser.add_argument("--slice-pooling", type=str, default="abmil", choices=["abmil", "cls"])
     parser.add_argument("--title", type=str, default="", help="Plot title")

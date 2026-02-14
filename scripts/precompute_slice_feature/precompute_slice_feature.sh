@@ -23,9 +23,13 @@ DATA_DIR="/work/rwth1833/datasets/preprocessed/fastMRI" #"/hpcwork/rwth1833/data
 SAVE_DIR="/hpcwork/rwth1833/feat_caches/fastMRI" #"/hpcwork/rwth1833/feat_caches/MRNet"
 PLANE="axial"
 USE_RAW_SLICE_RESOLUTION=false  
-MODEL_NAME="medsiglip" # "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "ark"
+MODEL_NAME="medsiglip" # "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "ark", "mri-core"
 SPLIT="train"
-ARK_CHECKPOINT="/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
+# Local checkpoints for models that require them
+declare -A CHECKPOINTS=(
+  ["ark"]="/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
+  ["mri-core"]="/work/rwth1833/models/mri_core/mri_foundation.pth"
+)
 # Preprocessing modes: "resize", "resample", "crop", or "adaptive"
 SPATIAL_MODE="adaptive"
 EXTRA_ARGS="--amp bf16"
@@ -39,9 +43,9 @@ if [ "$USE_RAW_SLICE_RESOLUTION" = false ]; then
   EXTRA_ARGS="$EXTRA_ARGS --num-slices 32"
 fi
 
-# Add ark checkpoint if using ark model
-if [ "$MODEL_NAME" = "ark" ]; then
-  EXTRA_ARGS="$EXTRA_ARGS --ark-checkpoint $ARK_CHECKPOINT --workers 2"
+# Add checkpoint for models that require local weights
+if [[ -v CHECKPOINTS[$MODEL_NAME] ]]; then
+  EXTRA_ARGS="$EXTRA_ARGS --checkpoint ${CHECKPOINTS[$MODEL_NAME]} --workers 2"
 fi
 
 # Run your program

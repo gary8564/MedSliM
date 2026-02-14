@@ -2,10 +2,6 @@ import os
 from typing import Optional
 import torch.nn as nn
 
-from .ark import ArkFeatureExtractor
-from .dino import DinoFeatureExtractor
-from .siglip import SigLipFeatureExtractor
-from .clip import CLIPFeatureExtractor
 from med_slim.utils.preprocessing import get_model_config
 
 def build_slice_encoder(
@@ -20,19 +16,21 @@ def build_slice_encoder(
     Factory to construct a pretrained 2D slice feature extractor.
 
     Args:
-        name: Name of the foundation model. ['ark', 'dinov2', 'dinov3', 'rad-dino', 'medsiglip', 'biomedclip']
+        name: Name of the foundation model. ['ark', 'dinov2', 'dinov3', 'rad-dino', 'medsiglip', 'biomedclip', 'mri-core']
         model_repo: Optional HF repo to override defaults for DINO/MedSigLIP/CLIP.
-        checkpoint: Path to Ark checkpoint. Required for name='ark'.
+        checkpoint: Path to model checkpoint. Required for name='ark' and name='mri-core'.
         local_cache_dir: Local cache directory to store the model. If None, the default Hugging Face cache directory "~/.cache/huggingface/hub" will be used.
         freeze: If True, parameters are set to requires_grad=False.
 
     Returns:
         nn.Module: feature extractor model.
     """
-    assert name in ["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip"], "Slice encoder not supported."
+    valid_names = ["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core"]
+    assert name in valid_names, f"Slice encoder '{name}' not supported. Choose from {valid_names}."
     config = get_model_config(name)
 
     if config["name"] == "ark":
+        from .ark import ArkFeatureExtractor
         ckpt = checkpoint or config["repo"]
         if ckpt is None or not os.path.exists(ckpt):
             raise FileNotFoundError(
@@ -42,19 +40,33 @@ def build_slice_encoder(
         model = ArkFeatureExtractor(model_checkpoint_path=ckpt, use_projector=freeze)
 
     elif config["name"] in ("dinov2", "dinov3", "rad-dino"):
+        from .dino import DinoFeatureExtractor
         default_repo = config["repo"]
         repo = model_repo or default_repo
         model = DinoFeatureExtractor(model_repo=repo, local_cache_dir=local_cache_dir)
 
     elif config["name"] == "medsiglip":
+        from .siglip import SigLipFeatureExtractor
         default_repo = config["repo"]
         repo = model_repo or default_repo
         model = SigLipFeatureExtractor(model_repo=repo, local_cache_dir=local_cache_dir)
 
     elif config["name"] == "biomedclip":
+        from .clip import CLIPFeatureExtractor
         default_repo = config["repo"]
         repo = model_repo or default_repo
         model = CLIPFeatureExtractor(model_repo=repo, local_cache_dir=local_cache_dir)
+
+    elif config["name"] == "mri-core":
+        from .mri_core import MriCoreFeatureExtractor
+        ckpt = checkpoint or config["repo"]
+        if ckpt is None or not os.path.exists(ckpt):
+            raise FileNotFoundError(
+                "MRI-CORE checkpoint not provided. "
+                "Download from https://github.com/mazurowski-lab/mri_foundation "
+                "and pass checkpoint=ckpt_path to build_slice_encoder."
+            )
+        model = MriCoreFeatureExtractor(checkpoint_path=ckpt)
 
     else:
         raise ValueError(f"Unknown slice encoder name: {name}")
