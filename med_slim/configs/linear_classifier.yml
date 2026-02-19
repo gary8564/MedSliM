@@ -17,6 +17,7 @@ feat_dataset:
     - "mri-core"
 
 train_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/train.csv"
+# val_annots: "/path/to/val.csv"  # Optional: if provided, uses dedicated val set instead of splitting train
 test_annots: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/test.csv"
 output_dir: "/hpcwork/rwth1833/experiments/MedSliM-linear-probing"
 
@@ -24,6 +25,13 @@ output_dir: "/hpcwork/rwth1833/experiments/MedSliM-linear-probing"
 task: "binary" # "binary", "multiclass", "multilabel"
 target_labels:
   - "meniscus" # "acl", "meniscus"
+
+# Optional: class names for multiclass confusion matrix and per-class ROC plots.
+# Required for multiclass; if omitted, auto-generates as ["class_0", "class_1", ...].
+# class_names:
+#   - "normal"
+#   - "partial_injury"
+#   - "complete_fracture"
 
 # Hyperparameters
 # Note: For fine-tuning, use lower learning rate and enable early stopping

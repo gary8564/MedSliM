@@ -375,18 +375,6 @@ class PrecomputedFeatPairDataset(Dataset):
             "seq_len": torch.as_tensor(seq_len, dtype=torch.long),
         }
 
-class PrecomputedFeatSupConDataset(Dataset):
-    """
-    Dataset of constructing precomputed feature positivepairs at the exam level, which are used for contrastive learning.
-    For multi-plane views, the concept of "mixed-plane positives" is implemented:
-    use SupCon loss (multi-positive loss) so that the loss function will treat every every view of the same exam (axial, sagittal, coronal) as separate positives in the denominator,
-    explicitly tells the model: 'all these are positives for this exam'.
-    """
-    #TODO
-    pass
-
-
-
 class FeatClassificationDataset(Dataset):
     """
     Dataset for downstream classification tasks using precomputed slice features.
@@ -433,7 +421,7 @@ class FeatClassificationDataset(Dataset):
         self.split = split
         
         # Load labels
-        self.df_labels = pd.read_csv(annotations_path)
+        self.df_labels = pd.read_csv(annotations_path, dtype={"ID": str})
         self.df_labels.set_index("ID", inplace=True)
         
         # Validate target columns exist in the DataFrame
@@ -445,7 +433,7 @@ class FeatClassificationDataset(Dataset):
                 f"Available columns: {available_cols}"
             )
         
-        self.sample_ids = list(self.df_labels.index.astype(int))
+        self.sample_ids = list(self.df_labels.index)
         
         # Build feature paths for all encoders and verify consistency
         self.feat_paths = {}
@@ -465,7 +453,7 @@ class FeatClassificationDataset(Dataset):
             if not self.id_filename_map:
                 for f in feat_files:
                     fname = os.path.basename(f)
-                    fid = int(fname.split(".")[0])
+                    fid = fname.split(".")[0]
                     self.id_filename_map[fid] = fname
         
     def __len__(self):
@@ -477,7 +465,7 @@ class FeatClassificationDataset(Dataset):
             metadata = f.metadata()
         return feat, metadata
     
-    def _get_label(self, sample_id: int) -> torch.Tensor:
+    def _get_label(self, sample_id: str) -> torch.Tensor:
         """Get label(s) for a sample based on task type."""
         if self.task == "multilabel":
             labels = self.df_labels.loc[sample_id, self.target_columns].values.astype(np.float32)
@@ -555,7 +543,7 @@ class MultiViewFeatClassificationDataset(Dataset):
         self.split = split
         
         # Load labels
-        self.df_labels = pd.read_csv(annotations_path)
+        self.df_labels = pd.read_csv(annotations_path, dtype={"ID": str})
         self.df_labels.set_index("ID", inplace=True)
         
         # Validate target columns exist in the DataFrame
@@ -567,7 +555,7 @@ class MultiViewFeatClassificationDataset(Dataset):
                 f"Available columns: {available_cols}"
             )
         
-        self.sample_ids = list(self.df_labels.index.astype(int))
+        self.sample_ids = list(self.df_labels.index)
         
         # Build feature paths for all encoders and views
         self.feat_paths = {}  # {view_plane: {model_name: path}}
@@ -586,7 +574,7 @@ class MultiViewFeatClassificationDataset(Dataset):
                     feat_files = glob(os.path.join(feat_path, '*.safetensors'))
                     for f in feat_files:
                         fname = os.path.basename(f)
-                        fid = int(fname.split(".")[0])
+                        fid = fname.split(".")[0]
                         self.id_filename_map[fid] = fname
     
     def __len__(self):
@@ -598,7 +586,7 @@ class MultiViewFeatClassificationDataset(Dataset):
             metadata = f.metadata()
         return feat, metadata
     
-    def _get_label(self, sample_id: int) -> torch.Tensor:
+    def _get_label(self, sample_id: str) -> torch.Tensor:
         """Get label(s) for a sample based on task type."""
         if self.task == "multilabel":
             labels = self.df_labels.loc[sample_id, self.target_columns].values.astype(np.float32)

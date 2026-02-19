@@ -185,8 +185,31 @@ def main():
     col_order += [c for c in df_output.columns if c not in col_order]
     df_output = df_output[col_order]
     
-    df_output.to_csv(save_dir / f"{args.split}.csv", index=False)
-    logger.info(f"{args.split}.csv written with {len(df_output)} entries and columns: {list(df_output.columns)}")
+    # Produce two CSV variants: multiclass (injury severity) and binary (injury vs normal)
+    if "aclDiagnosis" in df_output.columns:
+        multiclass_counts = df_output["aclDiagnosis"].value_counts().sort_index()
+
+        # Multiclass CSV: keep original 0/1/2 labels, just rename "aclDiagnosis" to "acl"
+        df_multiclass = df_output.copy()
+        df_multiclass.rename(columns={"aclDiagnosis": "acl"}, inplace=True)
+        df_multiclass.to_csv(save_dir / f"{args.split}_multiclass.csv", index=False)
+        logger.info(
+            f"{args.split}_multiclass.csv written with {len(df_multiclass)} entries. "
+            f"acl label distribution (0=normal, 1=partial, 2=complete): {multiclass_counts.to_dict()}"
+        )
+
+        # Binary CSV: convert labels for injury severity to binary labels
+        df_binary = df_output.copy()
+        df_binary["acl"] = (df_binary["aclDiagnosis"] > 0).astype(int)
+        df_binary.drop(columns=["aclDiagnosis"], inplace=True)
+        binary_counts = df_binary["acl"].value_counts().sort_index()
+        df_binary.to_csv(save_dir / f"{args.split}_binary.csv", index=False)
+        logger.info(
+            f"{args.split}_binary.csv written with {len(df_binary)} entries. "
+            f"acl label distribution (0=normal, 1=injury): {binary_counts.to_dict()}"
+        )
+    else:
+        raise ValueError("aclDiagnosis column not found in metadata")
 
     num_files = len(list(save_dir.rglob("*.nii.gz")))
     logger.info(f"Finished. NIfTI files written: {num_files}")

@@ -26,8 +26,8 @@ from accelerate import Accelerator
 
 from med_slim.data.feat_dataset import FeatClassificationDataset, linear_classifier_collate_fn
 from med_slim.eval.load_cobra import load_pretrained_cobra
-from med_slim.eval.extract_feats import get_volume_attention
-from med_slim.utils.viz.attention import plot_attention_profile, compute_attention_metrics
+from med_slim.eval.extract_feats import get_volume_attention, get_volume_attention_per_head
+from med_slim.utils.viz.attention import plot_attention_profile, plot_per_head_attention_profile, compute_attention_metrics
 from med_slim.logging.setup import init_logging
 
 init_logging()
@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--fm-pooling", type=str, default="avg_pool", choices=["avg_pool", "attention"])
     parser.add_argument("--sequence-encoder", type=str, default="mamba2", choices=["mamba2", "transformer"])
     parser.add_argument("--slice-pooling", type=str, default="abmil", choices=["abmil", "cls"])
+    parser.add_argument("--per-head", action="store_true",
+                        help="Visualize per-head attention profiles (ABMIL multi-head only)")
     
     args = parser.parse_args()
     
@@ -123,6 +125,13 @@ def main():
         cobra_model, dataloader, accelerator, max_samples=args.num_samples
     )
     
+    # Extract per-head attention before filtering to main process
+    per_head_data = None
+    if args.per_head and args.slice_pooling == "abmil":
+        per_head_data = get_volume_attention_per_head(
+            cobra_model, dataloader, accelerator, max_samples=args.num_samples
+        )
+    
     if not accelerator.is_main_process:
         return
     
@@ -157,6 +166,29 @@ def main():
         metrics['sample_id'] = sample_id
         metrics['class_label'] = class_label
         all_metrics.append(metrics)
+    
+    # Per-head attention visualization
+    if per_head_data is not None:
+        ph_attn, ph_labels, ph_sample_ids, _, num_heads = per_head_data
+        logger.info(f"Plotting per-head attention for {len(ph_attn)} samples ({num_heads} heads)")
+        
+        per_head_dir = os.path.join(args.output_dir, "per_head_attention")
+        os.makedirs(per_head_dir, exist_ok=True)
+        
+        for attn, label, sample_id in zip(ph_attn, ph_labels, ph_sample_ids):
+            if task == "multilabel":
+                active_labels = [args.target_labels[j] for j, v in enumerate(label) if v == 1]
+                ph_class_label = " + ".join(active_labels) if active_labels else "Normal"
+            else:
+                ph_class_label = args.target_labels[0] if label == 1 else "Normal"
+            
+            plot_per_head_attention_profile(
+                attention_weights=attn,
+                sample_id=sample_id,
+                view_plane=args.plane,
+                output_dir=per_head_dir,
+                class_label=ph_class_label,
+            )
     
     # Save raw attention data
     stats_path = os.path.join(args.output_dir, "attention_stats.npz")

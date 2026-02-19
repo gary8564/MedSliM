@@ -333,6 +333,7 @@ class Cobra(nn.Module):
         self, 
         h: torch.Tensor, 
         mask: torch.Tensor = None,
+        return_per_head: bool = False,
     ) -> torch.Tensor:
         """
         Apply ABMIL attention pooling.
@@ -340,9 +341,10 @@ class Cobra(nn.Module):
         Args:
             h: Input tensor [batch_size, seq_len, embed_dim]
             mask: Boolean mask [batch_size, seq_len] (True = valid)
+            return_per_head: If True, return per-head attention [B, num_heads, num_slices]
         
         Returns:
-            Attention weights [batch_size, 1, seq_len]
+            Attention weights [B, 1, seq_len] or [B, num_heads, seq_len] if return_per_head=True
         """
         if self.num_heads > 1:
             # Split feature dim into heads: [B, num_slices, num_heads, head_dim]
@@ -352,6 +354,11 @@ class Cobra(nn.Module):
                 _, raw_attention = attn_net(h_heads[:, :, :, i], mask=mask, return_raw_attention=True) # [B, num_slices, 1]
                 attentions.append(raw_attention)
             A = torch.stack(attentions, dim=-1) # [B, num_slices, 1, num_heads]
+
+            if return_per_head:
+                per_head = A.squeeze(2).permute(0, 2, 1)  # [B, num_heads, num_slices]
+                return F.softmax(per_head, dim=-1)
+
             A = rearrange(A, 'b t e c -> b t (e c)', c=self.num_heads).mean(-1).unsqueeze(-1) # [B, num_slices, 1]
             A = torch.transpose(A, 2, 1) # [B, 1, num_slices]
             A = F.softmax(A, dim=-1) # [B, 1, num_slices]
@@ -365,9 +372,10 @@ class Cobra(nn.Module):
         x, 
         input_feature_dims=None, 
         get_attention=False, 
+        get_per_head_attention=False,
         return_slice_embeddings=False,
         seq_lengths=None,
-        **_,  # Ignore extra kwargs
+        **_,
     ):
         """Forward pass main function."""
         # Foundation model feature embedding
@@ -412,12 +420,15 @@ class Cobra(nn.Module):
         # Slice feature aggregation
         # CLS token pooling
         if self.slice_pooling == "cls":
-            if get_attention:
+            if get_attention or get_per_head_attention:
                 return self._extract_cls_attention(logits, mask, src_key_padding_mask)
             pooled = h[:, 0, :]
             return self.proj(pooled) if self.mode == "train" else pooled
 
         # ABMIL pooling
+        if get_per_head_attention:
+            return self._abmil_pooling(h, mask, return_per_head=True)
+
         A = self._abmil_pooling(h, mask)
 
         if get_attention:
@@ -437,6 +448,7 @@ class Cobra(nn.Module):
         *,
         input_feature_dims=None, 
         get_attention=False, 
+        get_per_head_attention=False,
         return_slice_embeddings=False,
         seq_lengths=None,
         **_,
@@ -449,12 +461,14 @@ class Cobra(nn.Module):
                 - SSL training mode: [B, num_slices, feature_dim]
                 - Inference mode: List of K tensors, each [B, num_slices, encoder_embed_dim]
             input_feature_dims: Feature dimensions per sample [B] (SSL mode).
-            get_attention: If True, return attention map instead of features.
+            get_attention: If True, return aggregated attention map [B, 1, num_slices].
+            get_per_head_attention: If True, return per-head attention [B, num_heads, num_slices] (ABMIL only).
             return_slice_embeddings: If True, return slice-level embeddings [B, num_slices, embed_dim] before pooling.
             seq_lengths: Actual sequence lengths [B] for masking padded positions.
         
         Returns:
             If get_attention=True: Attention map [B, 1, num_slices]
+            If get_per_head_attention=True: Per-head attention [B, num_heads, num_slices]
             If return_slice_embeddings=True: Slice embeddings [B, num_slices, embed_dim]
             Otherwise: Features [B, contrast_dim] (train) or [B, embed_dim] (inference)
         """
@@ -462,6 +476,7 @@ class Cobra(nn.Module):
             x,
             input_feature_dims=input_feature_dims,
             get_attention=get_attention,
+            get_per_head_attention=get_per_head_attention,
             return_slice_embeddings=return_slice_embeddings,
             seq_lengths=seq_lengths,
         )

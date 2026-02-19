@@ -1,29 +1,28 @@
 """
-COBRA Embedding Extraction and UMAP Clustering.
+COBRA Embedding Extraction and UMAP/t-SNE Clustering.
 
-Extracts stack-level or slice-level embeddings using COBRA and visualizes clustering.
+Extracts volume-level and slice-level embeddings using COBRA and visualizes clustering.
+Always loads both train and test splits from the feature directory.
 
 Usage:
-    # Aggregated embeddings - one point per volume
+    # Volume embeddings colored by pathology
     python -m med_slim.eval.embed_cluster \
         --checkpoint-path /path/to/cobra/checkpoint.pth.tar \
         --feat-dir /path/to/precomputed/features \
         --annotations-path /path/to/annotations.csv \
         --output-dir ./outputs \
-        --target-labels acl meniscus \
-        --plane sagittal \
-        --title "Aggregated Embedding Space"
+        --target-labels Abnormal ACL Meniscus \
+        --plane sagittal
 
-    # Slice-level embeddings - one point per slice
+    # Volume + slice-level embeddings (position + patient coloring)
     python -m med_slim.eval.embed_cluster \
         --checkpoint-path /path/to/checkpoint.pth.tar \
         --feat-dir /path/to/features \
         --annotations-path /path/to/annotations.csv \
         --output-dir ./outputs \
-        --target-labels acl \
+        --target-labels Abnormal \
         --slice-level \
-        --color-by slice_position \
-        --title "Slice-Level Embedding Space"
+        --method umap
 """
 
 import os
@@ -157,7 +156,6 @@ def main():
     parser.add_argument("--feat-dir", type=str, required=True, help="Directory with precomputed slice features")
     parser.add_argument("--annotations-path", type=str, required=True, help="Path to annotations CSV")
     parser.add_argument("--output-dir", type=str, required=True, help="Output directory")
-    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
     parser.add_argument("--plane", type=str, default="sagittal", help="View plane")
     parser.add_argument("--fm-model-names", type=str, default="dinov2", help="FM model names (space-separated)")
     parser.add_argument("--target-labels", type=str, nargs="+", required=True, help="Target label columns (e.g., ACL Meniscus)")
@@ -168,6 +166,8 @@ def main():
     parser.add_argument("--slice-pooling", type=str, default="abmil", choices=["abmil", "cls"])
     parser.add_argument("--title", type=str, default="", help="Plot title")
     parser.add_argument("--save-embeddings", action="store_true", help="Save embeddings to npz file")
+    parser.add_argument("--method", type=str, default="umap", choices=["umap", "tsne"],
+                        help="Dimensionality reduction method (default: umap)")
     
     # Slice-level analysis arguments
     parser.add_argument("--slice-level", action="store_true", 
@@ -197,9 +197,9 @@ def main():
         logger.info(f"Feature dir: {args.feat_dir}")
         logger.info(f"Annotations: {args.annotations_path}")
         logger.info(f"Target labels: {args.target_labels}")
-        logger.info(f"Split: {args.split}, Plane: {args.plane}")
+        logger.info(f"Plane: {args.plane}")
         logger.info(f"FM pooling: {args.fm_pooling}, Slice pooling: {args.slice_pooling}")
-        logger.info(f"Slice-level: {args.slice_level}, Color by: {args.color_by}")
+        logger.info(f"Slice-level: {args.slice_level}, Method: {args.method}")
         logger.info("=" * 60)
     
     # Load COBRA
@@ -215,97 +215,123 @@ def main():
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
     
-    # Determine task type based on number of target labels
+    splits = ["train", "test"]
     task = "multilabel" if len(args.target_labels) > 1 else "binary"
-    
-    # Create dataset with all target labels
     model_names = args.fm_model_names.split()
-    dataset = FeatClassificationDataset(
-        feat_dir=args.feat_dir,
-        slice_encoder_models=model_names,
-        view_plane=args.plane,
-        split=args.split,
-        annotations_path=args.annotations_path,
-        task=task,
-        target_columns=args.target_labels,
-    )
-    
-    if accelerator.is_main_process:
-        logger.info(f"Loaded {len(dataset)} samples")
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=linear_classifier_collate_fn,
-        num_workers=4,
-    )
-    
-    cobra_model, dataloader = accelerator.prepare(cobra_model, dataloader)
-    
-    # Extract embeddings
-    embeddings, labels, sample_ids, slice_positions, volume_ids = extract_embeddings(
-        cobra_model, dataloader, accelerator, slice_level=args.slice_level
-    )
-    
+
+    cobra_model = accelerator.prepare(cobra_model)
+
+    # Collect embeddings across splits
+    vol_embeddings_list, vol_labels_list, vol_sample_ids = [], [], []
+    slice_embeddings_list, slice_labels_list, slice_sample_ids = [], [], []
+    slice_positions_list, volume_ids_list = [], []
+    volume_offset = 0
+
+    for split in splits:
+        dataset = FeatClassificationDataset(
+            feat_dir=args.feat_dir,
+            slice_encoder_models=model_names,
+            view_plane=args.plane,
+            split=split,
+            annotations_path=args.annotations_path,
+            task=task,
+            target_columns=args.target_labels,
+        )
+        if accelerator.is_main_process:
+            logger.info(f"Loaded {len(dataset)} samples from split '{split}'")
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=linear_classifier_collate_fn,
+            num_workers=4,
+        )
+        dataloader = accelerator.prepare(dataloader)
+
+        # Volume-level embeddings
+        vol_embs, vol_labs, vol_sids, _, _ = extract_embeddings(
+            cobra_model, dataloader, accelerator, slice_level=False
+        )
+        vol_embeddings_list.append(vol_embs)
+        vol_labels_list.append(vol_labs)
+        vol_sample_ids.extend(vol_sids)
+
+        # Slice-level embeddings
+        if args.slice_level:
+            sl_embs, sl_labs, sl_sids, sl_pos, sl_vids = extract_embeddings(
+                cobra_model, dataloader, accelerator, slice_level=True
+            )
+            slice_embeddings_list.append(sl_embs)
+            slice_labels_list.append(sl_labs)
+            slice_sample_ids.extend(sl_sids)
+            slice_positions_list.append(sl_pos)
+            volume_ids_list.append(sl_vids + volume_offset)
+            volume_offset += len(vol_embs)
+
     if not accelerator.is_main_process:
         return
-    
-    logger.info(f"Extracted embeddings: {embeddings.shape}")
-    logger.info(f"Labels shape: {labels.shape}")
-    if args.slice_level:
-        logger.info(f"Slice positions shape: {slice_positions.shape}")
-        logger.info(f"Volume IDs shape: {volume_ids.shape}")
-    
+
+    vol_embeddings = np.concatenate(vol_embeddings_list, axis=0)
+    vol_labels = np.concatenate(vol_labels_list, axis=0)
+    logger.info(f"Total volume embeddings: {vol_embeddings.shape}")
+
     # Save embeddings if requested
     if args.save_embeddings:
-        suffix = "_slice_level" if args.slice_level else ""
-        npz_path = os.path.join(args.output_dir, f"embeddings{suffix}.npz")
         save_dict = {
-            "embeddings": embeddings,
-            "labels": labels,
-            "sample_ids": np.array(sample_ids, dtype=object),
+            "embeddings": vol_embeddings,
+            "labels": vol_labels,
+            "sample_ids": np.array(vol_sample_ids, dtype=object),
             "target_labels": np.array(args.target_labels, dtype=object),
         }
         if args.slice_level:
-            save_dict["slice_positions"] = slice_positions
-            save_dict["volume_ids"] = volume_ids
+            save_dict["slice_embeddings"] = np.concatenate(slice_embeddings_list, axis=0)
+            save_dict["slice_positions"] = np.concatenate(slice_positions_list, axis=0)
+            save_dict["volume_ids"] = np.concatenate(volume_ids_list, axis=0)
+        npz_path = os.path.join(args.output_dir, "embeddings.npz")
         np.savez(npz_path, **save_dict)
         logger.info(f"Saved embeddings to {npz_path}")
-    
-    # Determine coloring for UMAP
-    if args.slice_level and args.color_by == "slice_position":
-        # Color by relative slice position
+
+    # Plot 1: Volume embeddings colored by pathology
+    plot_embedding_clustering(
+        embeddings=vol_embeddings,
+        output_dir=args.output_dir,
+        labels=vol_labels,
+        label_names=[label.capitalize() for label in args.target_labels],
+        title=args.title or "Volume Embedding Space",
+        filename=f"{args.method}_{args.plane}_volume.png",
+        method=args.method,
+    )
+
+    # Slice-level plots
+    if args.slice_level:
+        slice_embeddings = np.concatenate(slice_embeddings_list, axis=0)
+        slice_positions = np.concatenate(slice_positions_list, axis=0)
+        volume_ids = np.concatenate(volume_ids_list, axis=0)
+        logger.info(f"Total slice embeddings: {slice_embeddings.shape}")
+
+        # Plot 2: Slice embeddings colored by position
         plot_embedding_clustering(
-            embeddings=embeddings,
+            embeddings=slice_embeddings,
             output_dir=args.output_dir,
             labels=slice_positions,
             label_names=["Slice Position"],
-            title=args.title or "Slice Embeddings (colored by position)",
-            filename=f"umap_{args.plane}_{args.split}_slice_position.png",
+            title="Slice Embeddings (colored by position)",
+            filename=f"{args.method}_{args.plane}_slice_position.png",
             continuous_color=True,
+            method=args.method,
         )
-    elif args.slice_level and args.color_by == "volume":
-        # Color by volume/sample ID
+
+        # Plot 3: Slice embeddings colored by patient
         plot_embedding_clustering(
-            embeddings=embeddings,
+            embeddings=slice_embeddings,
             output_dir=args.output_dir,
             labels=volume_ids,
-            label_names=["Volume ID"],
-            title=args.title or "Slice Embeddings (colored by volume)",
-            filename=f"umap_{args.plane}_{args.split}_volume.png",
+            label_names=["Patient"],
+            title="Slice Embeddings (colored by patient)",
+            filename=f"{args.method}_{args.plane}_slice_patient.png",
             continuous_color=True,
-        )
-    else:
-        # Color by pathology labels
-        suffix = "_slice_level" if args.slice_level else ""
-        plot_embedding_clustering(
-            embeddings=embeddings,
-            output_dir=args.output_dir,
-            labels=labels,
-            label_names=[label.capitalize() for label in args.target_labels],
-            title=args.title,
-            filename=f"umap_{args.plane}_{args.split}{suffix}.png",
+            method=args.method,
         )
 
 if __name__ == "__main__":

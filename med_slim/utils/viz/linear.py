@@ -123,30 +123,110 @@ def visualize_multilabel_metrics(
     output_dir: str,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Generate plots for multilabel classification (one set of plots per label).
+    Generate plots for multilabel classification.
+
+    Produces:
+        - Per-label ROC, PR, and 2-by-2 confusion matrix plots
+        - Combined macro-averaged ROC curve with all per-label curves
+
+    Note: An N-by-N confusion matrix is NOT produced for multilabel because
+    labels are independent -- a sample can have multiple labels simultaneously.
 
     Args:
-        y_true: Ground truth labels [N, num_classes]
-        y_pred_prob: Predicted probabilities [N, num_classes]
-        class_labels: List of class names
+        y_true: Ground truth labels [N, num_labels]
+        y_pred_prob: Predicted probabilities [N, num_labels]
+        class_labels: List of label names
         output_dir: Directory to save plots
 
     Returns:
-        Dictionary mapping class names to their metrics
+        Dictionary mapping label names to their metrics, plus "overall" macro averages
     """
+    fontdict = {'fontsize': 12, 'fontweight': 'bold'}
     metrics = {}
+    n_labels = len(class_labels)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---- Per-label plots + collect ROC data for combined plot ----
+    per_label_fpr = {}
+    per_label_tpr = {}
+    per_label_aurocs = []
+    per_label_auprcs = []
 
     for i, cls in enumerate(class_labels):
         auprc, roc_auc = visualize_binary_metrics(
             y_true[:, i],
             y_pred_prob[:, i],
             output_dir,
-            label=cls
+            label=cls,
         )
+
+        # Store ROC curve data for combined plot
+        fpr, tpr, _ = roc_curve(y_true[:, i], y_pred_prob[:, i])
+        per_label_fpr[i] = fpr
+        per_label_tpr[i] = tpr
+
         metrics[cls] = {
             "AUROC": float(roc_auc),
-            "AUPRC": float(auprc)
+            "AUPRC": float(auprc),
         }
+        per_label_aurocs.append(roc_auc)
+        per_label_auprcs.append(auprc)
+
+    # ---- Combined macro-averaged ROC curve ----
+    fpr_grid = np.linspace(0.0, 1.0, 1000)
+    mean_tpr = np.zeros_like(fpr_grid)
+
+    for i in range(n_labels):
+        mean_tpr += np.interp(fpr_grid, per_label_fpr[i], per_label_tpr[i])
+
+    mean_tpr /= n_labels
+    macro_auroc = float(auc(fpr_grid, mean_tpr))
+    macro_auprc = float(np.mean(per_label_auprcs))
+
+    # Plot combined figure
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    ax.plot(
+        fpr_grid,
+        mean_tpr,
+        label=f"Macro-average (AUC = {macro_auroc:.3f})",
+        color="navy",
+        linestyle=":",
+        linewidth=3,
+    )
+
+    cmap = plt.get_cmap("tab10") if n_labels <= 10 else plt.get_cmap("tab20")
+    for i, cls in enumerate(class_labels):
+        roc_auc_i = metrics[cls]["AUROC"]
+        ax.plot(
+            per_label_fpr[i],
+            per_label_tpr[i],
+            label=f"{cls} (AUC = {roc_auc_i:.3f})",
+            color=cmap(i),
+            linewidth=2,
+        )
+
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1)
+    ax.set_xlim([-0.01, 1.01])
+    ax.set_ylim([-0.01, 1.01])
+    ax.set_xlabel("False Positive Rate", fontdict=fontdict)
+    ax.set_ylabel("True Positive Rate", fontdict=fontdict)
+    ax.set_title(
+        "Per-label ROC Curves (Macro-averaged)",
+        fontdict={'fontsize': 14, 'fontweight': 'bold'},
+    )
+    ax.legend(loc="lower right", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "roc_multilabel_macro.png"), dpi=300)
+    plt.close(fig)
+
+    # Overall macro-averaged metrics
+    metrics["overall"] = {
+        "AUROC": macro_auroc,
+        "AUPRC": macro_auprc,
+    }
+    logger.info(f"Overall macro-averaged AUROC: {macro_auroc:.4f}, AUPRC: {macro_auprc:.4f}")
 
     return metrics
 
@@ -158,7 +238,10 @@ def visualize_multiclass_metrics(
     output_dir: str,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Generate plots for multiclass classification.
+    Generate plots for multiclass classification:
+        - Overall N-by-N confusion matrix
+        - Per-class one-vs-rest ROC, PR, and 2-by-2 confusion matrix plots
+        - Combined macro-averaged OvR ROC curve with all per-class curves
 
     Args:
         y_true: Ground truth labels [N] (class indices)
@@ -169,17 +252,19 @@ def visualize_multiclass_metrics(
     Returns:
         Dictionary with per-class and overall metrics
     """
+    fontdict = {'fontsize': 12, 'fontweight': 'bold'}
     metrics = {}
+    n_classes = len(class_labels)
 
     os.makedirs(output_dir, exist_ok=True)
 
     # Predictions
     pred_idx = np.argmax(y_pred_prob, axis=1)
-
+    
     # Overall confusion matrix
     cm = confusion_matrix(y_true, pred_idx)
 
-    # Plot confusion matrix
+    # Plot overall confusion matrix
     fig, ax = plt.subplots(figsize=(8, 8))
     sns.heatmap(
         cm,
@@ -190,31 +275,100 @@ def visualize_multiclass_metrics(
         yticklabels=class_labels,
         cmap='Blues'
     )
-    ax.set_xlabel("Predicted", fontdict={'fontsize': 12, 'fontweight': 'bold'})
-    ax.set_ylabel("Ground Truth", fontdict={'fontsize': 12, 'fontweight': 'bold'})
-    ax.set_title("Multiclass Confusion Matrix", fontdict={'fontsize': 14, 'fontweight': 'bold'})
+    ax.set_xlabel("Predictions", fontdict=fontdict)
+    ax.set_ylabel("Ground Truths", fontdict=fontdict)
+    ax.set_title("Confusion Matrix", fontdict={'fontsize': 14, 'fontweight': 'bold'})
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=300)
     plt.close(fig)
 
     # Per-class ROC curves (one-vs-rest)
+    per_class_fpr = {}
+    per_class_tpr = {}
+    per_class_aurocs = []
+    per_class_auprcs = []
+
     for i, cls in enumerate(class_labels):
         y_true_binary = (y_true == i).astype(int)
         y_pred_binary_prob = y_pred_prob[:, i]
 
+        # Per-class plots (ROC, PR, 2×2 confusion matrix)
         auprc, roc_auc = visualize_binary_metrics(
             y_true_binary,
             y_pred_binary_prob,
             output_dir,
-            label=cls
+            label=cls,
         )
+
+        # Store ROC curve data for combined plot
+        fpr, tpr, _ = roc_curve(y_true_binary, y_pred_binary_prob)
+        per_class_fpr[i] = fpr
+        per_class_tpr[i] = tpr
 
         metrics[cls] = {
             "AUROC": float(roc_auc),
             "AUPRC": float(auprc)
         }
+        per_class_aurocs.append(roc_auc)
+        per_class_auprcs.append(auprc)
+
+    # Combined macro-averaged ROC curve
+    # Interpolate all per-class ROC curves with shared FPR grid points
+    fpr_grid = np.linspace(0.0, 1.0, 1000)
+    mean_tpr = np.zeros_like(fpr_grid)
+
+    for i in range(n_classes):
+        mean_tpr += np.interp(fpr_grid, per_class_fpr[i], per_class_tpr[i])
+
+    mean_tpr /= n_classes
+    macro_auroc = float(auc(fpr_grid, mean_tpr))
+    macro_auprc = float(np.mean(per_class_auprcs))
+
+    # Plot combined figure
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    ax.plot(
+        fpr_grid,
+        mean_tpr,
+        label=f"Macro-average (AUC = {macro_auroc:.3f})",
+        color="navy",
+        linestyle=":",
+        linewidth=3,
+    )
+
+    cmap = plt.get_cmap("tab10") if n_classes <= 10 else plt.get_cmap("tab20")
+    for i, cls in enumerate(class_labels):
+        roc_auc_i = metrics[cls]["AUROC"]
+        ax.plot(
+            per_class_fpr[i],
+            per_class_tpr[i],
+            label=f"{cls} (AUC = {roc_auc_i:.3f})",
+            color=cmap(i),
+            linewidth=2,
+        )
+
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1)
+    ax.set_xlim([-0.01, 1.01])
+    ax.set_ylim([-0.01, 1.01])
+    ax.set_xlabel("False Positive Rate", fontdict=fontdict)
+    ax.set_ylabel("True Positive Rate", fontdict=fontdict)
+    ax.set_title(
+        "One-vs-Rest ROC Curves (Macro-averaged)",
+        fontdict={'fontsize': 14, 'fontweight': 'bold'},
+    )
+    ax.legend(loc="lower right", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "roc_multiclass_macro.png"), dpi=300)
+    plt.close(fig)
+
+    # Overall macro-averaged metrics
+    metrics["overall"] = {
+        "AUROC": macro_auroc,
+        "AUPRC": macro_auprc,
+    }
 
     logger.info(f"Multiclass Confusion Matrix:\n{cm}")
+    logger.info(f"Overall macro-averaged AUROC: {macro_auroc:.4f}, AUPRC: {macro_auprc:.4f}")
 
     return metrics
 

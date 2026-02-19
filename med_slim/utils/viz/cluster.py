@@ -8,6 +8,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import umap
+from sklearn.manifold import TSNE
 import logging
 from typing import Optional, List, Tuple, Dict
 
@@ -26,9 +27,11 @@ def plot_embedding_clustering(
     filename: str = 'embedding_umap.png',
     umap_kwargs: Optional[Dict] = None,
     continuous_color: bool = False,
+    method: str = 'umap',
+    tsne_kwargs: Optional[Dict] = None,
 ) -> str:
     """
-    Visualize embeddings using UMAP dimensionality reduction.
+    Visualize embeddings using UMAP or t-SNE dimensionality reduction.
     
     Args:
         embeddings: 2D array of embeddings [num_samples, embed_dim]
@@ -43,25 +46,38 @@ def plot_embedding_clustering(
         filename: Output filename
         umap_kwargs: Additional arguments for UMAP
         continuous_color: If True, treat labels as continuous values and use colormap
+        method: Dimensionality reduction method ('umap' or 'tsne')
+        tsne_kwargs: Additional arguments for t-SNE
     
     Returns:
         Path to saved figure
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # UMAP settings
-    default_umap_kwargs = {
-        'n_neighbors': 15, 
-        'min_dist': 0.1, 
-        'metric': 'cosine', 
-        'random_state': 42
-    }
-    if umap_kwargs:
-        default_umap_kwargs.update(umap_kwargs)
-    
-    logger.info(f"Running UMAP on {len(embeddings)} samples...")
-    reducer = umap.UMAP(n_components=2, **default_umap_kwargs)
-    embedding_2d = reducer.fit_transform(embeddings)
+    if method == 'tsne':
+        default_tsne_kwargs = {
+            'perplexity': min(30, len(embeddings) - 1),
+            'metric': 'cosine',
+            'random_state': 42,
+            'n_iter': 1000,
+        }
+        if tsne_kwargs:
+            default_tsne_kwargs.update(tsne_kwargs)
+        logger.info(f"Running t-SNE on {len(embeddings)} samples...")
+        reducer = TSNE(n_components=2, **default_tsne_kwargs)
+        embedding_2d = reducer.fit_transform(embeddings)
+    else:
+        default_umap_kwargs = {
+            'n_neighbors': 15, 
+            'min_dist': 0.1, 
+            'metric': 'cosine', 
+            'random_state': 42
+        }
+        if umap_kwargs:
+            default_umap_kwargs.update(umap_kwargs)
+        logger.info(f"Running UMAP on {len(embeddings)} samples...")
+        reducer = umap.UMAP(n_components=2, **default_umap_kwargs)
+        embedding_2d = reducer.fit_transform(embeddings)
     
     # Class labels
     if labels is not None and labels.ndim == 2:

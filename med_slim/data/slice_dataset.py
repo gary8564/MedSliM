@@ -2,11 +2,8 @@ import pandas as pd
 import torchio as tio 
 import torch.utils.data as data 
 import torch
-import numpy as np
 from pathlib import Path 
-from typing import Optional, List
-
-from med_slim.utils.preprocessing import ZNormalization, CropOrPad
+from typing import Optional
 
 def slice_collate_fn(batch):
     """
@@ -33,23 +30,28 @@ class SliceDataset(data.Dataset):
         ):
         super().__init__()
         if split not in ["train", "val", "test"]:
-            raise AttributeError(f"`split` attribute must be a str type and specified as either `train`, `val`, or `test`.")
+            raise AttributeError("`split` attribute must be a str type and specified as either `train`, `val`, or `test`.")
         if plane not in ["axial", "sagittal", "coronal"]:
-            raise AttributeError(f"`plane` attribute must be a str type and specified as either `axial`, `sagittal`, or `coronal`.")
+            raise AttributeError("`plane` attribute must be a str type and specified as either `axial`, `sagittal`, or `coronal`.")
         self.path_root = Path(path_root)
         self.split = split 
         self.transform = transform
-        self.df = pd.read_csv(self.path_root/f'{split}.csv', index_col='ID', dtype={'ID': str})
         self.plane = plane
+        csv_path = self.path_root / f'{split}.csv'
         
-        # Filter DataFrame by plane if column exists
-        if 'plane' in self.df.columns:
-            self.df = self.df[self.df['plane'] == plane]
-        
-        if len(self.df) == 0:
-            raise ValueError(f"No samples found after filtering by plane={plane}.")
-        
-        self.sample_ids = self.df.index.tolist()
+        if csv_path.exists():
+            self.df = pd.read_csv(csv_path, index_col='ID', dtype={'ID': str})
+            if 'plane' in self.df.columns:
+                self.df = self.df[self.df['plane'] == plane]
+            self.sample_ids = self.df.index.tolist()
+        else:
+            # Discover from filesystem
+            nifti_dir = self.path_root / split / plane
+            self.sample_ids = sorted([
+                p.stem.replace('.nii', '') 
+                for p in nifti_dir.glob('*.nii.gz')
+            ])
+            self.df = None
         
     def __len__(self):
         return len(self.sample_ids)
@@ -62,67 +64,3 @@ class SliceDataset(data.Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return {'uid': uid, "orientation": self.plane, 'source': img}
-    
-class SliceClassificationDataset(SliceDataset):
-    def __init__(
-            self,
-            path_root: str,
-            split: str,
-            task: str,
-            transform: Optional[tio.Compose] = None,
-            labels: Optional[List[str]] = None,
-            plane: str = 'axial',
-        ):
-        super().__init__(path_root, split, transform, plane=plane)
-        if task not in ["binary", "multiclass", "multilabel"]:
-            raise AttributeError(f"`task` attribute must be a str type and specified as either `binary`, `multiclass`, or `multilabel`.")
-        if len(labels) > 1 and task == "binary":
-            raise AttributeError(f"`labels` attribute must be a list of length 1 for binary classification.")
-        self.task = task
-        self.labels = labels
-        if self.labels is not None:
-            self.df = self.df[["ID", *self.labels]]
-    
-    def __getitem__(self, index):
-        sample_id = self.sample_ids[index]
-        uid = str(sample_id)
-        img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
-        img = tio.ScalarImage(img_path)
-        if self.transform is not None:
-            img = self.transform(img)
-        if self.task == "multilabel":
-            target = self.df.loc[sample_id, self.labels].to_numpy(dtype=np.float32) if self.labels is not None else self.df.loc[sample_id].to_numpy(dtype=np.float32)
-            target = torch.tensor(target, dtype=torch.float32)
-        elif self.task == "binary":
-            # For binary classification, BCEWithLogitsLoss expects target shape [B, 1] and float dtype
-            target = self.df.loc[sample_id, self.labels[0]] if self.labels is not None else self.df.loc[sample_id, "label"]
-            target = torch.tensor(target, dtype=torch.float32).unsqueeze(0)
-        else:  # multiclass: if labels provided, one-hot encoding; otherwise, integer encoding
-            target = self.df.loc[sample_id, self.labels].to_numpy(dtype=np.int64) if self.labels is not None else self.df.loc[sample_id, "label"].to_numpy(dtype=np.int64)
-            target = torch.tensor(target, dtype=torch.long)  
-        return {'uid': uid, "orientation": self.plane, 'source': img, 'target': target}
-
-class SliceSegmentationDataset(SliceDataset):
-    def __init__(
-            self,
-            path_root: str,
-            split: str,
-            transform: Optional[tio.Compose] = None,
-            plane: str = 'axial',
-            ):
-        super().__init__(path_root, split, transform, plane=plane)
-    
-    def __getitem__(self, index):
-        sample_id = self.sample_ids[index]
-        uid = str(sample_id)
-        img_path = self.path_root / f'{self.split}' / f'{self.plane}' / f'{uid}.nii.gz'
-        mask_path = self.path_root / f'{self.split}' / f'{self.plane}' / 'mask' / f'{uid}.nii.gz'
-        img = tio.ScalarImage(img_path)
-        mask = tio.LabelMap(mask_path)
-        subject = tio.Subject(img=img, mask=mask)
-        if self.transform is not None:
-            subject = self.transform(subject)
-        img = subject['img']
-        mask = subject['mask']
-        
-        return {'uid': uid, "orientation": self.plane, 'source': img, 'target': mask}

@@ -140,6 +140,72 @@ def plot_multiview_attention_comparison(
     
     logger.info(f"Saved multi-view attention comparison to {filepath}")
 
+
+def plot_per_head_attention_profile(
+    attention_weights: np.ndarray,
+    sample_id: Union[str, int],
+    view_plane: str,
+    output_dir: str,
+    class_label: Optional[str] = None,
+    fig_size: Tuple[int, int] = (14, 10),
+) -> None:
+    """
+    Plot per-head ABMIL attention profiles.
+    
+    Shows aggregated attention on top, followed by each head's individual profile.
+    
+    Args:
+        attention_weights: 2D array [num_heads, num_slices]
+        sample_id: Sample identifier
+        view_plane: View plane name
+        output_dir: Directory to save the plot
+        class_label: Optional class label
+        fig_size: Figure size
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    num_heads, num_slices = attention_weights.shape
+    slice_indices = np.arange(num_slices)
+
+    fig, axes = plt.subplots(num_heads + 1, 1, figsize=fig_size, sharex=True,
+                             gridspec_kw={'hspace': 0.3})
+
+    # Aggregated attention (mean of per-head softmax)
+    avg_attn = attention_weights.mean(axis=0)
+    avg_attn = avg_attn / avg_attn.sum()
+    colors = plt.cm.Reds(avg_attn / avg_attn.max())
+    axes[0].bar(slice_indices, avg_attn, color=colors, edgecolor='darkred', linewidth=0.5)
+    axes[0].set_ylabel('Weight', fontsize=9)
+    axes[0].set_title('Aggregated (mean of heads)', fontsize=11, fontweight='bold')
+    axes[0].set_xlim(-0.5, num_slices - 0.5)
+
+    head_cmaps = ['Blues', 'Oranges', 'Greens', 'Purples', 'YlOrBr', 'PiYG', 'BrBG', 'RdYlGn']
+    for i in range(num_heads):
+        attn = attention_weights[i]
+        cmap = plt.cm.get_cmap(head_cmaps[i % len(head_cmaps)])
+        bar_colors = cmap(attn / attn.max())
+        axes[i + 1].bar(slice_indices, attn, color=bar_colors, edgecolor='gray', linewidth=0.3)
+        axes[i + 1].set_ylabel('Weight', fontsize=9)
+        axes[i + 1].set_title(f'Head {i + 1}', fontsize=10)
+        axes[i + 1].set_xlim(-0.5, num_slices - 0.5)
+
+    axes[-1].set_xlabel('Slice Index', fontsize=12, fontweight='bold')
+
+    title = f'Per-Head Attention - {view_plane.capitalize()}'
+    if class_label:
+        title += f' ({class_label})'
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=1.02)
+
+    fig.tight_layout()
+
+    filename = f'per_head_attention_{sample_id}_{view_plane}.png'
+    filepath = os.path.join(output_dir, filename)
+    fig.savefig(filepath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    logger.info(f"Saved per-head attention profile to {filepath}")
+
+
 def compute_attention_metrics(
     attention_weights: np.ndarray,
     ground_truth_range: Optional[Tuple[int, int]] = None,
@@ -158,8 +224,7 @@ def compute_attention_metrics(
         - num_slices: Total number of slices
         - peak_position: Index of highest attention slice
         - peak_attention: Value of highest attention
-        - entropy: Attention distribution entropy (higher = more uniform)
-        - concentration: Gini coefficient (higher = more concentrated)
+        
         If ground_truth_range provided:
         - peak_in_gt_range: Whether peak is in GT region (0 or 1)
         - iou_topk_gt_range: IoU between top-k slices and GT region
@@ -176,6 +241,21 @@ def compute_attention_metrics(
     metrics['num_slices'] = num_slices
     metrics['peak_position'] = int(np.argmax(attention_weights))
     metrics['peak_attention'] = float(np.max(attention_weights))
+
+    # Entropy (higher = more uniform distribution)
+    eps = 1e-12
+    entropy = -np.sum(attention_weights * np.log(attention_weights + eps))
+    metrics['entropy'] = float(entropy)
+    metrics['max_entropy'] = float(np.log(num_slices))
+    metrics['normalized_entropy'] = float(entropy / np.log(num_slices)) if num_slices > 1 else 1.0
+
+    # Gini coefficient (higher = more concentrated on few slices)
+    sorted_weights = np.sort(attention_weights)
+    n = len(sorted_weights)
+    index = np.arange(1, n + 1)
+    gini = (2 * np.sum(index * sorted_weights) - (n + 1) * np.sum(sorted_weights)) / (n * np.sum(sorted_weights) + eps)
+    metrics['gini_coefficient'] = float(gini)
+
     # Ground truth comparison
     if ground_truth_range is not None:
         start, end = ground_truth_range

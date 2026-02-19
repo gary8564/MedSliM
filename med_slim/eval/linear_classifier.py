@@ -10,7 +10,6 @@ Linear Probing Evaluation for pretrained MedSliM SSL Model.
 """
 import os
 import argparse
-import warnings
 import yaml
 import json
 import logging
@@ -22,8 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from pathlib import Path
-from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from torch.utils.data import DataLoader, Dataset, Subset
+from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from tqdm import tqdm
 from datetime import datetime
@@ -369,8 +368,20 @@ def _compute_predictions_and_metrics(
     task: str,
     target_labels: List[str],
     output_dir: Optional[str] = None,
+    class_names: Optional[List[str]] = None,
 ) -> Dict:
-    """Convert probabilities to prediction labels, compute metrics, and create results DataFrame."""
+    """Convert probabilities to prediction labels, compute metrics, and create results DataFrame.
+    
+    Args:
+        all_probs: Predicted probabilities
+        all_true: Ground truth labels
+        sample_ids: Sample identifiers
+        task: Task type (binary, multiclass, multilabel)
+        target_labels: Column names used as classification targets
+        output_dir: Optional output directory for visualization
+        class_names: Optional list of class names for multiclass visualization.
+                     If None and task is multiclass, auto-generates as ["class_0", "class_1", ...].
+    """
     if task == "binary":
         all_probs = all_probs.squeeze(-1) if all_probs.ndim > 1 else all_probs
         all_preds = (all_probs >= 0.5).astype(int)
@@ -383,7 +394,18 @@ def _compute_predictions_and_metrics(
     viz_metrics = None
     if output_dir is not None:
         fig_dir = os.path.join(output_dir, "fig")
-        viz_labels = target_labels[:1] if task == "binary" else target_labels
+
+        # Determine visualization labels
+        if task == "binary":
+            viz_labels = target_labels[:1]
+        elif task == "multiclass":
+            if class_names is not None:
+                viz_labels = class_names
+            else:
+                num_classes = all_probs.shape[-1]
+                viz_labels = [f"class_{i}" for i in range(num_classes)]
+        else:
+            viz_labels = target_labels
         
         viz_metrics = compute_and_visualize_metrics(
             y_true=all_true,
@@ -683,6 +705,7 @@ def evaluate_single_view_classifier(
         task=task,
         target_labels=target_labels,
         output_dir=output_dir,
+        class_names=cfg.get("class_names"),
     )
     
     return eval_results
@@ -696,11 +719,12 @@ def run_single_view_evaluation(
     accelerator: Accelerator,
     output_dir: str,
     class_weights: Optional[torch.Tensor] = None,
+    val_dataset: Optional[FeatClassificationDataset] = None,
 ) -> Dict:
     """
     Run complete single-view evaluation pipeline.
     
-    1. Create train/val split
+    1. Create train/val split (or val_dataset if the validation set is already provided by the data provider)
     2. Initialize SingleViewClassifier (COBRA + classifier head)
     3. Linear probe training
     4. Evaluate on test set
@@ -714,33 +738,36 @@ def run_single_view_evaluation(
         logger.info("Single-view evaluation")
         logger.info(f"{'='*50}")
     
-    # Create train/val split
-    all_labels = np.array([train_dataset._get_label(sid).numpy() for sid in train_dataset.sample_ids])
-    val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
-    
-    if task == "multilabel":
-        n_splits = max(2, int(1.0 / val_split_ratio))
-        kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True)
-        splits = list(kfold.split(X=np.arange(len(train_dataset)), y=all_labels))
-        train_idx, val_idx = splits[0]
+    # Create train/val split or use dedicated val set
+    if val_dataset is not None:
+        train_data = train_dataset
+        val_data = val_dataset
     else:
-        train_idx, val_idx = train_test_split(
-            np.arange(len(train_dataset)),
-            test_size=val_split_ratio,
-            stratify=all_labels,
-            shuffle=True
-        )
-    
+        all_labels = np.array([train_dataset._get_label(sid).numpy() for sid in train_dataset.sample_ids])
+        val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
+        
+        if task == "multilabel":
+            n_splits = max(2, int(1.0 / val_split_ratio))
+            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True)
+            splits = list(kfold.split(X=np.arange(len(train_dataset)), y=all_labels))
+            train_idx, val_idx = splits[0]
+        else:
+            train_idx, val_idx = train_test_split(
+                np.arange(len(train_dataset)),
+                test_size=val_split_ratio,
+                stratify=all_labels,
+                shuffle=True
+            )
+        
+        train_data = Subset(train_dataset, train_idx)
+        val_data = Subset(train_dataset, val_idx)
     if accelerator.is_main_process:
-        logger.info(f"Training samples: {len(train_idx)}, Validation samples: {len(val_idx)}")
+        logger.info(f"Training samples:  {len(train_data)}, Validation samples: {len(val_data)}")
     
-    # Create subsets and dataloaders
-    train_subset = Subset(train_dataset, train_idx)
-    val_subset = Subset(train_dataset, val_idx)
-    
-    train_loader = DataLoader(train_subset, batch_size=hyperparams["batch_size"], shuffle=True, 
+    # Create dataloaders
+    train_loader = DataLoader(train_data, batch_size=hyperparams["batch_size"], shuffle=True, 
                               collate_fn=linear_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
-    val_loader = DataLoader(val_subset, batch_size=hyperparams["batch_size"], shuffle=False,
+    val_loader = DataLoader(val_data, batch_size=hyperparams["batch_size"], shuffle=False,
                             collate_fn=linear_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
     test_loader = DataLoader(test_dataset, batch_size=hyperparams["batch_size"], shuffle=False,
                              collate_fn=linear_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
@@ -827,8 +854,8 @@ def run_single_view_evaluation(
 # =============================================================================
 def collect_predictions_per_view_classifier(
     cobra_model: Cobra,
-    train_subset: Subset,
-    val_subset: Subset,
+    train_subset: Dataset,
+    val_subset: Dataset,
     test_dataset: FeatClassificationDataset,
     view_plane: str,
     cfg: Dict,
@@ -838,6 +865,10 @@ def collect_predictions_per_view_classifier(
 ) -> Dict:
     """
     Train a single-view classifier to get per-view predictions on validation and test sets for logistic regression ensemble.
+    
+    Args:
+        train_subset: Training data (Subset when split from train, or full Dataset when using dedicated val set)
+        val_subset: Validation data (Subset when split from train, or full Dataset when using dedicated val set)
     
     Returns:
         Dict with val_probs, val_labels, test_probs, test_labels, sample_ids
@@ -1029,6 +1060,7 @@ def evaluate_logistic_ensemble(
     target_labels: List[str],
     view_planes: List[str],
     output_dir: Optional[str] = None,
+    class_names: Optional[List[str]] = None,
 ) -> Dict:
     """
     Evaluate logistic regression ensemble and return metrics.
@@ -1041,6 +1073,7 @@ def evaluate_logistic_ensemble(
         target_labels: List of label names
         view_planes: List of view plane names
         output_dir: Optional output directory
+        class_names: Optional list of human-readable class names for multiclass visualization
     
     Returns:
         Dict with predictions DataFrame, metrics, and ensemble weights
@@ -1078,6 +1111,7 @@ def evaluate_logistic_ensemble(
         task=task,
         target_labels=target_labels,
         output_dir=output_dir,
+        class_names=class_names,
     )
     
     # Add ensemble weights for interpretability
@@ -1128,6 +1162,7 @@ def run_multiview_logistic_ensemble(
     output_dir: str,
     view_planes: List[str],
     class_weights: Optional[torch.Tensor] = None,
+    val_datasets: Optional[Dict[str, FeatClassificationDataset]] = None,
 ) -> Dict:
     """
     Run multi-view evaluation using logistic regression ensemble.
@@ -1149,6 +1184,8 @@ def run_multiview_logistic_ensemble(
         output_dir: Output directory
         view_planes: List of view plane names
         class_weights: Optional class weights
+        val_datasets: Optional dict mapping view_plane -> FeatClassificationDataset for validation.
+                      If provided, uses dedicated val sets instead of splitting train.
     """
     hyperparams = cfg["hyperparams"]
     task = cfg["task"]
@@ -1160,25 +1197,33 @@ def run_multiview_logistic_ensemble(
         logger.info(f"View planes: {view_planes}")
         logger.info(f"{'='*50}")
     
-    # Create consistent train/val split (same across all views)
-    all_labels = np.array([train_datasets[view_planes[0]]._get_label(sid).numpy() for sid in train_datasets[view_planes[0]].sample_ids])
-    val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
+    # Create consistent train/val split or use dedicated val sets
+    use_dedicated_val = val_datasets is not None
     
-    if task == "multilabel":
-        n_splits = max(2, int(1.0 / val_split_ratio))
-        kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        splits = list(kfold.split(X=np.arange(len(train_datasets[view_planes[0]])), y=all_labels))
-        train_idx, val_idx = splits[0]
+    if use_dedicated_val:
+        if accelerator.is_main_process:
+            n_train = len(train_datasets[view_planes[0]])
+            n_val = len(val_datasets[view_planes[0]])
+            logger.info(f"Using dedicated validation set. Training: {n_train}, Validation: {n_val}")
     else:
-        train_idx, val_idx = train_test_split(
-            np.arange(len(train_datasets[view_planes[0]])),
-            test_size=val_split_ratio,
-            stratify=all_labels,
-            random_state=42,
-        )
-    
-    if accelerator.is_main_process:
-        logger.info(f"Training samples: {len(train_idx)}, Validation samples: {len(val_idx)}")
+        all_labels = np.array([train_datasets[view_planes[0]]._get_label(sid).numpy() for sid in train_datasets[view_planes[0]].sample_ids])
+        val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
+        
+        if task == "multilabel":
+            n_splits = max(2, int(1.0 / val_split_ratio))
+            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            splits = list(kfold.split(X=np.arange(len(train_datasets[view_planes[0]])), y=all_labels))
+            train_idx, val_idx = splits[0]
+        else:
+            train_idx, val_idx = train_test_split(
+                np.arange(len(train_datasets[view_planes[0]])),
+                test_size=val_split_ratio,
+                stratify=all_labels,
+                random_state=42,
+            )
+        
+        if accelerator.is_main_process:
+            logger.info(f"Split training set. Training: {len(train_idx)}, Validation: {len(val_idx)}")
     
     # Step 1: Train single-view classifiers and collect predictions for each view
     view_predictions = {}
@@ -1192,9 +1237,13 @@ def run_multiview_logistic_ensemble(
         train_dataset_view_plane = train_datasets[plane]
         test_dataset_view_plane = test_datasets[plane]
         
-        # Use the same train/val indices for consistency
-        train_subset = Subset(train_dataset_view_plane, train_idx)
-        val_subset = Subset(train_dataset_view_plane, val_idx)
+        # Use dedicated val set or split from training set
+        if use_dedicated_val:
+            train_subset = train_dataset_view_plane
+            val_subset = val_datasets[plane]
+        else:
+            train_subset = Subset(train_dataset_view_plane, train_idx)
+            val_subset = Subset(train_dataset_view_plane, val_idx)
         
         # Train and collect predictions
         predictions = collect_predictions_per_view_classifier(
@@ -1294,6 +1343,7 @@ def run_multiview_logistic_ensemble(
         target_labels=target_labels,
         view_planes=view_planes,
         output_dir=output_dir,
+        class_names=cfg.get("class_names"),
     )
     
     # Save results
@@ -1519,6 +1569,7 @@ def evaluate_multiview_classifier(
         task=task,
         target_labels=target_labels,
         output_dir=output_dir,
+        class_names=cfg.get("class_names"),
     )
     
     # Store attention weights for interpretability
@@ -1537,11 +1588,12 @@ def run_multiview_evaluation(
     output_dir: str,
     view_planes: List[str],
     class_weights: Optional[torch.Tensor] = None,
+    val_dataset: Optional[MultiViewFeatClassificationDataset] = None,
 ) -> Dict:
     """
     Run complete multi-view evaluation pipeline with attention-based aggregation.
     
-    1. Create multi-view datasets
+    1. Create train/val split (or use dedicated val_dataset if provided)
     2. Initialize MultiViewClassifier with attention aggregation
     3. Linear probe training
     4. Evaluate on test set
@@ -1553,37 +1605,42 @@ def run_multiview_evaluation(
     
     if accelerator.is_main_process:
         logger.info(f"\n{'='*50}")
-        logger.info(f"Multi-view evaluation with attention aggregation")
+        logger.info("Multi-view evaluation with attention aggregation")
         logger.info(f"View planes: {view_planes}")
         logger.info(f"{'='*50}")
     
-    # Create train/val split
-    all_labels = np.array([train_dataset._get_label(sid).numpy() for sid in train_dataset.sample_ids])
-    val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
-    
-    if task == "multilabel":
-        n_splits = max(2, int(1.0 / val_split_ratio))
-        kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        splits = list(kfold.split(X=np.arange(len(train_dataset)), y=all_labels))
-        train_idx, val_idx = splits[0]
+    # Create train/val split or use dedicated val set
+    if val_dataset is not None:
+        train_data = train_dataset
+        val_data = val_dataset
+        if accelerator.is_main_process:
+            logger.info(f"Using dedicated validation set. Training: {len(train_data)}, Validation: {len(val_data)}")
     else:
-        train_idx, val_idx = train_test_split(
-            np.arange(len(train_dataset)),
-            test_size=val_split_ratio,
-            stratify=all_labels,
-            random_state=42,
-        )
-    
-    if accelerator.is_main_process:
-        logger.info(f"Training samples: {len(train_idx)}, Validation samples: {len(val_idx)}")
-    
-    train_subset = Subset(train_dataset, train_idx)
-    val_subset = Subset(train_dataset, val_idx)
+        all_labels = np.array([train_dataset._get_label(sid).numpy() for sid in train_dataset.sample_ids])
+        val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
+        
+        if task == "multilabel":
+            n_splits = max(2, int(1.0 / val_split_ratio))
+            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            splits = list(kfold.split(X=np.arange(len(train_dataset)), y=all_labels))
+            train_idx, val_idx = splits[0]
+        else:
+            train_idx, val_idx = train_test_split(
+                np.arange(len(train_dataset)),
+                test_size=val_split_ratio,
+                stratify=all_labels,
+                random_state=42,
+            )
+        
+        train_data = Subset(train_dataset, train_idx)
+        val_data = Subset(train_dataset, val_idx)
+        if accelerator.is_main_process:
+            logger.info(f"Split training set. Training: {len(train_data)}, Validation: {len(val_data)}")
     
     # Create dataloaders
-    train_loader = DataLoader(train_subset, batch_size=hyperparams["batch_size"], shuffle=True,
+    train_loader = DataLoader(train_data, batch_size=hyperparams["batch_size"], shuffle=True,
                               collate_fn=multiview_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
-    val_loader = DataLoader(val_subset, batch_size=hyperparams["batch_size"], shuffle=False,
+    val_loader = DataLoader(val_data, batch_size=hyperparams["batch_size"], shuffle=False,
                             collate_fn=multiview_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
     test_loader = DataLoader(test_dataset, batch_size=hyperparams["batch_size"], shuffle=False,
                              collate_fn=multiview_classifier_collate_fn, num_workers=hyperparams.get("num_workers", 0))
@@ -1762,6 +1819,8 @@ def main(args):
     ) if args.weighted_loss else None
     
     # Run evaluation
+    has_val_annots = "val_annots" in cfg and cfg["val_annots"]
+    
     if use_multiview:
         # Multi-view with logistic regression ensemble
         if accelerator.is_main_process:
@@ -1771,6 +1830,7 @@ def main(args):
         # Create datasets for all views once
         train_datasets = {}
         test_datasets = {}
+        val_datasets = {} if has_val_annots else None
         
         for plane in view_planes:
             train_datasets[plane] = FeatClassificationDataset(
@@ -1792,6 +1852,17 @@ def main(args):
                 task=cfg["task"],
                 target_columns=cfg["target_labels"],
             )
+            
+            if has_val_annots:
+                val_datasets[plane] = FeatClassificationDataset(
+                    feat_dir=cfg["feat_dataset"]["feat_dir"],
+                    slice_encoder_models=model_names,
+                    view_plane=plane,
+                    split="val",
+                    annotations_path=cfg["val_annots"],
+                    task=cfg["task"],
+                    target_columns=cfg["target_labels"],
+                )
         
         eval_results = run_multiview_logistic_ensemble(
             cobra_model=cobra_model,
@@ -1802,6 +1873,7 @@ def main(args):
             output_dir=output_dir,
             view_planes=view_planes,
             class_weights=class_weights,
+            val_datasets=val_datasets,
         )
     else:
         # Single-view
@@ -1828,9 +1900,23 @@ def main(args):
             target_columns=cfg["target_labels"],
         )
         
+        val_dataset = None
+        if has_val_annots:
+            val_dataset = FeatClassificationDataset(
+                feat_dir=cfg["feat_dataset"]["feat_dir"],
+                slice_encoder_models=model_names,
+                view_plane=view_plane,
+                split="val",
+                annotations_path=cfg["val_annots"],
+                task=cfg["task"],
+                target_columns=cfg["target_labels"],
+            )
+        
         if accelerator.is_main_process:
             logger.info(f"Using single-view inference with plane: {view_plane}")
             logger.info(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
+            if val_dataset is not None:
+                logger.info(f"Val samples (dedicated): {len(val_dataset)}")
         
         eval_results = run_single_view_evaluation(
             cobra_model=cobra_model,
@@ -1840,6 +1926,7 @@ def main(args):
             accelerator=accelerator,
             output_dir=output_dir,
             class_weights=class_weights,
+            val_dataset=val_dataset,
         )
 
     if accelerator.is_main_process:

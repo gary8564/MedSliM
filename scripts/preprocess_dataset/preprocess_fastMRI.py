@@ -133,7 +133,7 @@ def detect_plane(ds) -> str:
         if absn[2] >= absn[0] and absn[2] >= absn[1]:
             return "axial"
     else:
-        raise ValueError(f"Couldn't detect plane from DICOM metadata.")
+        raise ValueError("Couldn't detect plane from DICOM metadata.")
 
 def detect_sequence(ds) -> str:
     text = " ".join(
@@ -151,7 +151,7 @@ def detect_sequence(ds) -> str:
     elif "pd" in text or "proton density" in text:
         base = "pd"
     else:
-        raise ValueError(f"Couldn't detect sequence from DICOM metadata.")
+        raise ValueError("Couldn't detect sequence from DICOM metadata.")
 
     fat_suppressed = re.search(
         r"(fat\s*sat|fat[-_ ]?supp|fatsat|fs\b|_fs|fs_)",

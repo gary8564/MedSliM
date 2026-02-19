@@ -179,7 +179,7 @@ def get_volume_attention(
             # attention shape: [B, 1, max_seq_len]
             attention = attention.squeeze(1).cpu().numpy()  # [B, max_seq_len]
             
-            batch_size = len(features)
+            batch_size = attention.shape[0]
             for i in range(batch_size):
                 if max_samples and sample_count >= max_samples:
                     break
@@ -197,3 +197,65 @@ def get_volume_attention(
                 break
     
     return all_attention, all_labels, all_sample_ids, all_seq_lengths
+
+
+def get_volume_attention_per_head(
+    cobra_model: Cobra,
+    dataloader: DataLoader,
+    accelerator: Accelerator,
+    max_samples: Optional[int] = None,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[str], List[int], int]:
+    """
+    Extract per-head slice-level attention weights from COBRA ABMIL pooling.
+    
+    Args:
+        cobra_model: Pretrained COBRA model with ABMIL slice pooling
+        dataloader: DataLoader yielding batches of slice features
+        accelerator: HuggingFace Accelerator
+        max_samples: Maximum number of samples to process (None = all)
+    
+    Returns:
+        attention_weights: List of attention arrays [num_heads, num_slices] per sample
+        labels: List of label arrays per sample
+        sample_ids: List of sample IDs
+        seq_lengths: List of sequence lengths
+        num_heads: Number of attention heads
+    """
+    cobra_model.eval()
+    all_attention = []
+    all_labels = []
+    all_sample_ids = []
+    all_seq_lengths = []
+    num_heads = 0
+
+    sample_count = 0
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Extracting per-head attention", disable=not accelerator.is_main_process):
+            seq_lengths = batch["seq_lengths"].to(accelerator.device)
+            features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype)
+                       for f in batch["features"]]
+
+            attention = cobra_model(features, seq_lengths=seq_lengths, get_per_head_attention=True)
+            # attention shape: [B, num_heads, max_seq_len]
+            attention = attention.cpu().numpy()
+            num_heads = attention.shape[1]
+
+            batch_size = attention.shape[0]
+            for i in range(batch_size):
+                if max_samples and sample_count >= max_samples:
+                    break
+
+                seq_len = seq_lengths[i].item()
+                attn = attention[i, :, :seq_len]  # [num_heads, seq_len]
+
+                all_attention.append(attn)
+                all_labels.append(batch["labels"][i].cpu().numpy())
+                all_sample_ids.append(batch["sample_ids"][i])
+                all_seq_lengths.append(seq_len)
+                sample_count += 1
+
+            if max_samples and sample_count >= max_samples:
+                break
+
+    return all_attention, all_labels, all_sample_ids, all_seq_lengths, num_heads
