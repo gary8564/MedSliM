@@ -288,9 +288,12 @@ class PrecomputedFeatPairDataset(Dataset):
     
     def _sample_or_pad_slices(self, feats: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
-        Sample or pad slices to the target number of slices.
-        
+        Select or pad slices to the target number of slices.
+
         - More slices than target: uniformly subsample (preserving anatomical order).
+          Note that this uses deterministic evenly-spaced sampling (np.linspace) 
+          so that each slice index maps to a consistent relative anatomical position 
+          across volumes and across the two views of a positive pair.
         - Fewer slices than target: zero-pad and return actual count for masking.
         - Exactly target slices: return as-is.
         
@@ -307,7 +310,8 @@ class PrecomputedFeatPairDataset(Dataset):
             return feats, target
         elif num_slices > target:
             # Uniformly subsample target indices, preserving anatomical order
-            indices = np.sort(np.random.choice(num_slices, size=target, replace=False))
+            # indices = np.sort(np.random.choice(num_slices, size=target, replace=False))
+            indices = np.round(np.linspace(0, num_slices - 1, target)).astype(int)
             return feats[indices], target
         else:
             # Zero-pad to target length
@@ -355,7 +359,6 @@ class PrecomputedFeatPairDataset(Dataset):
         )
         
         # Sample or pad slices to fixed length
-        # Positive samples in a pair get independent subsampling
         feats1, seq_len = self._sample_or_pad_slices(feats1)
         feats2, _ = self._sample_or_pad_slices(feats2)
         

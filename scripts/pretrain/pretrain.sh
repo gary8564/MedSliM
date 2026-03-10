@@ -6,10 +6,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem-per-cpu=5G
-#SBATCH --time=72:00:00                 
-#SBATCH --job-name=pretrain_MRNet_fastMRI
-#SBATCH --output=logs/pretrain/stdout_pretrain_MRNet_fastMRI_%j.txt    
+#SBATCH --mem-per-cpu=8G
+#SBATCH --time=24:00:00                 
+#SBATCH --job-name=medslim_linspace_balanced_sampling
+#SBATCH --output=logs/pretrain/stdout_pretrain_linspace_balanced_sampling_%j.txt    
 #SBATCH --account=p0021834    
 
 ### Setup
@@ -29,11 +29,11 @@ NUM_GPUS=1
 
 ### Configuration
 # Checkpoint to resume from (leave empty for training from scratch)
-RESUME_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-08-18:35/medslim-epoch2000.pth.tar"
+#RESUME_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-08-18:35/medslim-epoch2000.pth.tar"
 
 # Curriculum learning: load model weights only, reset optimizer and epoch.
 # Set to true when adding new datasets or adding new slice encoder models.
-CURRICULUM=true
+#CURRICULUM=true
 
 # Override slice encoder models from config
 # Available: dinov2, dinov3, rad-dino, medsiglip, biomedclip, ark, mri-core

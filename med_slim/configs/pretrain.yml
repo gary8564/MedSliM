@@ -3,10 +3,10 @@ feat_dataset:
   datasets:
     - name: mrnet
       feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
-    # - name: fastMRI
-    #   feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adaptive"
-    # - name: kmar-50k
-    #   feat_dir: "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive"
+    - name: fastMRI
+      feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adaptive"
+    - name: kmar-50k
+      feat_dir: "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive"
   model_name: 
     - "dinov2"
     - "rad-dino"
@@ -92,5 +92,5 @@ train:
   num_workers: 20
   early_stopping: 
     patience: 10
-  save_ckpt_path: /hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI/ # "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K"
+  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K"
 
