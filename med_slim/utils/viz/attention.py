@@ -170,13 +170,13 @@ def plot_per_head_attention_profile(
     fig, axes = plt.subplots(num_heads + 1, 1, figsize=fig_size, sharex=True,
                              gridspec_kw={'hspace': 0.3})
 
-    # Aggregated attention (mean of per-head softmax)
+    # Aggregated attention (average over heads)
     avg_attn = attention_weights.mean(axis=0)
     avg_attn = avg_attn / avg_attn.sum()
     colors = plt.cm.Reds(avg_attn / avg_attn.max())
     axes[0].bar(slice_indices, avg_attn, color=colors, edgecolor='darkred', linewidth=0.5)
     axes[0].set_ylabel('Weight', fontsize=9)
-    axes[0].set_title('Aggregated (mean of heads)', fontsize=11, fontweight='bold')
+    axes[0].set_title('Aggregated (average over heads)', fontsize=11, fontweight='bold')
     axes[0].set_xlim(-0.5, num_slices - 0.5)
 
     head_cmaps = ['Blues', 'Oranges', 'Greens', 'Purples', 'YlOrBr', 'PiYG', 'BrBG', 'RdYlGn']

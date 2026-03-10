@@ -2,7 +2,7 @@ import os
 from typing import Optional
 import torch.nn as nn
 
-from med_slim.utils.preprocessing import get_model_config
+from med_slim.utils.model_config import get_slice_encoder_config
 
 def build_slice_encoder(
     name: str,
@@ -27,7 +27,7 @@ def build_slice_encoder(
     """
     valid_names = ["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core"]
     assert name in valid_names, f"Slice encoder '{name}' not supported. Choose from {valid_names}."
-    config = get_model_config(name)
+    config = get_slice_encoder_config(name)
 
     if config["name"] == "ark":
         from .ark import ArkFeatureExtractor

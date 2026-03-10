@@ -2,7 +2,6 @@ import torchio as tio
 from typing import Tuple, Optional
 
 from med_slim.utils.preprocessing import (
-    CropOrPad, 
     CropOrPad2D,
     CropOrPad3D,
     ZNormalization, 
@@ -11,8 +10,8 @@ from med_slim.utils.preprocessing import (
     ResampleInPlane,
     AdaptivePreprocessing,
     EnsureSliceAxisLast,
-    get_model_config,
 )
+from med_slim.utils.model_config import get_slice_encoder_config
 
 def get_transforms(model_name: str,
                    num_slices: Optional[int] = None,
@@ -41,7 +40,7 @@ def get_transforms(model_name: str,
         Tuple of (train_transform, val_transform)
     """
     # Get model-specific configuration
-    config = get_model_config(model_name)
+    config = get_slice_encoder_config(model_name)
     
     # Extract configuration parameters
     H_crop, W_crop = tuple(config["img_size"])
@@ -103,7 +102,7 @@ def get_adaptive_transform(
     """
     Get adaptive transform for a specific FM based on source resolution.
     """
-    config = get_model_config(model_name)
+    config = get_slice_encoder_config(model_name)
     H_target, W_target = tuple(config["img_size"])
     means = list(config["image_mean"])
     stds = list(config["image_std"])

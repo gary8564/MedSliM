@@ -3,10 +3,10 @@ feat_dataset:
   datasets:
     - name: mrnet
       feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
-    - name: fastMRI
-      feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adaptive"
-    - name: kmar-50k
-      feat_dir: "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive"
+    # - name: fastMRI
+    #   feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adaptive"
+    # - name: kmar-50k
+    #   feat_dir: "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive"
   model_name: 
     - "dinov2"
     - "rad-dino"
@@ -58,13 +58,13 @@ model:
       image_mean: [0.485, 0.456, 0.406]
       image_std: [0.229, 0.224, 0.225]
       embed_dim: 1376
-      repo: "/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
+      repo: "/hpcwork/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
     - name: mri-core
       img_size: [224, 224]
       image_mean: [0.0, 0.0, 0.0]  # MRI-CORE uses per-slice min-max normalization internally
       image_std: [1.0, 1.0, 1.0]
       embed_dim: 768
-      repo: "/work/rwth1833/models/mri_core/mri_foundation.pth"
+      repo: "/hpcwork/rwth1833/models/mri_core/mri_foundation.pth"
 
   cobra:
     embed_dim: 1024 # 768, 1024, 1536

@@ -1,14 +1,56 @@
 import torch
+import yaml
 import logging
 import os
+from pathlib import Path
 from accelerate import Accelerator
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from med_slim.model.sequence_encoder.cobra import Cobra
 from med_slim.logging.setup import init_logging
 
 init_logging()
 logger = logging.getLogger(__name__)
+
+
+def _build_cobra(
+    model_config: Dict,
+    sequence_encoder: str,
+    slice_pooling: str,
+    fm_pooling: str,
+) -> Cobra:
+    """Construct a COBRA model in inference mode from model configuration."""
+    embed_dim = model_config["embed_dim"]
+    encoder_kwargs: Dict[str, Any] = {}
+
+    if sequence_encoder == "mamba2":
+        encoder_kwargs["d_state"] = model_config.get("mamba_d_state", 128)
+    else:
+        encoder_kwargs["rotary_positional_encoding"] = model_config["transformer_rotary_positional_encoding"]
+        encoder_kwargs["norm_first"] = model_config["transformer_norm_first"]
+        encoder_kwargs["dim_feedforward"] = model_config.get(
+            "transformer_dim_feedforward",
+            4 * embed_dim,
+        )
+
+    if slice_pooling == "abmil" or fm_pooling == "attention":
+        encoder_kwargs["att_dim"] = model_config["attn_dim"]
+
+    num_layers = model_config.get("num_layers", model_config.get("num_mamba_layers"))
+
+    return Cobra(
+        input_dims=model_config["input_dims"],
+        embed_dim=embed_dim,
+        contrast_dim=model_config["contrast_dim"],
+        num_heads=model_config["num_heads"],
+        num_layers=num_layers,
+        dropout=model_config["dropout"],
+        mode="inference",
+        sequence_encoder=sequence_encoder,
+        fm_pooling=fm_pooling,
+        slice_pooling=slice_pooling,
+        **encoder_kwargs,
+    )
 
 
 def load_pretrained_cobra(
@@ -49,56 +91,16 @@ def load_pretrained_cobra(
         slice_pooling = state_dict.get("pooling", "abmil")  # Default for older checkpoints
     logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}")
     
-    # Build encoder-specific kwargs
-    encoder_kwargs = {}
-    
-    embed_dim = model_config["embed_dim"]
-    
-    if sequence_encoder == "mamba2":
-        encoder_kwargs["d_state"] = model_config.get("mamba_d_state", 128)
-    else:
-        encoder_kwargs["rotary_positional_encoding"] = model_config["transformer_rotary_positional_encoding"]
-        encoder_kwargs["norm_first"] = model_config["transformer_norm_first"]
-        encoder_kwargs["dim_feedforward"] = model_config.get(
-            "transformer_dim_feedforward", 
-            4 * embed_dim
-        )
-    
-    # att_dim is needed for ABMIL slice pooling and FM attention pooling
-    if slice_pooling == "abmil" or fm_pooling == "attention":
-        encoder_kwargs["att_dim"] = model_config["attn_dim"]
-    
-    num_layers = model_config["num_layers"] if "num_layers" in model_config else model_config["num_mamba_layers"]
-    
-    # Create model in inference mode
-    model = Cobra(
-        input_dims=model_config["input_dims"], 
-        embed_dim=embed_dim,
-        contrast_dim=model_config["contrast_dim"],
-        num_heads=model_config["num_heads"],
-        num_layers=num_layers,
-        dropout=model_config["dropout"],
-        mode="inference",
-        sequence_encoder=sequence_encoder,
-        fm_pooling=fm_pooling,
-        slice_pooling=slice_pooling,
-        **encoder_kwargs,
-    )
+    model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling)
     
     # Extract encoder weights from checkpoint
     if "state_dict" not in list(state_dict.keys()):
         raise ValueError(f"`state_dict` key not found in saved model checkpoint {checkpoint_path}.")
     
     chkpt = state_dict["state_dict"]
-    # cobra_weights = {
-    #     k.split(f"{encoder_type}_encoder.")[-1]: v 
-    #     for k, v in chkpt.items() 
-    #     if f"{encoder_type}_encoder" in k and f"{encoder_type}_encoder.proj" not in k
-    # }
-    # TODO: Remove this once all checkpoints are updated
+
     # Handle legacy checkpoint key names (mamba_enc -> seq_enc)
     has_legacy_mamba = any("mamba_enc" in k for k in chkpt.keys())
-    
     if has_legacy_mamba:
         logger.info("Detected legacy checkpoint format, remapping keys: mamba_enc -> seq_enc")
     
@@ -124,3 +126,63 @@ def load_pretrained_cobra(
     logger.info(f"{encoder_type.capitalize()} COBRA model loaded successfully.")
     
     return model
+
+
+def load_cobra_from_experiment(
+    experiment_dir: str,
+    accelerator: Accelerator,
+) -> Tuple[Cobra, Dict[str, Any]]:
+    """
+    Load a COBRA model from a linear-probing saved checkpoints and configuration.
+    """
+    experiment_dir = Path(experiment_dir)
+
+    # Load experiment config
+    config_path = experiment_dir / "config.yml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"config.yml not found in {experiment_dir}")
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    cobra_cfg = cfg.get("cobra_config")
+    if cobra_cfg is None:
+        raise ValueError(
+            "cobra_config not found in config.yml. "
+            "Re-run linear probing to save the updated config."
+        )
+
+    # Model configuration
+    seq_enc = cfg.get("sequence_encoder", "mamba2")
+    ckpt_path = experiment_dir / "ckpt" / "classifier.pt"  # Saved classifier checkpoint
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"classifier.pt not found at {ckpt_path}")
+
+    raw = torch.load(ckpt_path, map_location=accelerator.device, weights_only=False)
+
+    # Detect slice_pooling from weight keys
+    has_attn_keys = any(k.startswith("cobra.attn.") for k in raw.keys())
+    slice_pooling = "abmil" if has_attn_keys else "cls"
+
+    # Attention pooling if cobra.fm_attn.* exists
+    has_fm_attn = any(k.startswith("cobra.fm_attn.") for k in raw.keys())
+    fm_pooling = "attention" if has_fm_attn else "avg_pool"
+
+    logger.info(
+        f"Loading COBRA from experiment: sequence_encoder={seq_enc}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}"
+    )
+
+    model = _build_cobra(cobra_cfg, seq_enc, slice_pooling, fm_pooling)
+
+    # Extract cobra.* weights from classifier state dict
+    cobra_weights = {
+        k[len("cobra."):]: v
+        for k, v in raw.items()
+        if k.startswith("cobra.")
+    }
+    if not cobra_weights:
+        raise ValueError("No cobra.* keys found in classifier.pt")
+
+    model.load_state_dict(cobra_weights, strict=False)
+    logger.info("COBRA model loaded from experiment directory.")
+
+    return model, cfg

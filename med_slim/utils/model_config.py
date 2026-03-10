@@ -2,7 +2,8 @@ import yaml
 from pathlib import Path
 from typing import Dict, Any
 
-def get_model_config(model_name: str) -> Dict[str, Any]:
+
+def get_slice_encoder_config(model_name: str) -> Dict[str, Any]:
     """
     Get model configurations from the YAML file.
     
@@ -13,7 +14,7 @@ def get_model_config(model_name: str) -> Dict[str, Any]:
         Dict containing model-specific configuration
     """
     current_dir = Path(__file__).parent
-    configs_dir = current_dir.parent.parent / "configs"
+    configs_dir = current_dir.parent / "configs"
     config_path = configs_dir / "pretrain.yml"
     
     if not config_path.exists():

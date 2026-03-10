@@ -43,6 +43,7 @@ from med_slim.eval.load_cobra import load_pretrained_cobra
 from med_slim.utils.callbacks.early_stopping import EarlyStopping
 from med_slim.utils.metrics.linear import get_loss_criterion, get_eval_metrics, get_num_classes, compute_class_weights_for_weighted_loss
 from med_slim.utils.viz.linear import compute_and_visualize_metrics
+from med_slim.utils.label_metadata import get_dataset_metadata, get_annotation_paths_by_split, build_multiclass_label_names
 from med_slim.logging.setup import init_logging
 
 init_logging()
@@ -54,7 +55,6 @@ CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 # =============================================================================
 # Classifier Head and Attention Aggregator
 # =============================================================================
-
 class ClassifierHead(nn.Module):
     """MLP classifier head for linear probing."""
     def __init__(self, input_dim: int, num_classes: int, hidden_dim: int = 512, dropout: float = 0.5):
@@ -1749,6 +1749,36 @@ def main(args):
     with open(args.linear_classifier_config, "r") as f:
         cfg = yaml.safe_load(f)
 
+    dataset_name = cfg.get("feat_dataset", {}).get("dataset_name")
+    if dataset_name is None:
+        raise ValueError("Missing required field `dataset_name` in `linear_classifier.yml`.")
+    ds_meta = get_dataset_metadata(dataset_name)
+    if "task" not in ds_meta:
+        raise ValueError("Missing required field `task` in `eval_datasets.yaml` for dataset `dataset_name`.")
+    if "target_labels" not in ds_meta:
+        raise ValueError("Missing required field `target_labels` in `eval_datasets.yaml` for dataset `dataset_name`.")
+    cfg["task"] = ds_meta["task"]
+    cfg["target_labels"] = ds_meta["target_labels"]
+    if cfg["task"] == "multiclass":
+        if "multiclass_label_maps" not in ds_meta:
+            raise ValueError("Missing required field `multiclass_label_maps` in `eval_datasets.yaml` for dataset `dataset_name`.")
+        cfg["class_names"] = build_multiclass_label_names(
+            cfg["target_labels"][0], ds_meta["multiclass_label_maps"]
+        )
+
+    # Get annotation paths from annotations_dir
+    annotations_dir = cfg.get("annotations_dir")
+    if not annotations_dir:
+        raise ValueError("Missing required field `annotations_dir` in linear_classifier.yml")
+    annot_files = get_annotation_paths_by_split(
+        annotations_dir, cfg["task"],
+        splits=["train", "test"],
+    )
+    cfg["train_annots"] = str(annot_files["train"])
+    cfg["test_annots"] = str(annot_files["test"])
+    if "val" in annot_files:
+        cfg["val_annots"] = str(annot_files["val"])
+
     # CLI `--fine-tune` flag overrides `freeze_cobra` in config
     if args.fine_tune:
         cfg["freeze_cobra"] = not args.fine_tune
@@ -1771,6 +1801,14 @@ def main(args):
     else:
         output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_{view_planes[0]}_{CURR_TIME}")
     
+    # Save pretrained COBRA model config
+    checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg["checkpoint_path"]
+    pretrain_config_path = Path(checkpoint_path).parent / "config.yaml"
+    with open(pretrain_config_path, "r") as f:
+        pretrain_cfg = yaml.safe_load(f)
+    cobra_cfg = pretrain_cfg["model"]["cobra"]
+    cfg["cobra_config"] = cobra_cfg
+
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "config.yml"), "w") as f:
@@ -1787,17 +1825,9 @@ def main(args):
         )
     
     # Load pretrained COBRA model
-    checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg["checkpoint_path"]
-    
     if accelerator.is_main_process:
         logger.info("Loading pretrained COBRA model...")
         logger.info(f"Checkpoint path: {checkpoint_path}")
-    
-    pretrain_config_path = Path(checkpoint_path).parent / "config.yaml"
-    with open(pretrain_config_path, "r") as f:
-        pretrain_cfg = yaml.safe_load(f)
-    cobra_cfg = pretrain_cfg["model"]["cobra"]
-    
     cobra_model = load_pretrained_cobra(
         checkpoint_path=checkpoint_path,
         accelerator=accelerator,

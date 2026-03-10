@@ -1,0 +1,35 @@
+# Shared metadata for downstream evaluation datasets.
+#
+# Each entry defines the task type, target CSV columns, human-readable display
+# names, and (for multiclass) integer-to-class mappings.
+#
+# To add a new downstream evaluation dataset, create a new top-level key and fill in the fields below.
+
+datasets:
+  MRNet:
+    task: binary
+    target_labels: [meniscus]
+    label_display_names:
+      meniscus: Meniscal Tear
+      acl: ACL Tear
+      abnormal: Abnormal
+
+  SKM-TEA:
+    task: multilabel
+    target_labels: [meniscal_tear, ligament_tear, cartilage_lesion, effusion]
+    label_display_names:
+      meniscal_tear: Meniscal Tear
+      ligament_tear: Ligament Tear
+      cartilage_lesion: Cartilage Lesion
+      effusion: Effusion
+
+  kneeMRI:
+    task: multiclass
+    target_labels: [acl]
+    label_display_names:
+      acl: ACL Tear
+    multiclass_label_maps:
+      acl:
+        0: Normal
+        1: Partial ACL Tear
+        2: Complete ACL Tear

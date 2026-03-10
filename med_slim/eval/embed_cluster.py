@@ -7,22 +7,18 @@ Always loads both train and test splits from the feature directory.
 Usage:
     # Volume embeddings colored by pathology
     python -m med_slim.eval.embed_cluster \
-        --checkpoint-path /path/to/cobra/checkpoint.pth.tar \
-        --feat-dir /path/to/precomputed/features \
-        --annotations-path /path/to/annotations.csv \
-        --output-dir ./outputs \
-        --target-labels Abnormal ACL Meniscus \
-        --plane sagittal
-
-    # Volume + slice-level embeddings (position + patient coloring)
+        --experiment-dir /path/to/experiment_output
+    # or 
     python -m med_slim.eval.embed_cluster \
         --checkpoint-path /path/to/checkpoint.pth.tar \
         --feat-dir /path/to/features \
-        --annotations-path /path/to/annotations.csv \
-        --output-dir ./outputs \
-        --target-labels Abnormal \
-        --slice-level \
-        --method umap
+        --annotations-dir /path/to/preprocessed/MRNet \
+        --dataset-name MRNet \
+        --output-dir ./outputs
+
+    # Slice-level embeddings colored by pathology
+    python -m med_slim.eval.embed_cluster \
+        --experiment-dir /path/to/experiment_output --slice-level
 """
 
 import os
@@ -37,8 +33,15 @@ from accelerate import Accelerator
 from tqdm import tqdm
 
 from med_slim.data.feat_dataset import FeatClassificationDataset, linear_classifier_collate_fn
-from med_slim.eval.load_cobra import load_pretrained_cobra
+from med_slim.eval.load_cobra import load_pretrained_cobra, load_cobra_from_experiment
 from med_slim.utils.viz.cluster import plot_embedding_clustering
+from med_slim.utils.label_metadata import (
+    get_dataset_metadata,
+    get_annotation_paths_by_split,
+    build_binary_label_names,
+    build_multilabel_display_names,
+    build_multiclass_label_names,
+)
 from med_slim.logging.setup import init_logging
 
 init_logging()
@@ -61,26 +64,14 @@ def extract_embeddings(
         slice_level: If True, return slice-level embeddings before aggregation
     
     Returns:
-        If slice_level=False:
-            embeddings: [N, embed_dim] numpy array
-            labels: [N] or [N, num_labels] numpy array
-            sample_ids: List of sample IDs
-            slice_positions: None
-            volume_ids: None
-        If slice_level=True:
-            embeddings: [N * num_slices, embed_dim] numpy array
-            labels: [N * num_slices] or [N * num_slices, num_labels] numpy array  
-            sample_ids: List of sample IDs (repeated for each slice)
-            slice_positions: [N * num_slices] numpy array of slice positions
-            volume_ids: [N * num_slices] numpy array of volume indices
+        embeddings: [N, embed_dim] numpy array for volume-level, [total_slices, D] for slice-level
+        labels: [N] or [N, num_labels] numpy array for volume, repeated per slice for slice-level
+        sample_ids: List of sample IDs
     """
     cobra_model.eval()
     all_embeddings = []
     all_labels = []
     all_sample_ids = []
-    all_slice_positions = []
-    all_volume_ids = []
-    volume_counter = 0
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting embeddings", disable=not accelerator.is_main_process):
@@ -90,37 +81,20 @@ def extract_embeddings(
             batch_sample_ids = batch["sample_ids"]
             
             if slice_level:
-                # Get slice-level embeddings [B, num_slices, embed_dim]
                 embeddings = cobra_model(features, seq_lengths=seq_lengths, return_slice_embeddings=True)
-                B, T, E = embeddings.shape
+                B = embeddings.shape[0]
                 
-                # Create slice position and volume ID arrays
                 for i in range(B):
                     num_slices = seq_lengths[i].item()
-                    slice_embs = embeddings[i, :num_slices, :]  # [num_slices, embed_dim]
-                    all_embeddings.append(slice_embs.float())
+                    all_embeddings.append(embeddings[i, :num_slices, :].float())
                     
-                    # Repeat labels for each slice
                     if len(batch_labels.shape) == 1:
-                        slice_labels = batch_labels[i].unsqueeze(0).expand(num_slices)
+                        all_labels.append(batch_labels[i].unsqueeze(0).expand(num_slices))
                     else:
-                        slice_labels = batch_labels[i].unsqueeze(0).expand(num_slices, -1)
-                    all_labels.append(slice_labels)
+                        all_labels.append(batch_labels[i].unsqueeze(0).expand(num_slices, -1))
                     
-                    # Track slice positions (normalized to range 0-1)
-                    positions = torch.arange(num_slices, device=accelerator.device).float() / max(num_slices - 1, 1)
-                    all_slice_positions.append(positions)
-                    
-                    # Track volume IDs
-                    volume_ids = torch.full((num_slices,), volume_counter + i, device=accelerator.device)
-                    all_volume_ids.append(volume_ids)
-                    
-                    # Extend sample IDs for each slice
                     all_sample_ids.extend([batch_sample_ids[i]] * num_slices)
-                
-                volume_counter += B
             else:
-                # Get aggregated embeddings [B, embed_dim]
                 embeddings = cobra_model(features, seq_lengths=seq_lengths)
                 all_embeddings.append(embeddings.float())
                 all_labels.append(batch_labels)
@@ -129,113 +103,162 @@ def extract_embeddings(
     embeddings = torch.cat(all_embeddings, dim=0)
     labels = torch.cat(all_labels, dim=0)
     
-    # Gather from all processes
     embeddings = accelerator.gather_for_metrics(embeddings)
     labels = accelerator.gather_for_metrics(labels)
     
-    if slice_level:
-        slice_positions = torch.cat(all_slice_positions, dim=0)
-        volume_ids = torch.cat(all_volume_ids, dim=0)
-        slice_positions = accelerator.gather_for_metrics(slice_positions)
-        volume_ids = accelerator.gather_for_metrics(volume_ids)
-        return (
-            embeddings.cpu().numpy(), 
-            labels.cpu().numpy(), 
-            all_sample_ids,
-            slice_positions.cpu().numpy(),
-            volume_ids.cpu().numpy(),
-        )
-    
-    return embeddings.cpu().numpy(), labels.cpu().numpy(), all_sample_ids, None, None
+    return embeddings.cpu().numpy(), labels.cpu().numpy(), all_sample_ids
 
 
 def main():
     parser = argparse.ArgumentParser(description="Extract COBRA embeddings and visualize with UMAP")
     
-    parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to COBRA checkpoint")
-    parser.add_argument("--feat-dir", type=str, required=True, help="Directory with precomputed slice features")
-    parser.add_argument("--annotations-path", type=str, required=True, help="Path to annotations CSV")
-    parser.add_argument("--output-dir", type=str, required=True, help="Output directory")
-    parser.add_argument("--plane", type=str, default="sagittal", help="View plane")
-    parser.add_argument("--fm-model-names", type=str, default="dinov2", help="FM model names (space-separated)")
-    parser.add_argument("--target-labels", type=str, nargs="+", required=True, help="Target label columns (e.g., ACL Meniscus)")
+    parser.add_argument("--experiment-dir", type=str, default=None,
+                        help="Path to a linear-probing experiment directory. "
+                             "Load model, features, annotations, and labels from config.yml and ckpt/classifier.pt directly.")
+    # Optional args if experiment-dir is not provided
+    parser.add_argument("--checkpoint-path", type=str, default=None, help="Path to COBRA checkpoint")
+    parser.add_argument("--feat-dir", type=str, default=None, help="Directory with precomputed slice features")
+    parser.add_argument("--annotations-dir", type=str, default=None,
+                        help="Directory containing split annotation CSVs "
+                             "(e.g. train.csv/test.csv or train_multiclass.csv/test_multiclass.csv)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
+    parser.add_argument("--dataset-name", type=str, default=None,
+                        help="Dataset name (e.g. MRNet, SKM-TEA, kneeMRI)")
+    parser.add_argument("--plane", type=str, default=None, help="View plane")
+    parser.add_argument("--fm-model-names", type=str, default=None, help="FM model names (space-separated)")
+    parser.add_argument("--target-labels", type=str, nargs="+", default=None,
+                        help="Target label columns to override the ones specified in `eval_datasets.yaml`")
+    parser.add_argument("--task", type=str, default=None, choices=["binary", "multiclass", "multilabel"],
+                        help="Classification task type to override the one specified in `eval_datasets.yaml`")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--fm-pooling", type=str, default="avg_pool", choices=["avg_pool", "attention"],
-                        help="FM pooling: 'avg_pool' (average pooling) or 'attention' (requires fine-tuning).")
-    parser.add_argument("--sequence-encoder", type=str, default="mamba2", choices=["mamba2", "transformer"])
-    parser.add_argument("--slice-pooling", type=str, default="abmil", choices=["abmil", "cls"])
-    parser.add_argument("--title", type=str, default="", help="Plot title")
+    parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "attention"])
+    parser.add_argument("--sequence-encoder", type=str, default=None, choices=["mamba2", "transformer"])
+    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
     parser.add_argument("--save-embeddings", action="store_true", help="Save embeddings to npz file")
     parser.add_argument("--method", type=str, default="umap", choices=["umap", "tsne"],
                         help="Dimensionality reduction method (default: umap)")
     
+    # UMAP hyperparameters
+    parser.add_argument("--n-neighbors", type=int, default=15,
+                        help="UMAP n_neighbors: larger values capture more global structure (default: 15)")
+    parser.add_argument("--min-dist", type=float, default=0.1,
+                        help="UMAP min_dist: lower values create tighter clusters (default: 0.1)")
+    
+    # t-SNE hyperparameters
+    parser.add_argument("--perplexity", type=float, default=30,
+                        help="t-SNE perplexity: related to nearest neighbors, try 20-50 (default: 30)")
+    
     # Slice-level analysis arguments
     parser.add_argument("--slice-level", action="store_true", 
                         help="Extract slice-level embeddings before aggregation")
-    parser.add_argument("--color-by", type=str, default="label",
-                        choices=["label", "slice_position", "volume"],
-                        help="Color scheme for UMAP: 'label' (pathology), 'slice_position' (relative position), 'volume' (sample ID)")
+    parser.add_argument("--supervised", action="store_true",
+                        help="Use supervised UMAP (labels guide the layout). "
+                             "Only affects label-colored plots, not continuous-color plots.")
     
     args = parser.parse_args()
     
     accelerator = Accelerator()
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Load pretrain config
-    pretrain_config_path = Path(args.checkpoint_path).parent / "config.yaml"
-    cobra_cfg = {}
-    if pretrain_config_path.exists():
-        with open(pretrain_config_path) as f:
-            pretrain_cfg = yaml.safe_load(f)
-        cobra_cfg = pretrain_cfg.get("model", {}).get("cobra", {})
-    
+
+    # Configuration
+    if args.experiment_dir:
+        cobra_model, exp_cfg = load_cobra_from_experiment(args.experiment_dir, accelerator)
+        cobra_model = cobra_model.to(accelerator.device)
+        cobra_model.eval()
+
+        feat_cfg = exp_cfg.get("feat_dataset", {})
+        feat_dir = args.feat_dir or feat_cfg.get("feat_dir")
+        plane = args.plane or feat_cfg.get("plane", ["sagittal"])[0]
+        model_names = args.fm_model_names.split() if args.fm_model_names else feat_cfg.get("model_name", ["dinov2"])
+        if isinstance(model_names, str):
+            model_names = [model_names]
+        dataset_name = args.dataset_name or feat_cfg.get("dataset_name")
+        output_dir = args.output_dir or os.path.join(args.experiment_dir, "embed_cluster")
+        annotations_dir = args.annotations_dir or exp_cfg.get("annotations_dir")
+        if not annotations_dir:
+            raise ValueError(
+                "Cannot determine annotations_dir from experiment config. "
+                "Pass --annotations-dir explicitly."
+            )
+    else:
+        if not args.checkpoint_path:
+            parser.error("--checkpoint-path is required when --experiment-dir is not used")
+        if not args.feat_dir:
+            parser.error("--feat-dir is required when --experiment-dir is not used")
+        if not args.annotations_dir:
+            parser.error("--annotations-dir is required when --experiment-dir is not used")
+        if not args.output_dir:
+            parser.error("--output-dir is required when --experiment-dir is not used")
+
+        feat_dir = args.feat_dir
+        plane = args.plane or "sagittal"
+        model_names = args.fm_model_names.split() if args.fm_model_names else ["dinov2"]
+        dataset_name = args.dataset_name
+        output_dir = args.output_dir
+        annotations_dir = args.annotations_dir
+
+        # Load COBRA from pretrained checkpoint
+        pretrain_config_path = Path(args.checkpoint_path).parent / "config.yaml"
+        cobra_cfg = {}
+        if pretrain_config_path.exists():
+            with open(pretrain_config_path) as f:
+                pretrain_cfg = yaml.safe_load(f)
+            cobra_cfg = pretrain_cfg.get("model", {}).get("cobra", {})
+
+        cobra_model = load_pretrained_cobra(
+            checkpoint_path=args.checkpoint_path,
+            accelerator=accelerator,
+            model_config=cobra_cfg,
+            encoder_type="momentum",
+            fm_pooling=args.fm_pooling or "avg_pool",
+            sequence_encoder=args.sequence_encoder or "mamba2",
+            slice_pooling=args.slice_pooling or "abmil",
+        )
+        cobra_model = cobra_model.to(accelerator.device)
+        cobra_model.eval()
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    ds_meta = None
+    if dataset_name:
+        ds_meta = get_dataset_metadata(dataset_name)
+    else: 
+        raise ValueError("Cannot determine dataset name.")
+    if ds_meta is None:
+        raise ValueError("Cannot determine dataset metadata.")
+    target_labels = args.target_labels or ds_meta["target_labels"]
+    task = args.task or ds_meta["task"]
+    annotations_by_split = get_annotation_paths_by_split(
+        annotations_dir, task, ["train", "test"]
+    )
+    splits = list(annotations_by_split.keys())
+
     if accelerator.is_main_process:
         logger.info("=" * 60)
         logger.info("COBRA Embedding Extraction & Clustering")
         logger.info("=" * 60)
-        logger.info(f"Checkpoint: {args.checkpoint_path}")
-        logger.info(f"Feature dir: {args.feat_dir}")
-        logger.info(f"Annotations: {args.annotations_path}")
-        logger.info(f"Target labels: {args.target_labels}")
-        logger.info(f"Plane: {args.plane}")
-        logger.info(f"FM pooling: {args.fm_pooling}, Slice pooling: {args.slice_pooling}")
-        logger.info(f"Slice-level: {args.slice_level}, Method: {args.method}")
+        if args.experiment_dir:
+            logger.info(f"Experiment dir: {args.experiment_dir}")
+        logger.info(f"Feature dir: {feat_dir}")
+        logger.info(f"Target labels: {target_labels}")
+        logger.info(f"Plane: {plane}")
+        logger.info(f"Task: {task}, Slice-level: {args.slice_level}, Method: {args.method}, Supervised: {args.supervised}")
         logger.info("=" * 60)
-    
-    # Load COBRA
-    cobra_model = load_pretrained_cobra(
-        checkpoint_path=args.checkpoint_path,
-        accelerator=accelerator,
-        model_config=cobra_cfg,
-        encoder_type="momentum",
-        fm_pooling=args.fm_pooling,
-        sequence_encoder=args.sequence_encoder,
-        slice_pooling=args.slice_pooling,
-    )
-    cobra_model = cobra_model.to(accelerator.device)
-    cobra_model.eval()
-    
-    splits = ["train", "test"]
-    task = "multilabel" if len(args.target_labels) > 1 else "binary"
-    model_names = args.fm_model_names.split()
 
     cobra_model = accelerator.prepare(cobra_model)
 
     # Collect embeddings across splits
     vol_embeddings_list, vol_labels_list, vol_sample_ids = [], [], []
     slice_embeddings_list, slice_labels_list, slice_sample_ids = [], [], []
-    slice_positions_list, volume_ids_list = [], []
-    volume_offset = 0
 
     for split in splits:
         dataset = FeatClassificationDataset(
-            feat_dir=args.feat_dir,
+            feat_dir=feat_dir,
             slice_encoder_models=model_names,
-            view_plane=args.plane,
+            view_plane=plane,
             split=split,
-            annotations_path=args.annotations_path,
+            annotations_path=str(annotations_by_split[split]),
             task=task,
-            target_columns=args.target_labels,
+            target_columns=target_labels,
         )
         if accelerator.is_main_process:
             logger.info(f"Loaded {len(dataset)} samples from split '{split}'")
@@ -250,7 +273,7 @@ def main():
         dataloader = accelerator.prepare(dataloader)
 
         # Volume-level embeddings
-        vol_embs, vol_labs, vol_sids, _, _ = extract_embeddings(
+        vol_embs, vol_labs, vol_sids = extract_embeddings(
             cobra_model, dataloader, accelerator, slice_level=False
         )
         vol_embeddings_list.append(vol_embs)
@@ -259,15 +282,12 @@ def main():
 
         # Slice-level embeddings
         if args.slice_level:
-            sl_embs, sl_labs, sl_sids, sl_pos, sl_vids = extract_embeddings(
+            sl_embs, sl_labs, sl_sids = extract_embeddings(
                 cobra_model, dataloader, accelerator, slice_level=True
             )
             slice_embeddings_list.append(sl_embs)
             slice_labels_list.append(sl_labs)
             slice_sample_ids.extend(sl_sids)
-            slice_positions_list.append(sl_pos)
-            volume_ids_list.append(sl_vids + volume_offset)
-            volume_offset += len(vol_embs)
 
     if not accelerator.is_main_process:
         return
@@ -282,56 +302,69 @@ def main():
             "embeddings": vol_embeddings,
             "labels": vol_labels,
             "sample_ids": np.array(vol_sample_ids, dtype=object),
-            "target_labels": np.array(args.target_labels, dtype=object),
+            "target_labels": np.array(target_labels, dtype=object),
         }
         if args.slice_level:
             save_dict["slice_embeddings"] = np.concatenate(slice_embeddings_list, axis=0)
-            save_dict["slice_positions"] = np.concatenate(slice_positions_list, axis=0)
-            save_dict["volume_ids"] = np.concatenate(volume_ids_list, axis=0)
-        npz_path = os.path.join(args.output_dir, "embeddings.npz")
+            save_dict["slice_labels"] = np.concatenate(slice_labels_list, axis=0)
+        npz_path = os.path.join(output_dir, "embeddings.npz")
         np.savez(npz_path, **save_dict)
         logger.info(f"Saved embeddings to {npz_path}")
+
+    # Build label names from dataset metadata (or fallback formatting)
+    display_map = ds_meta.get("label_display_names") if ds_meta else None
+    multiclass_maps = ds_meta.get("multiclass_label_maps") if ds_meta else None
+
+    if task == "binary":
+        vol_label_names = build_binary_label_names(target_labels[0], display_map)
+    elif task == "multiclass":
+        vol_label_names = build_multiclass_label_names(target_labels[0], multiclass_maps)
+        if not vol_label_names:
+            unique_vals = sorted(np.unique(vol_labels).astype(int))
+            vol_label_names = [f"Class {v}" for v in range(max(unique_vals) + 1)]
+            logger.warning(
+                f"No multiclass display names for column '{target_labels[0]}'. "
+                f"Using auto-generated names: {vol_label_names}. "
+                f"Add entries to `eval_datasets.yaml` for readable legends."
+            )
+    else:
+        vol_label_names = build_multilabel_display_names(target_labels, display_map)
+
+    umap_kwargs = {"n_neighbors": args.n_neighbors, "min_dist": args.min_dist}
+    tsne_kwargs = {"perplexity": args.perplexity}
+    sup_tag = "_supervised" if args.supervised else ""
 
     # Plot 1: Volume embeddings colored by pathology
     plot_embedding_clustering(
         embeddings=vol_embeddings,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         labels=vol_labels,
-        label_names=[label.capitalize() for label in args.target_labels],
-        title=args.title or "Volume Embedding Space",
-        filename=f"{args.method}_{args.plane}_volume.png",
+        label_names=vol_label_names,
+        title=f"{dataset_name}",
+        filename=f"{dataset_name}_{args.method}_{plane}_embedding{sup_tag}.png",
         method=args.method,
+        umap_kwargs=umap_kwargs,
+        tsne_kwargs=tsne_kwargs,
+        supervised=args.supervised,
     )
 
-    # Slice-level plots
+    # Slice-level plot: colored by pathology
     if args.slice_level:
         slice_embeddings = np.concatenate(slice_embeddings_list, axis=0)
-        slice_positions = np.concatenate(slice_positions_list, axis=0)
-        volume_ids = np.concatenate(volume_ids_list, axis=0)
+        slice_labels = np.concatenate(slice_labels_list, axis=0)
         logger.info(f"Total slice embeddings: {slice_embeddings.shape}")
 
-        # Plot 2: Slice embeddings colored by position
         plot_embedding_clustering(
             embeddings=slice_embeddings,
-            output_dir=args.output_dir,
-            labels=slice_positions,
-            label_names=["Slice Position"],
-            title="Slice Embeddings (colored by position)",
-            filename=f"{args.method}_{args.plane}_slice_position.png",
-            continuous_color=True,
+            output_dir=output_dir,
+            labels=slice_labels,
+            label_names=vol_label_names,
+            title=f"{dataset_name}",
+            filename=f"{dataset_name}_{args.method}_{plane}_slice_embedding{sup_tag}.png",
             method=args.method,
-        )
-
-        # Plot 3: Slice embeddings colored by patient
-        plot_embedding_clustering(
-            embeddings=slice_embeddings,
-            output_dir=args.output_dir,
-            labels=volume_ids,
-            label_names=["Patient"],
-            title="Slice Embeddings (colored by patient)",
-            filename=f"{args.method}_{args.plane}_slice_patient.png",
-            continuous_color=True,
-            method=args.method,
+            umap_kwargs=umap_kwargs,
+            tsne_kwargs=tsne_kwargs,
+            supervised=args.supervised,
         )
 
 if __name__ == "__main__":

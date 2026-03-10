@@ -1,5 +1,5 @@
 """
-UMAP embedding visualization for volumetric-image features.
+UMAP / t-SNE embedding visualization for volumetric-image features.
 """
 
 import os
@@ -17,6 +17,13 @@ init_logging()
 logger = logging.getLogger(__name__)
 
 
+def _prepare_supervised_labels(labels: np.ndarray) -> np.ndarray:
+    """Convert labels to a 1-D integer array suitable for supervised UMAP."""
+    if labels.ndim == 2:
+        return np.array(["_".join(str(int(v)) for v in row) for row in labels])
+    return labels.astype(int)
+
+
 def plot_embedding_clustering(
     embeddings: np.ndarray,
     output_dir: str,
@@ -29,6 +36,7 @@ def plot_embedding_clustering(
     continuous_color: bool = False,
     method: str = 'umap',
     tsne_kwargs: Optional[Dict] = None,
+    supervised: bool = False,
 ) -> str:
     """
     Visualize embeddings using UMAP or t-SNE dimensionality reduction.
@@ -48,6 +56,7 @@ def plot_embedding_clustering(
         continuous_color: If True, treat labels as continuous values and use colormap
         method: Dimensionality reduction method ('umap' or 'tsne')
         tsne_kwargs: Additional arguments for t-SNE
+        supervised: Only valid for method='umap'. If True, use labels to guide UMAP layout.
     
     Returns:
         Path to saved figure
@@ -63,6 +72,8 @@ def plot_embedding_clustering(
         }
         if tsne_kwargs:
             default_tsne_kwargs.update(tsne_kwargs)
+        if supervised:
+            logger.warning("Supervised mode is not supported for t-SNE, falling back to unsupervised.")
         logger.info(f"Running t-SNE on {len(embeddings)} samples...")
         reducer = TSNE(n_components=2, **default_tsne_kwargs)
         embedding_2d = reducer.fit_transform(embeddings)
@@ -75,9 +86,17 @@ def plot_embedding_clustering(
         }
         if umap_kwargs:
             default_umap_kwargs.update(umap_kwargs)
-        logger.info(f"Running UMAP on {len(embeddings)} samples...")
         reducer = umap.UMAP(n_components=2, **default_umap_kwargs)
-        embedding_2d = reducer.fit_transform(embeddings)
+
+        if supervised and labels is not None and not continuous_color:
+            y = _prepare_supervised_labels(labels)
+            logger.info(f"Running supervised UMAP on {len(embeddings)} samples...")
+            embedding_2d = reducer.fit_transform(embeddings, y=y)
+        else:
+            if supervised:
+                logger.warning("Supervised UMAP requires categorical labels; falling back to unsupervised.")
+            logger.info(f"Running UMAP on {len(embeddings)} samples...")
+            embedding_2d = reducer.fit_transform(embeddings)
     
     # Class labels
     if labels is not None and labels.ndim == 2:
@@ -91,12 +110,12 @@ def plot_embedding_clustering(
             'UMAP2': embedding_2d[:, 1],
             'Label': combined_labels,
         })
-    elif labels is not None:
-        # Binary label
+    elif labels is not None and not continuous_color:
+        # Categorical labels (binary or multiclass): label_names[i] maps label value i to display name
         if label_names:
-            label_strs = [label_names[int(l)] for l in labels]
+            label_strs = [label_names[int(v)] for v in labels]
         else:
-            label_strs = [str(int(l)) for l in labels]
+            label_strs = [str(int(v)) for v in labels]
         df = pd.DataFrame({
             'UMAP1': embedding_2d[:, 0],
             'UMAP2': embedding_2d[:, 1],

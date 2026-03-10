@@ -10,52 +10,73 @@
 #SBATCH --time=1:00:00                 
 #SBATCH --job-name=embed_cluster_%j
 #SBATCH --output=stdout_embed_cluster_%j.txt    
-#SBATCH --account=rwth1833    
+#SBATCH --account=p0021834    
 
 ### Setup
 source .venv/bin/activate
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
-CHECKPOINT_PATH="/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet/2025-12-02-03:07/medslim_test_run_MRNet-epoch2000.pth.tar"
-FEAT_DIR="/hpcwork/rwth1833/feat_caches/MRNet/slices_32"
-ANNOTATIONS_PATH="/hpcwork/rwth1833/datasets/preprocessed/MRNet/test.csv"
-OUTPUT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/embed_cluster/MRNet-2026-01-09-04:55"
-
-# Model settings
-FM_MODEL_NAMES="dinov2 rad-dino medsiglip ark biomedclip"
-FM_POOLING="mean"  # Options: "mean", "concat"
-SEQUENCE_ENCODER="mamba2"
-SLICE_POOLING="abmil"
-
-# Data settings
-SPLIT="test"
+CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-02-15-11:55/medslim-epoch2000.pth.tar"
+FEAT_DIR="/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+ANNOTATIONS_DIR="/hpcwork/rwth1833/datasets/preprocessed/MRNet"
+OUTPUT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/embed_cluster"
+DATASET_NAME="MRNet"
 PLANE="sagittal"
-TARGET_LABELS="abnormal acl meniscus"  # Space-separated pathology labels
+FM_MODEL_NAMES="dinov2 medsiglip ark mri-core"
+
+# Recommended future mode once experiment configs include cobra_config:
+# EXPERIMENT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/meniscus_sagittal_2026-02-19-06:18"
 
 # Visualization settings
-TITLE="MRNet Embedding Space"
+METHOD="umap"           # Options: "umap", "tsne"
+SLICE_LEVEL=true       # Set to true for slice-level embeddings
+SUPERVISED=false        # Set to true for supervised UMAP (uses pathology labels to guide layout)
+
+# UMAP hyperparameters
+N_NEIGHBORS=30
+MIN_DIST=0.05
+
+# t-SNE hyperparameters
+PERPLEXITY=30.0
+
+### Build extra args
+EXTRA_ARGS=""
+
+if [[ "${SLICE_LEVEL}" == "true" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --slice-level"
+fi
+
+if [[ "${SUPERVISED}" == "true" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --supervised"
+fi
 
 ### Run script
-echo "Starting COBRA embedding extraction and UMAP clustering..."
+echo "Starting COBRA embedding extraction and ${METHOD} clustering..."
 echo "Checkpoint: ${CHECKPOINT_PATH}"
-echo "Target labels: ${TARGET_LABELS}"
-echo "Plane: ${PLANE}, Split: ${SPLIT}"
+echo "Dataset: ${DATASET_NAME}"
 
 python -m med_slim.eval.embed_cluster \
   --checkpoint-path "${CHECKPOINT_PATH}" \
   --feat-dir "${FEAT_DIR}" \
-  --annotations-path "${ANNOTATIONS_PATH}" \
+  --annotations-dir "${ANNOTATIONS_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
-  --split "${SPLIT}" \
+  --dataset-name "${DATASET_NAME}" \
   --plane "${PLANE}" \
   --fm-model-names "${FM_MODEL_NAMES}" \
-  --target-labels ${TARGET_LABELS} \
-  --fm-pooling "${FM_POOLING}" \
-  --sequence-encoder "${SEQUENCE_ENCODER}" \
-  --slice-pooling "${SLICE_POOLING}" \
-  --title "${TITLE}" \
-  --save-embeddings
+  --method "${METHOD}" \
+  --n-neighbors $N_NEIGHBORS \
+  --min-dist $MIN_DIST \
+  --perplexity $PERPLEXITY \
+  --save-embeddings \
+  ${EXTRA_ARGS}
+
+# Future experiment-dir mode:
+# python -m med_slim.eval.embed_cluster \
+#   --experiment-dir "${EXPERIMENT_DIR}" \
+#   --method "${METHOD}" \
+#   --save-embeddings \
+#   ${EXTRA_ARGS}
 
 echo "Embedding extraction and clustering complete!"
 echo "Output saved to: ${OUTPUT_DIR}"

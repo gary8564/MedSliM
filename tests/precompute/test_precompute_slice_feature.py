@@ -16,7 +16,8 @@ import torchio as tio
 from pathlib import Path
 
 from med_slim.data.slice_dataset import SliceDataset, slice_collate_fn
-from med_slim.utils.preprocessing.transforms import get_transforms, get_model_config
+from med_slim.utils.preprocessing.transforms import get_transforms
+from med_slim.utils.model_config import get_slice_encoder_config
 from med_slim.model.slice_encoder import build_slice_encoder
 
 def _make_synthetic_dataset(tmp_path: Path, num_samples: int = 2) -> Path:
@@ -48,7 +49,7 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
 
     def setUp(self):
         self.model_name = "biomedclip"
-        self.cfg = get_model_config(self.model_name)
+        self.cfg = get_slice_encoder_config(self.model_name)
         self.H_crop, self.W_crop = tuple(self.cfg["img_size"])
         self.num_slices = 32
 

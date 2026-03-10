@@ -5,7 +5,8 @@ import torchio as tio
 import pandas as pd
 
 from med_slim.data.slice_dataset import SliceDataset
-from med_slim.utils.preprocessing.transforms import get_transforms, get_model_config
+from med_slim.utils.preprocessing.transforms import get_transforms
+from med_slim.utils.model_config import get_slice_encoder_config
 
 DATA_ROOT = Path("/hpcwork/rwth1833/datasets/preprocessed/MRNet")
 
@@ -16,7 +17,7 @@ def test_slicedataset_shapes_and_metadata():
 
     # Load config to derive expected spatial sizes
     model_name = "dinov2"
-    cfg = get_model_config(model_name)
+    cfg = get_slice_encoder_config(model_name)
     H_crop, W_crop = tuple(cfg["img_size"])
     D = 32 
 
