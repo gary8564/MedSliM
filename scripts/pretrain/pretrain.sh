@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem-per-cpu=8G
 #SBATCH --time=24:00:00                 
-#SBATCH --job-name=medslim_linspace_balanced_sampling
+#SBATCH --job-name=medslim_test_run_MRNet
 #SBATCH --output=logs/pretrain/stdout_pretrain_linspace_balanced_sampling_%j.txt    
 #SBATCH --account=p0021834    
 

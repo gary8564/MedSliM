@@ -66,6 +66,8 @@ class Cobra(nn.Module):
         sequence_encoder: str = "mamba2",
         fm_pooling: str = "avg_pool",
         slice_pooling: str = "abmil",
+        pooling_target: str = "post_embed",
+        raw_output_dim: int = None,
         **kwargs
     ):
         """
@@ -82,6 +84,11 @@ class Cobra(nn.Module):
                 - 'avg_pool': Average pool embeddings across foundation models.
                 - 'attention': Learn attention weights to pool FM embeddings per slice (requires fine-tuning).
             slice_pooling: 'abmil' or 'cls' (cls requires transformer).
+            pooling_target: Which representation to aggregate at inference (ABMIL only).
+                - 'post_embed': Pool from post-Embed-MLP features (default).
+                - 'raw': Pool from original FM patch embeddings, as proposed in COBRA paper.
+            raw_output_dim: FM embedding dimension for the 'raw' pooling target.
+                Required when pooling_target='raw'.
             **kwargs: Additional encoder-specific parameters:
                 - d_state: Mamba2 state dimension (default: 128)
                 - dim_feedforward: Transformer FFN dimension (default: 4*embed_dim)
@@ -101,9 +108,19 @@ class Cobra(nn.Module):
         assert slice_pooling in ["abmil", "cls"], f"Invalid slice_pooling '{slice_pooling}'. Must be one of 'abmil', 'cls'."
         if slice_pooling == "cls" and sequence_encoder != "transformer":
                 raise ValueError(f"slice_pooling='cls' requires sequence_encoder='transformer'. Got {sequence_encoder}.")
+        assert pooling_target in ["post_embed", "raw"], (
+            f"Invalid pooling_target '{pooling_target}'. Must be one of 'post_embed', 'raw'."
+        )
+        if pooling_target == "raw":
+            if slice_pooling == "cls":
+                raise ValueError("pooling_target='raw' is not compatible with slice_pooling='cls'.")
+            if raw_output_dim is None:
+                raise ValueError("raw_output_dim is required when pooling_target='raw'.")
 
         self.mode = mode
         self.embed_dim = embed_dim
+        self.pooling_target = pooling_target
+        self._raw_output_dim = raw_output_dim
         self.sequence_encoder = sequence_encoder
         self.fm_pooling = fm_pooling
         self.slice_pooling = slice_pooling
@@ -186,6 +203,13 @@ class Cobra(nn.Module):
                 n_heads=1,
                 activation='softmax',
             )
+
+    @property
+    def output_dim(self) -> int:
+        """Dimension of the volume-level output embedding, accounting for pooling_target."""
+        if self.pooling_target == "raw":
+            return self._raw_output_dim
+        return self.embed_dim
 
     def _build_mask(self, seq_lengths: torch.Tensor, max_len: int) -> torch.Tensor:
         """Build boolean mask from sequence lengths. True = valid, False = padded."""
@@ -440,7 +464,11 @@ class Cobra(nn.Module):
             pooled = torch.bmm(A, h).squeeze(1)  # [B, embed_dim]
             return self.proj(pooled)
         else:
-            return torch.bmm(A, logits).squeeze(1)  # [B, embed_dim]
+            if self.pooling_target == "raw":
+                raw_x = x[0] if isinstance(x, list) else x
+                return torch.bmm(A, raw_x).squeeze(1)  # [B, raw_output_dim]
+            else:  # post_embed (default)
+                return torch.bmm(A, logits).squeeze(1)  # [B, embed_dim]
 
     def forward(
         self, 
@@ -470,7 +498,7 @@ class Cobra(nn.Module):
             If get_attention=True: Attention map [B, 1, num_slices]
             If get_per_head_attention=True: Per-head attention [B, num_heads, num_slices]
             If return_slice_embeddings=True: Slice embeddings [B, num_slices, embed_dim]
-            Otherwise: Features [B, contrast_dim] (train) or [B, embed_dim] (inference)
+            Otherwise: Features [B, contrast_dim] (train) or [B, output_dim] (inference)
         """
         return self._forward(
             x,

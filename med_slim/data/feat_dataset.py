@@ -311,7 +311,13 @@ class PrecomputedFeatPairDataset(Dataset):
         elif num_slices > target:
             # Uniformly subsample target indices, preserving anatomical order
             # indices = np.sort(np.random.choice(num_slices, size=target, replace=False))
-            indices = np.round(np.linspace(0, num_slices - 1, target)).astype(int)
+            # Evenly spaced indices, preserving anatomical order
+            # indices = np.round(np.linspace(0, num_slices - 1, target)).astype(int)
+            # Evenly-spaced subsampling with small random jitter
+            base_indices = np.linspace(0, num_slices - 1, target)
+            jitter = np.random.randint(-2, 3, size=target)  # random offset in [-2, +2]
+            indices = np.clip(np.round(base_indices + jitter), 0, num_slices - 1).astype(int)
+            indices = np.sort(np.unique(indices))
             return feats[indices], target
         else:
             # Zero-pad to target length
@@ -504,6 +510,83 @@ class FeatClassificationDataset(Dataset):
             "seq_length": seq_lengths[0],
             "label": label,
             "sample_id": sample_id
+        }
+
+
+class UnlabeledFeatDataset(Dataset):
+    """
+    Dataset for loading precomputed features without annotations for plotting embeddings.
+
+    Scans ``{feat_dir}/{model_name}/{split}/{plane}/*.safetensors`` and returns
+    raw feature tensors with a dummy label.  Metadata (dataset name, plane) is
+    tracked externally by the caller.
+
+    Directory structure: {feat_dir}/{model_name}/{split}/{plane}/*.safetensors
+    """
+
+    def __init__(
+        self,
+        feat_dir: str,
+        slice_encoder_models: List[str],
+        split: str,
+        view_plane: str,
+    ):
+        self.feat_dir = feat_dir
+        self.slice_encoder_models = slice_encoder_models
+        self.view_plane = view_plane
+        self.split = split
+
+        first_model = slice_encoder_models[0]
+        feat_path = os.path.join(feat_dir, first_model, split, view_plane)
+        if not os.path.exists(feat_path):
+            raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
+
+        self.feat_files = sorted(glob(os.path.join(feat_path, "*.safetensors")))
+        if len(self.feat_files) == 0:
+            raise FileNotFoundError(f"No .safetensors files found in {feat_path}")
+
+        self.id_filename_map = {}
+        for f in self.feat_files:
+            fname = os.path.basename(f)
+            fid = fname.split(".")[0]
+            self.id_filename_map[fid] = fname
+
+        self.sample_ids = list(self.id_filename_map.keys())
+
+        self.feat_paths = {}
+        for model_name in slice_encoder_models:
+            p = os.path.join(feat_dir, model_name, split, view_plane)
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Feature path {p} does not exist!")
+            self.feat_paths[model_name] = p
+
+    def __len__(self) -> int:
+        return len(self.sample_ids)
+
+    def __getitem__(self, idx: int) -> Dict:
+        sample_id = self.sample_ids[idx]
+        filename = self.id_filename_map[sample_id]
+
+        feat_embeds = []
+        seq_lengths = []
+        for model_name in self.slice_encoder_models:
+            feat_file = os.path.join(self.feat_paths[model_name], filename)
+            with safe_open(feat_file, framework="pt", device="cpu") as f:
+                feat = f.get_tensor("feats")
+            seq_lengths.append(feat.shape[0])
+            feat_embeds.append(feat)
+
+        if len(seq_lengths) > 1:
+            assert all(s == seq_lengths[0] for s in seq_lengths), (
+                f"Sequence length mismatch for {sample_id}: "
+                f"{dict(zip(self.slice_encoder_models, seq_lengths))}"
+            )
+
+        return {
+            "feature_embeds": feat_embeds,
+            "seq_length": seq_lengths[0],
+            "label": torch.tensor(0, dtype=torch.long),
+            "sample_id": sample_id,
         }
 
 

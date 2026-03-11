@@ -18,6 +18,8 @@ def _build_cobra(
     sequence_encoder: str,
     slice_pooling: str,
     fm_pooling: str,
+    pooling_target: str = "post_embed",
+    raw_output_dim: Optional[int] = None,
 ) -> Cobra:
     """Construct a COBRA model in inference mode from model configuration."""
     embed_dim = model_config["embed_dim"]
@@ -49,6 +51,8 @@ def _build_cobra(
         sequence_encoder=sequence_encoder,
         fm_pooling=fm_pooling,
         slice_pooling=slice_pooling,
+        pooling_target=pooling_target,
+        raw_output_dim=raw_output_dim,
         **encoder_kwargs,
     )
 
@@ -61,6 +65,8 @@ def load_pretrained_cobra(
     fm_pooling: str = "avg_pool",
     sequence_encoder: Optional[str] = None,
     slice_pooling: Optional[str] = None,
+    pooling_target: str = "post_embed",
+    raw_output_dim: Optional[int] = None,
 ) -> Cobra:
     """
     Load the COBRA model from a pretrained checkpoint.
@@ -73,6 +79,8 @@ def load_pretrained_cobra(
     - fm_pooling (str): Feature aggregation method. Default is "avg_pool".
     - sequence_encoder (str, optional): Override sequence encoder type. If None, uses checkpoint or defaults to "mamba2".
     - slice_pooling (str, optional): Override slice pooling type. If None, uses saved checkpoint.
+    - pooling_target (str): Which representation to pool at inference ('post_embed', 'raw').
+    - raw_output_dim (int, optional): FM embedding dimension, required when pooling_target='raw'.
 
     Returns:
     - Cobra: The loaded COBRA model in inference mode.
@@ -89,9 +97,9 @@ def load_pretrained_cobra(
         sequence_encoder = state_dict.get("sequence_encoder", "mamba2")  # Default for older checkpoints
     if slice_pooling is None:
         slice_pooling = state_dict.get("pooling", "abmil")  # Default for older checkpoints
-    logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}")
+    logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, pooling_target={pooling_target}")
     
-    model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling)
+    model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target, raw_output_dim)
     
     # Extract encoder weights from checkpoint
     if "state_dict" not in list(state_dict.keys()):

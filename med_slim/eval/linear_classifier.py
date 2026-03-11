@@ -774,7 +774,7 @@ def run_single_view_evaluation(
     
     # Get dimensions
     num_classes = get_num_classes(task, cfg["target_labels"], train_dataset)
-    input_dim = cobra_model.embed_dim
+    input_dim = cobra_model.output_dim
     
     if accelerator.is_main_process:
         logger.info(f"Num classes: {num_classes}, COBRA output dim: {input_dim}")
@@ -902,7 +902,7 @@ def collect_predictions_per_view_classifier(
     
     # Get dimensions
     num_classes = get_num_classes(task, cfg["target_labels"], train_subset.dataset)
-    input_dim = cobra_model.embed_dim
+    input_dim = cobra_model.output_dim
     
     # Initialize model
     freeze_cobra = cfg.get("freeze_cobra", True)
@@ -1647,7 +1647,7 @@ def run_multiview_evaluation(
     
     # Get dimensions
     num_classes = get_num_classes(task, cfg["target_labels"], train_dataset)
-    input_dim = cobra_model.embed_dim
+    input_dim = cobra_model.output_dim
     
     if accelerator.is_main_process:
         logger.info(f"Num classes: {num_classes}, COBRA output dim: {input_dim}")
@@ -1824,6 +1824,12 @@ def main(args):
             dir=output_dir,
         )
     
+    # Determine raw FM output dimension for 'raw' pooling target
+    raw_output_dim = None
+    if args.pooling_target == "raw":
+        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
+        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
+
     # Load pretrained COBRA model
     if accelerator.is_main_process:
         logger.info("Loading pretrained COBRA model...")
@@ -1835,7 +1841,9 @@ def main(args):
         encoder_type=cfg["encoder_type"],
         fm_pooling=args.fm_pooling,
         sequence_encoder=args.sequence_encoder,  
-        slice_pooling=args.slice_pooling, 
+        slice_pooling=args.slice_pooling,
+        pooling_target=args.pooling_target,
+        raw_output_dim=raw_output_dim,
     )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
@@ -2017,6 +2025,15 @@ if __name__ == "__main__":
         type=str,
         choices=["abmil", "cls"],
         default=None,
+    )
+    parser.add_argument(
+        "--pooling-target",
+        type=str,
+        choices=["post_embed", "raw"],
+        default="post_embed",
+        help="Determines which representation to aggregate at inference: "
+             "'post_embed': after Embed MLP (default), "
+             "'raw': original FM patch embeddings proposed in COBRA paper."
     )
     args = parser.parse_args()
     main(args)

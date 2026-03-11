@@ -4,25 +4,22 @@ encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
 
 feat_dataset:
-  dataset_name: "kneeMRI" # "MRNet"
-  feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
+  dataset_name: "MRNet" # "MRNet"
+  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_32/crop"
   plane:
     - "sagittal"
     # - "coronal"
     # - "axial"
   model_name:
-    - "dinov2"
-    - "medsiglip"
-    - "ark"
     - "mri-core"
 
-annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/MRNet"
 output_dir: "/hpcwork/rwth1833/experiments/MedSliM-linear-probing"
 
 # Hyperparameters
 # Note: For fine-tuning, use lower learning rate and enable early stopping
 hyperparams:
-  batch_size: 1
+  batch_size: 16
   base_lr: 1e-5 # Base learning rate for linear heads (and optionally for fm_attn)
   backbone_lr_scale: 0.1 # COBRA backbone learning rate = base_lr * backbone_lr_scale when fine-tuning COBRA
   weight_decay: 0.01  # L2 regularization to prevent overfitting

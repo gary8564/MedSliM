@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G 
-#SBATCH --time=3:00:00                 
+#SBATCH --time=1:00:00                 
 #SBATCH --job-name=lp_binary_classification_%j
 #SBATCH --output=stdout_lp_binary_classification_%j.txt    
 #SBATCH --account=p0021834    
@@ -18,12 +18,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
 CONFIG_PATH="./med_slim/configs/linear_classifier.yml"
-CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-02-16-11:36/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
-FINE_TUNE=true  # whether to fine-tune COBRA backbone
+CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-01-09-04:53/medslim_test_run_MRNet-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
+FINE_TUNE=false  # whether to fine-tune COBRA backbone
 FM_POOLING="avg_pool"  # Options: "avg_pool", "attention" (attention requires fine-tuning COBRA)
 SEQUENCE_ENCODER="mamba2"
 SLICE_POOLING="cls" # Only used when sequence encoder is transformer
-FM_MODEL_NAMES="dinov2 medsiglip ark mri-core" 
+FM_MODEL_NAMES="mri-core" 
+POOLING_TARGET="raw"
 
 EXTRA_ARGS=""
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
@@ -48,6 +49,7 @@ python ./med_slim/eval/linear_classifier.py \
   --weighted-loss \
   --fm-pooling "${FM_POOLING}" \
   --sequence-encoder "${SEQUENCE_ENCODER}" \
+  --pooling-target "${POOLING_TARGET}" \
   ${EXTRA_ARGS}
 
 echo "Linear probing evaluation complete!"
