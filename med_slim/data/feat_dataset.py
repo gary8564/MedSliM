@@ -6,6 +6,7 @@ import random
 import os
 import logging
 from typing import List, Tuple, Dict
+from concurrent.futures import ThreadPoolExecutor
 from torch.utils.data import Dataset
 from glob import glob
 from tqdm import tqdm
@@ -143,7 +144,8 @@ class PrecomputedFeatPairDataset(Dataset):
                  view_planes: List[str], 
                  split: str, 
                  max_feature_dim: int,
-                 num_target_slices: int = 32):
+                 num_target_slices: int = 32,
+                 cache_in_memory: bool = False):
         """
         Args:
             feat_dirs: List of dicts with keys "name" (dataset name) and "feat_dir" (path to features)
@@ -154,6 +156,7 @@ class PrecomputedFeatPairDataset(Dataset):
             num_target_slices: Target number of slices for all outputs. Volumes with more slices 
                                are uniformly subsampled (order-preserving); volumes with fewer are 
                                zero-padded. Default: 32.
+            cache_in_memory: If True, preload all feature tensors into RAM at init to eliminate per-epoch disk I/O.
         """
         self.feat_dirs = feat_dirs
         self.slice_encoder_models = slice_encoder_models
@@ -165,6 +168,9 @@ class PrecomputedFeatPairDataset(Dataset):
         self.feat_dir_map: Dict[str, str] = {}
         self.feat_path_dict = self._get_feat_path_dict_by_study_id()
         self.study_ids = list(self.feat_path_dict.keys())
+        self._feat_cache: Dict[str, torch.Tensor] = {}
+        if cache_in_memory:
+            self._preload_all_features()
     
     @staticmethod
     def _extract_exam_id(uid: str) -> str:
@@ -274,6 +280,52 @@ class PrecomputedFeatPairDataset(Dataset):
         return os.path.join(
             self.feat_dir_map[study_id], model_name, self.split, plane, f"{uid}.safetensors"
         )
+        
+    def _load_feats(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
+        with safe_open(feat_path, framework="pt", device="cpu") as f:
+            feats = f.get_tensor("feats")
+            metadata = f.metadata()
+        assert feats.ndim == 2, f"Expected number of dimensions to be 2, but got {feats.ndim=}!"
+        assert metadata["plane"] in self.view_planes, f"Expected plane to be in {self.view_planes}, but got {metadata['plane']}!"
+        assert metadata["model_name"] in self.slice_encoder_models, f"Expected model name to be in {self.slice_encoder_models}, but got {metadata['model_name']}!"
+        return feats, metadata
+
+    def _preload_all_features(self) -> None:
+        """
+        Preload all feature tensors into RAM using multi-threaded I/O.
+        After this call, `_get_feats` returns tensors from an in-memory dict instead of hitting the filesystem, eliminating all per-epoch disk I/O.
+        """
+        unique_paths: set[str] = set()
+        for study_id in self.study_ids:
+            for plane, uid_list in self.feat_path_dict[study_id].items():
+                for uid in uid_list:
+                    for model in self.slice_encoder_models:
+                        unique_paths.add(self._get_feat_path(study_id, model, plane, uid))
+
+        logger.info(f"Preloading {len(unique_paths)} feature files into memory "
+                     f"(multi-threaded I/O)...")
+
+        total_bytes = 0
+        with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 8)) as pool:
+            results = pool.map(lambda p: (p, self._load_feats(p)), unique_paths)
+            for path, (tensor, _metadata) in tqdm(
+                results,
+                total=len(unique_paths),
+                desc="Caching features in RAM",
+            ):
+                self._feat_cache[path] = tensor
+                total_bytes += tensor.nelement() * tensor.element_size()
+
+        logger.info(f"Feature cache ready: {len(self._feat_cache)} tensors, "
+                     f"{total_bytes / 1e9:.2f} GB in RAM")
+
+    def _get_feats(self, feat_path: str) -> torch.Tensor:
+        """Return features from in-memory cache. If not found, load from disk."""
+        cached = self._feat_cache.get(feat_path)
+        if cached is not None:
+            return cached
+        with safe_open(feat_path, framework="pt", device="cpu") as f:
+            return f.get_tensor("feats")
 
     def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
@@ -325,15 +377,6 @@ class PrecomputedFeatPairDataset(Dataset):
             padded = torch.nn.functional.pad(feats, (0, 0, 0, pad_size), value=0.0)
             return padded, num_slices  # actual number of slices for masking
     
-    def _load_feats(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
-        with safe_open(feat_path, framework="pt", device="cpu") as f:
-            feats = f.get_tensor("feats")
-            metadata = f.metadata()
-        assert feats.ndim == 2, f"Expected number of dimensions to be 2, but got {feats.ndim=}!"
-        assert metadata["plane"] in self.view_planes, f"Expected plane to be in {self.view_planes}, but got {metadata['plane']}!"
-        assert metadata["model_name"] in self.slice_encoder_models, f"Expected model name to be in {self.slice_encoder_models}, but got {metadata['model_name']}!"
-        return feats, metadata
-    
     def __len__(self):
         return len(self.study_ids)
 
@@ -352,11 +395,8 @@ class PrecomputedFeatPairDataset(Dataset):
         fm1, fm2 = random.sample(self.slice_encoder_models, 2)
         feat_path1 = self._get_feat_path(study_id, fm1, selected_view_plane, selected_uid)
         feat_path2 = self._get_feat_path(study_id, fm2, selected_view_plane, selected_uid)
-        feats1, metadata1 = self._load_feats(feat_path1)
-        feats2, metadata2 = self._load_feats(feat_path2)
-        
-        assert metadata1["plane"] == metadata2["plane"], \
-            f"Expected plane to be equal, but got {metadata1['plane']} and {metadata2['plane']}!"
+        feats1 = self._get_feats(feat_path1)
+        feats2 = self._get_feats(feat_path2)
         
         assert feats1.shape[0] == feats2.shape[0], (
             f"Expected same number of slices for positive pair (same patient with same view plane and MRI sequence), "
@@ -368,10 +408,9 @@ class PrecomputedFeatPairDataset(Dataset):
         feats1, seq_len = self._sample_or_pad_slices(feats1)
         feats2, _ = self._sample_or_pad_slices(feats2)
         
-        with torch.no_grad():
-            # Pad feature dimension to max_feature_dim
-            feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
-            feats2, orig_embed_dim2 = self._pad_feature_dim(feats2) 
+        # Pad feature dimension to max_feature_dim to ensure consistent batch size
+        feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
+        feats2, orig_embed_dim2 = self._pad_feature_dim(feats2)
         
         assert feats1.shape[1] == feats2.shape[1], \
             f"Expected embed_dim to be equal, but got {feats1.shape[1]} and {feats2.shape[1]}!"

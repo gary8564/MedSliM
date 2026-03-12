@@ -63,7 +63,7 @@ def main(args, cfg):
 
     # Initialize Weights & Biases on main process
     if accelerator.is_main_process:
-        run_name = f"test-run-MRNet-{args.sequence_encoder}-{args.pooling}-{CURR_TIME}"
+        run_name = f"MRNet-fastMRI-KMAR50K-{args.sequence_encoder}-{args.pooling}-{CURR_TIME}"
         wandb.init(
             project="MedSliM-pretraining",
             name=run_name,
@@ -118,6 +118,14 @@ def main(args, cfg):
     max_feature_dim = max(cobra_cfg["input_dims"])
     feat_cfg = cfg["feat_dataset"]
     feat_dirs = feat_cfg["datasets"]
+
+    # If features were staged to local SSD, rewrite base paths
+    local_base = os.environ.get("MEDSLIM_FEAT_BASE_OVERRIDE")
+    if local_base:
+        hpcwork_base = "/hpcwork/rwth1833/feat_caches"
+        for ds in feat_dirs:
+            ds["feat_dir"] = ds["feat_dir"].replace(hpcwork_base, local_base)
+        print(f"Using local SSD feature cache: {local_base}")
     slice_encoder_models = feat_cfg["model_name"]
     view_planes = feat_cfg["plane"]
     num_target_slices = feat_cfg.get("num_target_slices", 32)
@@ -129,6 +137,7 @@ def main(args, cfg):
         split="train",
         max_feature_dim=max_feature_dim,
         num_target_slices=num_target_slices,
+        cache_in_memory=True,
     )
 
     # Optional: convert to SyncBatchNorm when training across processes for parity with DDP
