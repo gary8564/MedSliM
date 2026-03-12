@@ -368,8 +368,7 @@ class PrecomputedFeatPairDataset(Dataset):
             # Evenly-spaced subsampling with small random jitter
             base_indices = np.linspace(0, num_slices - 1, target)
             jitter = np.random.randint(-2, 3, size=target)  # random offset in [-2, +2]
-            indices = np.clip(np.round(base_indices + jitter), 0, num_slices - 1).astype(int)
-            indices = np.sort(np.unique(indices))
+            indices = np.sort(np.clip(np.round(base_indices + jitter), 0, num_slices - 1).astype(int))
             return feats[indices], target
         else:
             # Zero-pad to target length
