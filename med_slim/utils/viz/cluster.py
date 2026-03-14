@@ -11,6 +11,7 @@ import umap
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import normalize
 from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
 import logging
 from typing import Optional, List, Tuple, Dict
 
@@ -207,3 +208,59 @@ def plot_embedding_clustering(
     
     logger.info(f"Saved UMAP plot to {filepath}")
     return filepath
+
+
+def compute_silhouette(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    metric: str = "cosine",
+    sample_size: Optional[int] = 10000,
+) -> Optional[float]:
+    """
+    Compute the silhouette score on the original embeddings before dimensionality reduction.
+
+    The score measures how well clusters (defined by ``labels``) are separated
+    in the embedding space.  
+    A higher score (closer to +1) indicates better separation; 
+    values near 0 indicate overlapping clusters; 
+    negative values indicate misassignment.
+
+    Args:
+        embeddings: [N, D] feature array.
+        labels: [N] or [N, num_labels] label array.  For multi-label, labels
+                are converted to composite string keys.
+        metric: Distance metric (default: ``"cosine"``).
+        sample_size: If not None and N > sample_size, randomly subsample
+                     for tractability (silhouette is O(N^2)).
+
+    Returns:
+        Silhouette score (float), or None if fewer than 2 unique labels.
+    """
+    embeddings = normalize(embeddings, norm="l2")
+
+    if labels.ndim == 2:
+        flat_labels = np.array([
+            "_".join(str(int(v)) for v in row) for row in labels
+        ])
+    elif labels.dtype.kind in ("U", "S", "O"):
+        flat_labels = labels
+    else:
+        flat_labels = labels.astype(int)
+
+    unique = np.unique(flat_labels)
+    if len(unique) < 2:
+        logger.warning(
+            "Silhouette score requires at least 2 distinct labels; "
+            f"found {len(unique)}. Skipping."
+        )
+        return None
+
+    if sample_size is not None and len(embeddings) > sample_size:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(embeddings), size=sample_size, replace=False)
+        embeddings = embeddings[idx]
+        flat_labels = flat_labels[idx]
+
+    score = silhouette_score(embeddings, flat_labels, metric=metric)
+    logger.info(f"Silhouette score ({metric}): {score:.4f}")
+    return float(score)

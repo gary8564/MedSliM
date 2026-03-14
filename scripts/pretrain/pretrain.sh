@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem-per-cpu=8G
-#SBATCH --time=6:00:00                 
+#SBATCH --time=12:00:00                 
 #SBATCH --job-name=medslim_ablation_study
 #SBATCH --output=logs/pretrain/stdout_pretrain_ablation_study_abmil_choice_%j.txt    
 #SBATCH --account=p0021834     
@@ -44,7 +44,7 @@ MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark"
 # Staging to $TMPDIR speeds up that initial bulk read from ~50 min to ~2 min.
 FEAT_BASE="/hpcwork/rwth1833/feat_caches"
 STAGE_TO_LOCAL=true   # set to false to skip staging and read directly from /hpcwork
-FEAT_CACHE_SUBDIR=("MRNet/slices_raw/crop") # "fastMRI/slices_raw/adaptive" "KMAR-50K/slices_raw/adaptive")
+FEAT_CACHE_SUBDIR=("MRNet/slices_raw/crop" "KMAR-50K/slices_raw/adaptive" "fastMRI/slices_raw/adaptive")
 if $STAGE_TO_LOCAL && [ -n "$TMPDIR" ] && [ -d "$TMPDIR" ]; then
     LOCAL_BASE="$TMPDIR/feat_caches"
     echo "Staging feature caches to local SSD ($LOCAL_BASE)..."

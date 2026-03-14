@@ -27,6 +27,7 @@ Supports two modes:
 """
 
 import os
+import json
 import argparse
 import yaml
 import logging
@@ -43,7 +44,7 @@ from med_slim.data.feat_dataset import (
     linear_classifier_collate_fn,
 )
 from med_slim.eval.load_cobra import load_pretrained_cobra, load_cobra_from_experiment
-from med_slim.utils.viz.cluster import plot_embedding_clustering
+from med_slim.utils.viz.cluster import plot_embedding_clustering, compute_silhouette
 from med_slim.utils.label_metadata import (
     get_dataset_metadata,
     get_annotation_paths_by_split,
@@ -168,7 +169,7 @@ def _discover_splits(feat_dir: str, model_name: str, plane: str) -> list[str]:
 
 
 def _run_multi_dataset(args, accelerator: Accelerator):
-    """Multi-dataset mode: load from multiple feat dirs, color by plane/dataset."""
+    """Multi-dataset mode: load from multiple feat dirs, color by view plane."""
     model_names = args.fm_model_names.split() if args.fm_model_names else ["mri-core"]
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -197,7 +198,6 @@ def _run_multi_dataset(args, accelerator: Accelerator):
 
     all_embeddings = []
     plane_labels = []
-    dataset_labels = []
     max_per_group = args.max_samples_per_group
 
     for ds_name, feat_dir in datasets_map.items():
@@ -242,20 +242,29 @@ def _run_multi_dataset(args, accelerator: Accelerator):
                 embs = _extract_volume_embeddings(cobra_model, dataloader, accelerator)
                 all_embeddings.append(embs)
                 plane_labels.extend([plane] * embs.shape[0])
-                dataset_labels.extend([ds_name] * embs.shape[0])
 
     if not accelerator.is_main_process:
         return
 
     embeddings = np.concatenate(all_embeddings, axis=0)
     plane_arr = np.array(plane_labels)
-    dataset_arr = np.array(dataset_labels)
     logger.info(f"Total embeddings: {embeddings.shape[0]}")
 
     if args.save_embeddings:
         npz_path = os.path.join(output_dir, "cross_dataset_embeddings.npz")
-        np.savez(npz_path, embeddings=embeddings, planes=plane_arr, datasets=dataset_arr)
+        np.savez(npz_path, embeddings=embeddings, planes=plane_arr)
         logger.info(f"Saved embeddings to {npz_path}")
+
+    # Silhouette score on original embeddings (by view plane)
+    sil_by_plane = compute_silhouette(
+        embeddings, plane_arr, metric="cosine",
+        sample_size=args.silhouette_sample_size,
+    )
+    if sil_by_plane is not None:
+        sil_path = os.path.join(output_dir, "silhouette.json")
+        with open(sil_path, "w") as f:
+            json.dump({"silhouette_by_plane": sil_by_plane}, f, indent=4)
+        logger.info(f"Saved silhouette score to {sil_path}")
 
     umap_kwargs = {"n_neighbors": args.n_neighbors, "min_dist": args.min_dist}
     tsne_kwargs = {"perplexity": args.perplexity}
@@ -268,19 +277,6 @@ def _run_multi_dataset(args, accelerator: Accelerator):
         labels=plane_arr,
         title="Cross-Dataset Embeddings by View Plane",
         filename=f"cross_dataset_{args.method}_by_plane.png",
-        method=args.method,
-        umap_kwargs=umap_kwargs,
-        tsne_kwargs=tsne_kwargs,
-        pca_dim=pca_dim,
-    )
-
-    # Plot colored by dataset
-    plot_embedding_clustering(
-        embeddings=embeddings,
-        output_dir=output_dir,
-        labels=dataset_arr,
-        title="Cross-Dataset Embeddings by Dataset",
-        filename=f"cross_dataset_{args.method}_by_dataset.png",
         method=args.method,
         umap_kwargs=umap_kwargs,
         tsne_kwargs=tsne_kwargs,
@@ -458,6 +454,20 @@ def _run_single_dataset(args, accelerator: Accelerator):
     else:
         vol_label_names = build_multilabel_display_names(target_labels, display_map)
 
+    # Silhouette score on original embeddings (before dimensionality reduction)
+    silhouette = compute_silhouette(
+        vol_embeddings, vol_labels,
+        metric="cosine",
+        sample_size=args.silhouette_sample_size,
+    )
+    if silhouette is not None:
+        logger.info(f"Volume-level silhouette score: {silhouette:.4f}")
+        sil_path = os.path.join(output_dir, "silhouette.json")
+        sil_data = {"volume_silhouette": silhouette}
+        with open(sil_path, "w") as f:
+            json.dump(sil_data, f, indent=4)
+        logger.info(f"Saved silhouette score to {sil_path}")
+
     umap_kwargs = {"n_neighbors": args.n_neighbors, "min_dist": args.min_dist}
     tsne_kwargs = {"perplexity": args.perplexity}
     pca_dim = args.pca_dim if args.pca_dim > 0 else None
@@ -483,6 +493,23 @@ def _run_single_dataset(args, accelerator: Accelerator):
         slice_embeddings = np.concatenate(slice_embeddings_list, axis=0)
         slice_labels = np.concatenate(slice_labels_list, axis=0)
         logger.info(f"Total slice embeddings: {slice_embeddings.shape}")
+
+        slice_sil = compute_silhouette(
+            slice_embeddings, slice_labels,
+            metric="cosine",
+            sample_size=args.silhouette_sample_size,
+        )
+        if slice_sil is not None:
+            logger.info(f"Slice-level silhouette score: {slice_sil:.4f}")
+            sil_path = os.path.join(output_dir, "silhouette.json")
+            if os.path.exists(sil_path):
+                with open(sil_path, "r") as f:
+                    sil_data = json.load(f)
+            else:
+                sil_data = {}
+            sil_data["slice_silhouette"] = slice_sil
+            with open(sil_path, "w") as f:
+                json.dump(sil_data, f, indent=4)
 
         plot_embedding_clustering(
             embeddings=slice_embeddings,
@@ -559,12 +586,19 @@ def main():
     parser.add_argument("--supervised", action="store_true",
                         help="Use supervised UMAP (single-dataset mode)")
 
+    # Silhouette score
+    parser.add_argument("--silhouette-sample-size", type=int, default=10000,
+                        help="Max samples for silhouette score computation."
+                             "Set to 0 to use all samples. (default: 10000)")
+
     # Multi-dataset options
     parser.add_argument("--max-samples-per-group", type=int, default=None,
                         help="Cap samples per dataset/plane/split group to avoid "
                              "large datasets dominating the plot (multi-dataset mode)")
 
     args = parser.parse_args()
+    if args.silhouette_sample_size == 0:
+        args.silhouette_sample_size = None
     accelerator = Accelerator()
 
     if args.multi_dataset:

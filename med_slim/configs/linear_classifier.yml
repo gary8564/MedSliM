@@ -1,10 +1,43 @@
+# ==============================================================================
+# Linear Probing Evaluation Configuration
+# ==============================================================================
+# This config file defines the evaluation setup for linear probing of a pretrained
+# MedSliM SSL model.  It specifies the model checkpoint, feature dataset, and
+# evaluation hyperparameters.
+
+
+# ------------------------------------------------------------------------------
+# Model checkpoint configuration
+# ------------------------------------------------------------------------------
 # Path to pretrained MedSliM checkpoint
 checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-02-16-11:36/medslim-epoch2000.pth.tar"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
 
+# ------------------------------------------------------------------------------
+# Feature dataset configuration
+# ------------------------------------------------------------------------------
+# Feature cache directory structure:
+#   {feat_dir}/{model_name}/{split}/{plane}/*.safetensors
+# 
+# Example for single-sequence dataset (e.g. MRNet and kneeMRI):
+#   feat_dataset:
+#     dataset_name: "MRNet"
+#     feat_dir: "/path/to/feat_caches/MRNet/slices_raw/crop"
+#     plane: ["sagittal", "coronal", "axial"]   # multi-view channels
+#     model_name: ["mri-core"]
+#
+# Example for multi-sequence dataset (e.g. SKM-TEA):
+#   feat_dataset:
+#     dataset_name: "SKM-TEA"
+#     sequences: # map each MRI sequence to its own feat_dir
+#       DESS_E1: "/path/to/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive"
+#       DESS_E2: "/path/to/feat_caches/SKM-TEA/DESS_E2/slices_raw/adaptive"
+#     plane: ["sagittal"]
+#     model_name: ["dinov2"]
+
 feat_dataset:
-  dataset_name: "MRNet" # "MRNet"
+  dataset_name: "MRNet"
   feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
   plane:
     - "sagittal"
@@ -14,9 +47,15 @@ feat_dataset:
     - "mri-core"
 
 annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/MRNet"
+
+# ------------------------------------------------------------------------------
+# Output directory configuration
+# ------------------------------------------------------------------------------
 output_dir: "/hpcwork/rwth1833/experiments/MedSliM-linear-probing"
 
+# ------------------------------------------------------------------------------
 # Hyperparameters
+# ------------------------------------------------------------------------------
 # Note: For fine-tuning, use lower learning rate and enable early stopping
 hyperparams:
   batch_size: 1
@@ -27,7 +66,7 @@ hyperparams:
   max_epochs: 100
   num_workers: 4
   val_split_ratio: 0.1
-  patience: 15  # Early stopping: stop if val_auroc doesn't improve for num_patience epochs
+  patience: 10  # Early stopping: stop if val_auroc doesn't improve for num_patience epochs
   
   # Linear classifier hyperparameters
   linear:

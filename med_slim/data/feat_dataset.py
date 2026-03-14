@@ -34,7 +34,7 @@ class FeatureCache:
     @staticmethod
     def _read_tensor(path: str) -> Tuple[str, torch.Tensor]:
         with safe_open(path, framework="pt", device="cpu") as f:
-            return path, f.get_tensor("feats")
+            return path, f.get_tensor("feats").clone()
 
     def _preload(self, paths) -> None:
         paths = list(paths)
@@ -170,6 +170,16 @@ class PrecomputedFeatPairDataset(Dataset):
     all MRI sequences from the same patient study are grouped together.
     Each ``__getitem__`` call stochastically selects a plane and a series (UID),
     then forms a cross-FM positive pair from that series.
+    
+    SSL setting:
+        Positive pairs are constructed from different foundation models applied to the same exam and view plane.
+    
+    Semi-supervised learning setting:
+        When dataset configs include ``annotations_path`` and ``target_columns``, classification
+        labels are loaded and returned alongside features. 
+        This enables semi-supervised contrastive learning (SemiSupCon)
+        where labeled samples contribute additional same-class positives via the SupCon loss, 
+        while unlabeled samples use standard InfoNCE.
 
     To handle variable-length slices, we sample or pad to a fixed number of slices ``num_target_slices``:
         - Volumes with more slices than ``num_target_slices`` are uniformly subsampled (preserving anatomical order).
@@ -192,7 +202,13 @@ class PrecomputedFeatPairDataset(Dataset):
                  cache_in_memory: bool = False):
         """
         Args:
-            feat_dirs: List of dicts with keys "name" (dataset name) and "feat_dir" (path to features)
+            feat_dirs: List of dataset config dictionaries. Each dict must have:
+                - "name" (str): Dataset name (e.g., "mrnet")
+                - "feat_dir" (str): Path to precomputed features
+                And optionally for semi-supervised learning:
+                - "annotations_path" (str): Path to annotation CSV with columns [ID, target1, target2, ...]
+                - "target_columns" (list[str]): Column names to use as classification targets
+                                                (e.g., ["abnormal", "acl", "meniscus"])
             slice_encoder_models: List of slice encoder model names (e.g., ["dinov2", "rad-dino"])
             view_planes: List of view planes (e.g., ["axial", "sagittal", "coronal"])
             split: Data split ("train" or "val")
@@ -221,6 +237,9 @@ class PrecomputedFeatPairDataset(Dataset):
                         for model in self.slice_encoder_models:
                             unique_paths.add(self._get_feat_path(study_id, model, plane, uid))
             self._feat_cache = FeatureCache(unique_paths)
+        
+        # Load annotations for semi-supervised contrastive learning
+        self._load_annotations(feat_dirs)
     
     @staticmethod
     def _extract_exam_id(uid: str) -> str:
@@ -322,7 +341,7 @@ class PrecomputedFeatPairDataset(Dataset):
             f"Found {len(feat_path_dict)} patient studies with {total_series} total series. "
             f"{studies_with_multi_series} studies have multiple series per plane."
         )
-        
+
         return feat_path_dict
     
     def _get_feat_path(self, study_id: str, model_name: str, plane: str, uid: str) -> str:
@@ -331,6 +350,90 @@ class PrecomputedFeatPairDataset(Dataset):
             self.feat_dir_map[study_id], model_name, self.split, plane, f"{uid}.safetensors"
         )
         
+    def _load_annotations(self, feat_dirs: List[Dict[str, str]]) -> None:
+        """
+        Load classification annotations for datasets that provide them.
+        
+        Enables semi-supervised contrastive learning where labeled samples contribute
+        additional same-class positives to the contrastive loss (SupCon), while unlabeled
+        samples use standard InfoNCE.
+        
+        Annotations are keyed by (dataset_name, exam_id) to match the study_id format
+        used in the feature path dict: "{dataset_name}_{exam_id}".
+        """
+        self._annotations = {}  # {dataset_name: {exam_id_str: label_tensor}}
+        self._num_labels = 0
+        
+        for dataset in feat_dirs:
+            annotations_path = dataset.get("annotations_path")
+            target_columns = dataset.get("target_columns")
+            
+            if annotations_path is None and target_columns is None:
+                continue  # No annotations for this dataset (unlabeled)
+            
+            if annotations_path is None or target_columns is None:
+                raise ValueError(
+                    f"Dataset '{dataset['name']}': both 'annotations_path' and 'target_columns' "
+                    f"must be provided together for semi-supervised learning."
+                )
+            
+            if not os.path.exists(annotations_path):
+                raise FileNotFoundError(
+                    f"Annotations file not found: {annotations_path}"
+                )
+            
+            dataset_name = dataset["name"]
+            # Read with dtype=str for ID to preserve zero-padded IDs (e.g., "0001")
+            df = pd.read_csv(annotations_path, dtype={"ID": str})
+            df.set_index("ID", inplace=True)
+            
+            # Validate target columns
+            missing = [c for c in target_columns if c not in df.columns]
+            if missing:
+                raise ValueError(
+                    f"Target columns {missing} not found in {annotations_path}. "
+                    f"Available columns: {list(df.columns)}"
+                )
+            
+            self._num_labels = len(target_columns)
+            self._annotations[dataset_name] = {}
+            
+            for exam_id in df.index:
+                label_values = df.loc[exam_id, target_columns].values.astype(np.float32)
+                self._annotations[dataset_name][str(exam_id)] = torch.tensor(label_values)
+            
+            logger.info(
+                f"Loaded {len(self._annotations[dataset_name])} annotations for '{dataset_name}' "
+                f"with {self._num_labels} target columns: {target_columns}"
+            )
+        
+        if self._annotations:
+            labeled_datasets = list(self._annotations.keys())
+            logger.info(f"Semi-supervised mode: labeled dataset(s) = {labeled_datasets}")
+        else:
+            logger.info("Self-supervised mode: no annotations provided")
+
+    @property
+    def has_annotations(self) -> bool:
+        """Whether any dataset has annotations for semi-supervised learning."""
+        return self._num_labels > 0
+
+    @property
+    def num_labels(self) -> int:
+        """Number of labels (0 if no annotations)."""
+        return self._num_labels
+
+    def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """
+        Pad the embedding dimension to the largest embedding dimension in the batch by padding with zeros if it is smaller than the target dimension.
+        """
+        seq_len, embed_dim = x.shape
+        
+        if embed_dim < self.max_feature_dim:
+            pad_size = self.max_feature_dim - embed_dim
+            x = torch.nn.functional.pad(x, (0, pad_size), mode='constant', value=0)
+        return x, embed_dim
+    
     def _load_feats(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
         with safe_open(feat_path, framework="pt", device="cpu") as f:
             feats = f.get_tensor("feats").clone()
@@ -430,13 +533,28 @@ class PrecomputedFeatPairDataset(Dataset):
         assert feats1.shape[1] == feats2.shape[1], \
             f"Expected embed_dim to be equal, but got {feats1.shape[1]} and {feats2.shape[1]}!"
         
-        return {
+        result = {
             "feats1": feats1,                # [num_target_slices, max_feature_dim]
             "feats2": feats2,                # [num_target_slices, max_feature_dim]
             "orig_embed_dim1": torch.as_tensor(orig_embed_dim1, dtype=torch.long),
             "orig_embed_dim2": torch.as_tensor(orig_embed_dim2, dtype=torch.long),
             "seq_len": torch.as_tensor(seq_len, dtype=torch.long),
         }
+        
+        # Add labels for semi-supervised contrastive learning
+        if self._num_labels > 0:
+            dataset_name, exam_id = study_id.split("_", 1)
+            label_tensor = self._annotations.get(dataset_name, {}).get(exam_id, None)
+            
+            if label_tensor is not None:
+                result["label"] = label_tensor.clone()
+                result["has_label"] = torch.tensor(True)
+            else:
+                # Unlabeled sample: dummy label with sentinel, has_label=False
+                result["label"] = torch.zeros(self._num_labels, dtype=torch.float32)
+                result["has_label"] = torch.tensor(False)
+        
+        return result
 
 class FeatClassificationDataset(Dataset):
     """

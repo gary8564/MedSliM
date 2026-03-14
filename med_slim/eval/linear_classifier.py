@@ -1,12 +1,16 @@
 """
 Linear Probing Evaluation for pretrained MedSliM SSL Model.
 
-- Single-view classification: Train linear classifier head
-- Multi-view classification: 
-  1. Train independent single-view classifiers for each view plane
-  2. Collect predictions from each view
+- Single-channel classification: Train linear classifier head one one specific (sequence, plane).
+- Multi-channel classification (logistic regression ensemble):
+  1. Train independent single-channel classifiers for each channel
+  2. Collect predictions from each channel
   3. Fit logistic regression on stacked predictions
   4. Evaluate ensemble on test set
+
+A "channel" denotes a possible (sequence, plane) combination.  
+For single-sequence datasets, a channel is simply a view plane (e.g. sagittal, coronal, axial).
+For multi-sequence datasets, each sequence x plane pair is an independent channel (e.g. "DESS_E1/sagittal", "DESS_E2/sagittal").
 """
 import os
 import argparse
@@ -22,7 +26,7 @@ import torch.nn.functional as F
 import wandb
 from pathlib import Path
 from torch.utils.data import DataLoader, Dataset, Subset
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from tqdm import tqdm
 from datetime import datetime
@@ -849,6 +853,226 @@ def run_single_view_evaluation(
     return eval_results
 
 
+def run_single_view_kfold_evaluation(
+    cobra_model: Cobra,
+    train_dataset: FeatClassificationDataset,
+    test_dataset: FeatClassificationDataset,
+    cfg: Dict,
+    accelerator: Accelerator,
+    output_dir: str,
+    n_folds: int = 5,
+    class_weights: Optional[torch.Tensor] = None,
+) -> Dict:
+    """
+    Run K-fold cross-validation for single-view evaluation.
+
+    Args:
+        cobra_model: Pretrained COBRA model.
+        train_dataset: Training dataset.
+        test_dataset: Test dataset.
+        cfg: Configuration dict.
+        accelerator: HuggingFace Accelerator.
+        output_dir: Output directory.
+        n_folds: Number of cross-validation folds.
+        class_weights: Optional class weights for loss.
+
+    Returns:
+        Dict with per-fold results, mean/std AUROC, and best-fold predictions.
+    """
+    hyperparams = cfg["hyperparams"]
+    linear_hyperparams = hyperparams.get("linear", hyperparams)
+    task = cfg["task"]
+
+    if accelerator.is_main_process:
+        logger.info(f"\n{'='*50}")
+        logger.info(f"{n_folds}-Fold Cross-Validation Evaluation")
+        logger.info(f"{'='*50}")
+
+    all_labels = np.array([
+        train_dataset._get_label(sid).numpy()
+        for sid in train_dataset.sample_ids
+    ])
+
+    if task == "multilabel":
+        kfold = MultilabelStratifiedKFold(
+            n_splits=n_folds, shuffle=True, random_state=42
+        )
+        fold_splits = list(kfold.split(
+            X=np.arange(len(train_dataset)), y=all_labels
+        ))
+    else:
+        kfold = StratifiedKFold(
+            n_splits=n_folds, shuffle=True, random_state=42
+        )
+        fold_splits = list(kfold.split(
+            X=np.arange(len(train_dataset)), y=all_labels
+        ))
+
+    num_classes = get_num_classes(task, cfg["target_labels"], train_dataset)
+    input_dim = cobra_model.output_dim
+    freeze_cobra = cfg.get("freeze_cobra", True)
+
+    fold_aurocs = []
+    fold_auprcs = []
+    fold_results = []
+    best_fold_auroc = -1.0
+    best_fold_eval = None
+
+    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
+        if accelerator.is_main_process:
+            logger.info(f"\n{'='*50}")
+            logger.info(f"Fold {fold_idx + 1}/{n_folds}")
+            logger.info(f"{'='*50}")
+
+        train_data = Subset(train_dataset, train_idx.tolist())
+        val_data = Subset(train_dataset, val_idx.tolist())
+
+        if accelerator.is_main_process:
+            logger.info(
+                f"Training: {len(train_data)}, Validation: {len(val_data)}"
+            )
+
+        train_loader = DataLoader(
+            train_data,
+            batch_size=hyperparams["batch_size"],
+            shuffle=True,
+            collate_fn=linear_classifier_collate_fn,
+            num_workers=hyperparams.get("num_workers", 0),
+        )
+        val_loader = DataLoader(
+            val_data,
+            batch_size=hyperparams["batch_size"],
+            shuffle=False,
+            collate_fn=linear_classifier_collate_fn,
+            num_workers=hyperparams.get("num_workers", 0),
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=hyperparams["batch_size"],
+            shuffle=False,
+            collate_fn=linear_classifier_collate_fn,
+            num_workers=hyperparams.get("num_workers", 0),
+        )
+
+        model = SingleViewClassifier(
+            cobra_model=cobra_model,
+            input_dim=input_dim,
+            num_classes=num_classes,
+            classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
+            classifier_dropout=linear_hyperparams.get("dropout", 0.5),
+            freeze_cobra=freeze_cobra,
+        )
+
+        fold_output_dir = os.path.join(output_dir, f"fold_{fold_idx + 1}")
+        if accelerator.is_main_process:
+            os.makedirs(fold_output_dir, exist_ok=True)
+
+        training_results = train_single_view_classifier(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            cfg=cfg,
+            accelerator=accelerator,
+            output_dir=fold_output_dir,
+            class_weights=class_weights,
+            view_prefix=f"fold{fold_idx + 1}",
+        )
+
+        best_model = training_results["best_model"]
+
+        eval_results = evaluate_single_view_classifier(
+            model=best_model,
+            test_loader=test_loader,
+            cfg=cfg,
+            accelerator=accelerator,
+            output_dir=fold_output_dir,
+        )
+
+        accelerator.wait_for_everyone()
+
+        if accelerator.is_main_process and eval_results["metrics"]:
+            save_metrics = prepare_saving_metrics(eval_results["metrics"], task)
+            auroc = (
+                save_metrics["AUROC"]
+                if task == "binary"
+                else save_metrics["overall"]["AUROC"]
+            )
+            auprc = (
+                save_metrics["AUPRC"]
+                if task == "binary"
+                else save_metrics["overall"]["AUPRC"]
+            )
+
+            fold_aurocs.append(auroc)
+            fold_auprcs.append(auprc)
+            fold_results.append(save_metrics)
+
+            logger.info(
+                f"Fold {fold_idx + 1}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}"
+            )
+
+            wandb.log({
+                f"fold{fold_idx + 1}/test_auroc": auroc,
+                f"fold{fold_idx + 1}/test_auprc": auprc,
+            })
+
+            # Save fold metrics
+            table_dir = os.path.join(fold_output_dir, "table")
+            os.makedirs(table_dir, exist_ok=True)
+            eval_results["predictions"].to_csv(
+                os.path.join(table_dir, "predictions.csv"), index=False
+            )
+            with open(os.path.join(table_dir, "metrics.json"), "w") as f:
+                json.dump(save_metrics, f, indent=4)
+
+            if auroc > best_fold_auroc:
+                best_fold_auroc = auroc
+                best_fold_eval = eval_results
+
+    # Aggregate results across folds
+    if accelerator.is_main_process and fold_aurocs:
+        mean_auroc = float(np.mean(fold_aurocs))
+        std_auroc = float(np.std(fold_aurocs))
+        mean_auprc = float(np.mean(fold_auprcs))
+        std_auprc = float(np.std(fold_auprcs))
+
+        logger.info(f"\n{'='*50}")
+        logger.info(f"{n_folds}-Fold Cross-Validation Results")
+        logger.info(f"{'='*50}")
+        for i, (auc_val, prc_val) in enumerate(
+            zip(fold_aurocs, fold_auprcs)
+        ):
+            logger.info(
+                f"  Fold {i + 1}: AUROC={auc_val:.4f}, AUPRC={prc_val:.4f}"
+            )
+        logger.info(f"  Mean AUROC: {mean_auroc:.4f} +/- {std_auroc:.4f}")
+        logger.info(f"  Mean AUPRC: {mean_auprc:.4f} +/- {std_auprc:.4f}")
+
+        # Save aggregated results
+        cv_summary = {
+            "n_folds": n_folds,
+            "fold_aurocs": fold_aurocs,
+            "fold_auprcs": fold_auprcs,
+            "mean_auroc": mean_auroc,
+            "std_auroc": std_auroc,
+            "mean_auprc": mean_auprc,
+            "std_auprc": std_auprc,
+        }
+        table_dir = os.path.join(output_dir, "table")
+        os.makedirs(table_dir, exist_ok=True)
+        with open(os.path.join(table_dir, "cv_summary.json"), "w") as f:
+            json.dump(cv_summary, f, indent=4)
+
+        wandb.run.summary["cv_mean_auroc"] = mean_auroc
+        wandb.run.summary["cv_std_auroc"] = std_auroc
+        wandb.run.summary["cv_mean_auprc"] = mean_auprc
+        wandb.run.summary["cv_std_auprc"] = std_auprc
+        wandb.run.summary["test_auroc"] = mean_auroc
+        wandb.run.summary["test_auprc"] = mean_auprc
+
+    return best_fold_eval if best_fold_eval else {}
+
+
 # =============================================================================
 # Multi-View Logistic Regression Ensemble
 # =============================================================================
@@ -1383,6 +1607,236 @@ def run_multiview_logistic_ensemble(
     return eval_results
 
 
+def run_multiview_logistic_ensemble_kfold(
+    cobra_model: Cobra,
+    train_datasets: Dict[str, FeatClassificationDataset],
+    test_datasets: Dict[str, FeatClassificationDataset],
+    cfg: Dict,
+    accelerator: Accelerator,
+    output_dir: str,
+    view_planes: List[str],
+    n_folds: int = 5,
+    class_weights: Optional[torch.Tensor] = None,
+) -> Dict:
+    """
+    Run K-fold cross-validation for the multi-view logistic regression ensemble.
+
+    For each fold:
+      1. Split training data into K-1 train / 1 val (consistent across views).
+      2. For each view: train single-view classifier, collect val + test preds.
+      3. Stack per-view predictions, fit LogisticRegression on val preds.
+      4. Evaluate ensemble on test set, collect AUROC.
+
+    Reports mean +/- std of test AUROC across folds.
+
+    Args:
+        cobra_model: Pretrained COBRA model.
+        train_datasets: Dict mapping view_plane -> training FeatClassificationDataset.
+        test_datasets: Dict mapping view_plane -> test FeatClassificationDataset.
+        cfg: Configuration dict.
+        accelerator: HuggingFace Accelerator.
+        output_dir: Output directory.
+        view_planes: List of view plane names (or sequence names).
+        n_folds: Number of CV folds.
+        class_weights: Optional class weights for loss.
+
+    Returns:
+        Dict with per-fold results, mean/std AUROC, and best-fold predictions.
+    """
+    task = cfg["task"]
+    target_labels = cfg["target_labels"]
+
+    if accelerator.is_main_process:
+        logger.info(f"\n{'='*50}")
+        logger.info(f"{n_folds}-Fold Cross-Validation for Multi-view Logistic Ensemble")
+        logger.info(f"View planes: {view_planes}")
+        logger.info(f"{'='*50}")
+
+    # Build fold splits from the first view's training dataset (shared sample order across different views)
+    ref_dataset = train_datasets[view_planes[0]]
+    all_labels = np.array([
+        ref_dataset._get_label(sid).numpy() for sid in ref_dataset.sample_ids
+    ])
+
+    if task == "multilabel":
+        kfold = MultilabelStratifiedKFold(
+            n_splits=n_folds, shuffle=True, random_state=42
+        )
+        fold_splits = list(kfold.split(
+            X=np.arange(len(ref_dataset)), y=all_labels
+        ))
+    else:
+        kfold_splitter = StratifiedKFold(
+            n_splits=n_folds, shuffle=True, random_state=42
+        )
+        fold_splits = list(kfold_splitter.split(
+            X=np.arange(len(ref_dataset)), y=all_labels
+        ))
+
+    fold_aurocs = []
+    fold_auprcs = []
+    best_fold_auroc = -1.0
+    best_fold_eval = None
+
+    for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
+        if accelerator.is_main_process:
+            logger.info(f"\n{'='*50}")
+            logger.info(f"Fold {fold_idx + 1}/{n_folds}")
+            logger.info(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
+            logger.info(f"{'='*50}")
+
+        fold_output_dir = os.path.join(output_dir, f"fold_{fold_idx + 1}")
+        if accelerator.is_main_process:
+            os.makedirs(fold_output_dir, exist_ok=True)
+
+        # Train per-view classifiers and collect predictions for this fold
+        view_predictions = {}
+
+        for plane in view_planes:
+            if accelerator.is_main_process:
+                logger.info(f"\nTraining classifier for: {plane}")
+
+            train_subset = Subset(train_datasets[plane], train_idx.tolist())
+            val_subset = Subset(train_datasets[plane], val_idx.tolist())
+
+            predictions = collect_predictions_per_view_classifier(
+                cobra_model=cobra_model,
+                train_subset=train_subset,
+                val_subset=val_subset,
+                test_dataset=test_datasets[plane],
+                view_plane=plane,
+                cfg=cfg,
+                accelerator=accelerator,
+                output_dir=fold_output_dir,
+                class_weights=class_weights,
+            )
+            view_predictions[plane] = predictions
+
+            if accelerator.is_main_process:
+                logger.info(
+                    f"  {plane} val AUROC: "
+                    f"{predictions['best_val_auroc']:.4f}"
+                )
+
+        if not accelerator.is_main_process:
+            continue
+
+        # Stack predictions across views
+        if task == "binary":
+            X_val = np.column_stack([
+                view_predictions[p]["val_probs"] for p in view_planes
+            ])
+            X_test = np.column_stack([
+                view_predictions[p]["test_probs"] for p in view_planes
+            ])
+        else:
+            X_val = np.concatenate([
+                view_predictions[p]["val_probs"] for p in view_planes
+            ], axis=1)
+            X_test = np.concatenate([
+                view_predictions[p]["test_probs"] for p in view_planes
+            ], axis=1)
+
+        y_val = view_predictions[view_planes[0]]["val_labels"]
+        y_test = view_predictions[view_planes[0]]["test_labels"]
+        test_sample_ids = view_predictions[view_planes[0]]["test_sample_ids"]
+
+        # Fit logistic ensemble
+        ensemble = train_logistic_ensemble(X_val, y_val, task)
+
+        eval_results = evaluate_logistic_ensemble(
+            ensemble=ensemble,
+            X=X_test,
+            y=y_test,
+            sample_ids=test_sample_ids,
+            task=task,
+            target_labels=target_labels,
+            view_planes=view_planes,
+            output_dir=fold_output_dir,
+            class_names=cfg.get("class_names"),
+        )
+
+        if eval_results["metrics"]:
+            save_metrics = prepare_saving_metrics(
+                eval_results["metrics"], task
+            )
+            save_metrics["ensemble_weights"] = eval_results["ensemble_weights"]
+            auroc = (
+                save_metrics["AUROC"]
+                if task == "binary"
+                else save_metrics["overall"]["AUROC"]
+            )
+            auprc = (
+                save_metrics["AUPRC"]
+                if task == "binary"
+                else save_metrics["overall"]["AUPRC"]
+            )
+
+            fold_aurocs.append(auroc)
+            fold_auprcs.append(auprc)
+
+            logger.info(
+                f"Fold {fold_idx + 1}: AUROC={auroc:.4f}, AUPRC={auprc:.4f}"
+            )
+
+            wandb.log({
+                f"fold{fold_idx + 1}/test_auroc": auroc,
+                f"fold{fold_idx + 1}/test_auprc": auprc,
+            })
+
+            # Save fold results
+            table_dir = os.path.join(fold_output_dir, "table")
+            os.makedirs(table_dir, exist_ok=True)
+            eval_results["predictions"].to_csv(
+                os.path.join(table_dir, "predictions.csv"), index=False
+            )
+            with open(os.path.join(table_dir, "metrics.json"), "w") as f:
+                json.dump(save_metrics, f, indent=4)
+
+            if auroc > best_fold_auroc:
+                best_fold_auroc = auroc
+                best_fold_eval = eval_results
+
+    # Aggregate across folds
+    if accelerator.is_main_process and fold_aurocs:
+        mean_auroc = float(np.mean(fold_aurocs))
+        std_auroc = float(np.std(fold_aurocs))
+        mean_auprc = float(np.mean(fold_auprcs))
+        std_auprc = float(np.std(fold_auprcs))
+
+        logger.info(f"\n{'='*50}")
+        logger.info(f"{n_folds}-Fold CV Results (Multi-view Ensemble)")
+        logger.info(f"{'='*50}")
+        for i, (a, p) in enumerate(zip(fold_aurocs, fold_auprcs)):
+            logger.info(f"  Fold {i + 1}: AUROC={a:.4f}, AUPRC={p:.4f}")
+        logger.info(f"  Mean AUROC: {mean_auroc:.4f} +/- {std_auroc:.4f}")
+        logger.info(f"  Mean AUPRC: {mean_auprc:.4f} +/- {std_auprc:.4f}")
+
+        cv_summary = {
+            "n_folds": n_folds,
+            "view_planes": view_planes,
+            "fold_aurocs": fold_aurocs,
+            "fold_auprcs": fold_auprcs,
+            "mean_auroc": mean_auroc,
+            "std_auroc": std_auroc,
+            "mean_auprc": mean_auprc,
+            "std_auprc": std_auprc,
+        }
+        table_dir = os.path.join(output_dir, "table")
+        os.makedirs(table_dir, exist_ok=True)
+        with open(os.path.join(table_dir, "cv_summary.json"), "w") as f:
+            json.dump(cv_summary, f, indent=4)
+
+        wandb.run.summary["cv_mean_auroc"] = mean_auroc
+        wandb.run.summary["cv_std_auroc"] = std_auroc
+        wandb.run.summary["cv_mean_auprc"] = mean_auprc
+        wandb.run.summary["cv_std_auprc"] = std_auprc
+        wandb.run.summary["test_auroc"] = mean_auroc
+        wandb.run.summary["test_auprc"] = mean_auprc
+
+    return best_fold_eval if best_fold_eval else {}
+
+
 # =============================================================================
 # Attention-based Multi-View Inference
 # =============================================================================
@@ -1784,13 +2238,33 @@ def main(args):
         cfg["freeze_cobra"] = not args.fine_tune
 
     # Get view plane(s) and model names from config
-    view_planes = cfg["feat_dataset"]["plane"]
+    planes = cfg["feat_dataset"]["plane"]
     if args.fm_model_names:
         model_names = args.fm_model_names.split()  
     else:
         model_names = cfg["feat_dataset"]["model_name"]
     if isinstance(model_names, str):
         model_names = [model_names]
+
+    # Build the channel map: list of (channel_name, feat_dir, plane).
+    # Each channel becomes an independent entry in the logistic ensemble.
+    #   - Single-sequence: channels = planes  (e.g. ["sagittal", "coronal"])
+    #   - Multi-sequence:  channels = seq x plane  (e.g. ["DESS_E1/sagittal", "DESS_E2/sagittal"])
+    sequences = cfg["feat_dataset"].get("sequences")
+    if sequences:
+        channel_map = [
+            (f"{seq_name}/{plane}", seq_feat_dir, plane)
+            for seq_name, seq_feat_dir in sequences.items()
+            for plane in planes
+        ]
+    else:
+        single_feat_dir = cfg["feat_dataset"]["feat_dir"]
+        channel_map = [
+            (plane, single_feat_dir, plane)
+            for plane in planes
+        ]
+
+    view_planes = [ch[0] for ch in channel_map]
     use_multiview = len(view_planes) > 1
 
     # Create output directory
@@ -1860,19 +2334,20 @@ def main(args):
     has_val_annots = "val_annots" in cfg and cfg["val_annots"]
     
     if use_multiview:
-        # Multi-view with logistic regression ensemble
+        # Multi-view / multi-sequence logistic regression ensemble.
+        # Each entry in channel_map is (channel_name, feat_dir, plane).
         if accelerator.is_main_process:
-            logger.info("Using multi-view logistic regression ensemble")
-            logger.info(f"View planes: {view_planes}")
+            logger.info("Using multi-channel logistic regression ensemble")
+            logger.info(f"Channels: {view_planes}")
         
-        # Create datasets for all views once
+        # Create datasets for every channel
         train_datasets = {}
         test_datasets = {}
         val_datasets = {} if has_val_annots else None
         
-        for plane in view_planes:
-            train_datasets[plane] = FeatClassificationDataset(
-                feat_dir=cfg["feat_dataset"]["feat_dir"],
+        for channel_name, feat_dir, plane in channel_map:
+            train_datasets[channel_name] = FeatClassificationDataset(
+                feat_dir=feat_dir,
                 slice_encoder_models=model_names,
                 view_plane=plane,
                 split="train",
@@ -1882,8 +2357,8 @@ def main(args):
                 cache_in_memory=True,
             )
             
-            test_datasets[plane] = FeatClassificationDataset(
-                feat_dir=cfg["feat_dataset"]["feat_dir"],
+            test_datasets[channel_name] = FeatClassificationDataset(
+                feat_dir=feat_dir,
                 slice_encoder_models=model_names,
                 view_plane=plane,
                 split="test",
@@ -1894,8 +2369,8 @@ def main(args):
             )
             
             if has_val_annots:
-                val_datasets[plane] = FeatClassificationDataset(
-                    feat_dir=cfg["feat_dataset"]["feat_dir"],
+                val_datasets[channel_name] = FeatClassificationDataset(
+                    feat_dir=feat_dir,
                     slice_encoder_models=model_names,
                     view_plane=plane,
                     split="val",
@@ -1905,26 +2380,43 @@ def main(args):
                     cache_in_memory=True,
                 )
         
-        eval_results = run_multiview_logistic_ensemble(
-            cobra_model=cobra_model,
-            train_datasets=train_datasets,
-            test_datasets=test_datasets,
-            cfg=cfg,
-            accelerator=accelerator,
-            output_dir=output_dir,
-            view_planes=view_planes,
-            class_weights=class_weights,
-            val_datasets=val_datasets,
-        )
+        use_kfold = args.n_folds > 1 and val_datasets is None
+        if use_kfold:
+            eval_results = run_multiview_logistic_ensemble_kfold(
+                cobra_model=cobra_model,
+                train_datasets=train_datasets,
+                test_datasets=test_datasets,
+                cfg=cfg,
+                accelerator=accelerator,
+                output_dir=output_dir,
+                view_planes=view_planes,
+                n_folds=args.n_folds,
+                class_weights=class_weights,
+            )
+        else:
+            if args.n_folds > 1 and val_datasets is not None and accelerator.is_main_process:
+                logger.warning(
+                    f"--n-folds={args.n_folds} ignored because a dedicated validation set is available."
+                )
+            eval_results = run_multiview_logistic_ensemble(
+                cobra_model=cobra_model,
+                train_datasets=train_datasets,
+                test_datasets=test_datasets,
+                cfg=cfg,
+                accelerator=accelerator,
+                output_dir=output_dir,
+                view_planes=view_planes,
+                class_weights=class_weights,
+                val_datasets=val_datasets,
+            )
     else:
-        # Single-view
-        view_plane = view_planes[0]
+        # Single-view channel
+        channel_name, feat_dir, plane = channel_map[0]
         
-        # Create datasets
         train_dataset = FeatClassificationDataset(
-            feat_dir=cfg["feat_dataset"]["feat_dir"],
+            feat_dir=feat_dir,
             slice_encoder_models=model_names,
-            view_plane=view_plane,
+            view_plane=plane,
             split="train",
             annotations_path=cfg["train_annots"],
             task=cfg["task"],
@@ -1933,9 +2425,9 @@ def main(args):
         )
         
         test_dataset = FeatClassificationDataset(
-            feat_dir=cfg["feat_dataset"]["feat_dir"],
+            feat_dir=feat_dir,
             slice_encoder_models=model_names,
-            view_plane=view_plane,
+            view_plane=plane,
             split="test",
             annotations_path=cfg["test_annots"],
             task=cfg["task"],
@@ -1946,9 +2438,9 @@ def main(args):
         val_dataset = None
         if has_val_annots:
             val_dataset = FeatClassificationDataset(
-                feat_dir=cfg["feat_dataset"]["feat_dir"],
+                feat_dir=feat_dir,
                 slice_encoder_models=model_names,
-                view_plane=view_plane,
+                view_plane=plane,
                 split="val",
                 annotations_path=cfg["val_annots"],
                 task=cfg["task"],
@@ -1957,21 +2449,38 @@ def main(args):
             )
         
         if accelerator.is_main_process:
-            logger.info(f"Using single-view inference with plane: {view_plane}")
+            logger.info(f"Using single-channel inference: {channel_name}")
             logger.info(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
             if val_dataset is not None:
                 logger.info(f"Val samples (dedicated): {len(val_dataset)}")
         
-        eval_results = run_single_view_evaluation(
-            cobra_model=cobra_model,
-            train_dataset=train_dataset,
-            test_dataset=test_dataset,
-            cfg=cfg,
-            accelerator=accelerator,
-            output_dir=output_dir,
-            class_weights=class_weights,
-            val_dataset=val_dataset,
-        )
+        use_kfold = args.n_folds > 1 and val_dataset is None
+        if use_kfold:
+            eval_results = run_single_view_kfold_evaluation(
+                cobra_model=cobra_model,
+                train_dataset=train_dataset,
+                test_dataset=test_dataset,
+                cfg=cfg,
+                accelerator=accelerator,
+                output_dir=output_dir,
+                n_folds=args.n_folds,
+                class_weights=class_weights,
+            )
+        else:
+            if args.n_folds > 1 and val_dataset is not None and accelerator.is_main_process:
+                logger.warning(
+                    f"--n-folds={args.n_folds} ignored because a dedicated validation set is available."
+                )
+            eval_results = run_single_view_evaluation(
+                cobra_model=cobra_model,
+                train_dataset=train_dataset,
+                test_dataset=test_dataset,
+                cfg=cfg,
+                accelerator=accelerator,
+                output_dir=output_dir,
+                class_weights=class_weights,
+                val_dataset=val_dataset,
+            )
 
     if accelerator.is_main_process:
         logger.info(f"\n{'='*50}")
@@ -2040,6 +2549,14 @@ if __name__ == "__main__":
         help="Determines which representation to aggregate at inference: "
              "'post_embed': after Embed MLP (default), "
              "'raw': original FM patch embeddings proposed in COBRA paper."
+    )
+    parser.add_argument(
+        "--n-folds",
+        type=int,
+        default=1,
+        help="Number of cross-validation folds. "
+             "When > 1, runs K-fold CV and reports mean +/- std AUROC. "
+             "Ignored when a dedicated validation set is available. (default: 1)"
     )
     args = parser.parse_args()
     main(args)
