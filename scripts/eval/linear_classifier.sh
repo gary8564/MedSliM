@@ -18,10 +18,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
 CONFIG_PATH="./med_slim/configs/linear_classifier.yml"
-CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-03-14-02:00/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
+CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-03-13-22:31/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
 FINE_TUNE=false  # whether to fine-tune COBRA backbone
 FM_POOLING="avg_pool"  # Options: "avg_pool", "attention" (attention requires fine-tuning COBRA)
-SEQUENCE_ENCODER="transformer"
+SEQUENCE_ENCODER="mamba2"
 SLICE_POOLING="cls" # Only used when sequence encoder is transformer
 FM_MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark" 
 POOLING_TARGET="post_embed"

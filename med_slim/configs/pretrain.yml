@@ -73,11 +73,11 @@ model:
       repo: "/hpcwork/rwth1833/models/mri_core/mri_foundation.pth"
 
   cobra:
-    embed_dim: 1536 # 768, 1024, 1536
+    embed_dim: 768 # 768, 1024, 1536
     contrast_dim: 256
     input_dims: [768, 1024, 1536, 1152, 512, 1376]
     num_heads: 8
-    num_layers: 20 # 2, 6, 20
+    num_layers: 2 # 2, 6, 20
     dropout: 0.2
     # Mamba2-specific
     mamba_d_state: 128
