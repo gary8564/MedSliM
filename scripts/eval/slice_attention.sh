@@ -27,7 +27,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # FM_MODEL_NAMES="mri-core"
 
 # Recommended future mode once experiment configs include cobra_config:
-EXPERIMENT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/acl_sagittal_2026-03-09-01:15"
+EXPERIMENT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/acl_sagittal_2026-03-13-01:43"
 
 # Visualization settings
 SPLIT="test"

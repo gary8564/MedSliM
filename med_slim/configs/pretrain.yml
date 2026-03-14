@@ -84,7 +84,7 @@ model:
 train:
   momentum: 0.99
   temperature: 0.2
-  batch_size: 256 #512
+  batch_size: 512
   num_epochs: 2000
   learning_rate: 5e-4 
   warmup_epochs: 50
@@ -92,5 +92,5 @@ train:
   num_workers: 20
   early_stopping: 
     patience: 10
-  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/test-run-MRNet"
+  save_ckpt_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet"
 

@@ -40,21 +40,36 @@ def load_roi_annotations(annotations_path: str) -> Optional[pd.DataFrame]:
     return None
 
 
+def discover_pathology_roi_columns(roi_df: Optional[pd.DataFrame]) -> list[str]:
+    """Return pathology names that have ``roiZ_{name}`` / ``roiDepth_{name}`` columns."""
+    if roi_df is None:
+        return []
+    prefixes = []
+    for col in roi_df.columns:
+        if col.startswith("roiZ_"):
+            name = col[len("roiZ_"):]
+            if f"roiDepth_{name}" in roi_df.columns:
+                prefixes.append(name)
+    return sorted(prefixes)
+
+
 def get_roi_slice_range(
     roi_df: Optional[pd.DataFrame],
     sample_id: str,
     seq_len: int,
+    z_col: str = "roiZ",
+    depth_col: str = "roiDepth",
 ) -> Optional[Dict[str, Any]]:
     """Return clipped ROI slice metadata for a sample if available."""
     if roi_df is None or sample_id not in roi_df.index:
         return None
 
     row = roi_df.loc[sample_id]
-    if pd.isna(row["roiZ"]) or pd.isna(row["roiDepth"]):
+    if pd.isna(row[z_col]) or pd.isna(row[depth_col]):
         return None
 
-    roi_z = int(row["roiZ"])
-    roi_depth = int(row["roiDepth"])
+    roi_z = int(row[z_col])
+    roi_depth = int(row[depth_col])
     if roi_depth <= 0:
         return None
 
@@ -133,7 +148,6 @@ def main():
     parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
     parser.add_argument("--per-head", action="store_true",
                         help="Visualize per-head attention profiles (ABMIL multi-head only)")
-    
     args = parser.parse_args()
     accelerator = Accelerator()
 
@@ -223,6 +237,7 @@ def main():
     target_labels = args.target_labels or ds_meta["target_labels"]
     task = args.task or ds_meta["task"]
     roi_df = load_roi_annotations(annotations_path)
+    pathology_roi_cols = discover_pathology_roi_columns(roi_df)
 
     display_map = ds_meta.get("label_display_names") if ds_meta else None
     multiclass_maps = ds_meta.get("multiclass_label_maps") if ds_meta else None
@@ -323,6 +338,18 @@ def main():
         metrics['class_label'] = class_label
         if roi_range is not None:
             metrics.update(compute_roi_attention_metrics(attn, roi_range))
+
+        # Per-pathology ROI metrics (columns like roiZ_meniscal_tear, etc.)
+        for pcol in pathology_roi_cols:
+            p_range = get_roi_slice_range(
+                roi_df, str(sample_id), seq_len,
+                z_col=f"roiZ_{pcol}", depth_col=f"roiDepth_{pcol}",
+            )
+            if p_range is not None:
+                p_metrics = compute_roi_attention_metrics(attn, p_range)
+                for k, v in p_metrics.items():
+                    metrics[f"{k}_{pcol}"] = v
+
         all_metrics.append(metrics)
 
     # Per-head attention visualization
@@ -380,7 +407,7 @@ def main():
                 f"{np.max([m['peak_attention'] for m in all_metrics]):.3f}]")
     roi_metrics = [m for m in all_metrics if "mass_in_roi" in m]
     if roi_metrics:
-        logger.info(f"ROI-aware samples: {len(roi_metrics)}")
+        logger.info(f"ROI-aware samples (merged): {len(roi_metrics)}")
         logger.info(
             f"Mean mass_in_roi: {np.mean([m['mass_in_roi'] for m in roi_metrics]):.3f} "
             f"(random baseline: {np.mean([m['random_mass_in_roi'] for m in roi_metrics]):.3f})"
@@ -392,6 +419,23 @@ def main():
             f"Top-3 hit rate: {np.mean([m['top_3_hit'] for m in roi_metrics]):.3f}, "
             f"Top-5 hit rate: {np.mean([m['top_5_hit'] for m in roi_metrics]):.3f}"
         )
+
+    # Per-pathology ROI statistics
+    for pcol in pathology_roi_cols:
+        key = f"mass_in_roi_{pcol}"
+        p_metrics = [m for m in all_metrics if key in m]
+        if p_metrics:
+            display = format_display_name(pcol, display_map)
+            logger.info(f"--- {display} ({len(p_metrics)} samples) ---")
+            logger.info(
+                f"  mass_in_roi: {np.mean([m[key] for m in p_metrics]):.3f} "
+                f"(random: {np.mean([m[f'random_mass_in_roi_{pcol}'] for m in p_metrics]):.3f})"
+            )
+            logger.info(
+                f"  peak_in_roi: {np.mean([m[f'peak_in_roi_{pcol}'] for m in p_metrics]):.3f}, "
+                f"top-3: {np.mean([m[f'top_3_hit_{pcol}'] for m in p_metrics]):.3f}, "
+                f"top-5: {np.mean([m[f'top_5_hit_{pcol}'] for m in p_metrics]):.3f}"
+            )
 
     # Save metrics to CSV
     metrics_df = pd.DataFrame(all_metrics)

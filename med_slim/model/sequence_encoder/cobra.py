@@ -152,7 +152,6 @@ class Cobra(nn.Module):
             self.seq_enc = nn.TransformerEncoder(
                 enc_layer,
                 num_layers=num_layers,
-                norm=nn.LayerNorm(embed_dim),
                 enable_nested_tensor=False,
             )
 
@@ -451,9 +450,11 @@ class Cobra(nn.Module):
 
         # ABMIL pooling
         if get_per_head_attention:
-            return self._abmil_pooling(h, mask, return_per_head=True)
+            # return self._abmil_pooling(h, mask, return_per_head=True)
+            return self._abmil_pooling(logits, mask, return_per_head=True)
 
-        A = self._abmil_pooling(h, mask)
+        # A = self._abmil_pooling(h, mask)
+        A = self._abmil_pooling(logits, mask)
 
         if get_attention:
             return A

@@ -1847,7 +1847,7 @@ def main(args):
     )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
-    
+
     # Compute class weights
     class_weights = compute_class_weights_for_weighted_loss(
         cfg["train_annots"],
@@ -1879,6 +1879,7 @@ def main(args):
                 annotations_path=cfg["train_annots"],
                 task=cfg["task"],
                 target_columns=cfg["target_labels"],
+                cache_in_memory=True,
             )
             
             test_datasets[plane] = FeatClassificationDataset(
@@ -1889,6 +1890,7 @@ def main(args):
                 annotations_path=cfg["test_annots"],
                 task=cfg["task"],
                 target_columns=cfg["target_labels"],
+                cache_in_memory=True,
             )
             
             if has_val_annots:
@@ -1900,6 +1902,7 @@ def main(args):
                     annotations_path=cfg["val_annots"],
                     task=cfg["task"],
                     target_columns=cfg["target_labels"],
+                    cache_in_memory=True,
                 )
         
         eval_results = run_multiview_logistic_ensemble(
@@ -1926,6 +1929,7 @@ def main(args):
             annotations_path=cfg["train_annots"],
             task=cfg["task"],
             target_columns=cfg["target_labels"],
+            cache_in_memory=True,
         )
         
         test_dataset = FeatClassificationDataset(
@@ -1936,6 +1940,7 @@ def main(args):
             annotations_path=cfg["test_annots"],
             task=cfg["task"],
             target_columns=cfg["target_labels"],
+            cache_in_memory=True,
         )
         
         val_dataset = None
@@ -1948,6 +1953,7 @@ def main(args):
                 annotations_path=cfg["val_annots"],
                 task=cfg["task"],
                 target_columns=cfg["target_labels"],
+                cache_in_memory=True,
             )
         
         if accelerator.is_main_process:

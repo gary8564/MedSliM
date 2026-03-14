@@ -1,5 +1,6 @@
 from .slice_dataset import SliceDataset, slice_collate_fn
 from .feat_dataset import (
+    FeatureCache,
     PrecomputedFeatPairDataset, 
     FeatClassificationDataset, 
     UnlabeledFeatDataset,

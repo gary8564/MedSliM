@@ -17,6 +17,50 @@ from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
 
+
+class FeatureCache:
+    """
+    In-memory cache for safetensors feature files.
+
+    Preloads all given paths at construction using multi-threaded I/O,
+    then serves tensors from memory. 
+    Paths not in the cache are loaded from disk.
+    """
+
+    def __init__(self, paths):
+        self._cache: Dict[str, torch.Tensor] = {}
+        self._preload(paths)
+
+    @staticmethod
+    def _read_tensor(path: str) -> Tuple[str, torch.Tensor]:
+        with safe_open(path, framework="pt", device="cpu") as f:
+            return path, f.get_tensor("feats")
+
+    def _preload(self, paths) -> None:
+        paths = list(paths)
+        logger.info(f"Preloading {len(paths)} feature files into memory "
+                     f"(multi-threaded I/O)...")
+        total_bytes = 0
+        with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 8)) as pool:
+            for path, tensor in tqdm(
+                pool.map(self._read_tensor, paths),
+                total=len(paths),
+                desc="Caching features in RAM",
+            ):
+                self._cache[path] = tensor
+                total_bytes += tensor.nelement() * tensor.element_size()
+        logger.info(f"Feature cache ready: {len(self._cache)} tensors, "
+                     f"{total_bytes / 1e9:.2f} GB in RAM")
+
+    def get(self, path: str) -> torch.Tensor:
+        """Return cached tensor, falling back to disk if not in cache."""
+        cached = self._cache.get(path)
+        if cached is not None:
+            return cached
+        with safe_open(path, framework="pt", device="cpu") as f:
+            return f.get_tensor("feats")
+
+
 def linear_classifier_collate_fn(batch):
     """
     Custom collate function for FeatClassificationDataset.
@@ -39,7 +83,7 @@ def linear_classifier_collate_fn(batch):
     
     all_feats_list = [item["feature_embeds"] for item in batch]
     K = len(all_feats_list[0])  # Number of slice encoders
-    max_seq_len = max(seq_lengths).item()
+    max_seq_len = max(feat[0].shape[0] for feat in all_feats_list)
     batch_size = len(batch)
     
     # Create a list to store the K collated feature batches
@@ -87,7 +131,7 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
         all_seq_lengths = [item["seq_length"][view_plane] for item in batch]
         
         K = len(all_feats_list[0])  # Number of slice encoders
-        max_seq_len = max(all_seq_lengths)
+        max_seq_len = max(feat[0].shape[0] for feat in all_feats_list)
         
         # Create list of K tensors for this view, each [B, max_seq_len, encoder_embed_dim]
         features_list = []
@@ -165,12 +209,18 @@ class PrecomputedFeatPairDataset(Dataset):
         self.max_feature_dim = max_feature_dim
         self.num_target_slices = num_target_slices
         
-        self.feat_dir_map: Dict[str, str] = {}
+        self.feat_dir_map = {}
         self.feat_path_dict = self._get_feat_path_dict_by_study_id()
         self.study_ids = list(self.feat_path_dict.keys())
-        self._feat_cache: Dict[str, torch.Tensor] = {}
+        self._feat_cache = None
         if cache_in_memory:
-            self._preload_all_features()
+            unique_paths = set()
+            for study_id in self.study_ids:
+                for plane, uid_list in self.feat_path_dict[study_id].items():
+                    for uid in uid_list:
+                        for model in self.slice_encoder_models:
+                            unique_paths.add(self._get_feat_path(study_id, model, plane, uid))
+            self._feat_cache = FeatureCache(unique_paths)
     
     @staticmethod
     def _extract_exam_id(uid: str) -> str:
@@ -283,49 +333,53 @@ class PrecomputedFeatPairDataset(Dataset):
         
     def _load_feats(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
         with safe_open(feat_path, framework="pt", device="cpu") as f:
-            feats = f.get_tensor("feats")
+            feats = f.get_tensor("feats").clone()
             metadata = f.metadata()
         assert feats.ndim == 2, f"Expected number of dimensions to be 2, but got {feats.ndim=}!"
         assert metadata["plane"] in self.view_planes, f"Expected plane to be in {self.view_planes}, but got {metadata['plane']}!"
         assert metadata["model_name"] in self.slice_encoder_models, f"Expected model name to be in {self.slice_encoder_models}, but got {metadata['model_name']}!"
         return feats, metadata
 
-    def _preload_all_features(self) -> None:
-        """
-        Preload all feature tensors into RAM using multi-threaded I/O.
-        After this call, `_get_feats` returns tensors from an in-memory dict instead of hitting the filesystem, eliminating all per-epoch disk I/O.
-        """
-        unique_paths: set[str] = set()
-        for study_id in self.study_ids:
-            for plane, uid_list in self.feat_path_dict[study_id].items():
-                for uid in uid_list:
-                    for model in self.slice_encoder_models:
-                        unique_paths.add(self._get_feat_path(study_id, model, plane, uid))
-
-        logger.info(f"Preloading {len(unique_paths)} feature files into memory "
-                     f"(multi-threaded I/O)...")
-
-        total_bytes = 0
-        with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 8)) as pool:
-            results = pool.map(lambda p: (p, self._load_feats(p)), unique_paths)
-            for path, (tensor, _metadata) in tqdm(
-                results,
-                total=len(unique_paths),
-                desc="Caching features in RAM",
-            ):
-                self._feat_cache[path] = tensor
-                total_bytes += tensor.nelement() * tensor.element_size()
-
-        logger.info(f"Feature cache ready: {len(self._feat_cache)} tensors, "
-                     f"{total_bytes / 1e9:.2f} GB in RAM")
-
     def _get_feats(self, feat_path: str) -> torch.Tensor:
-        """Return features from in-memory cache. If not found, load from disk."""
-        cached = self._feat_cache.get(feat_path)
-        if cached is not None:
-            return cached
-        with safe_open(feat_path, framework="pt", device="cpu") as f:
-            return f.get_tensor("feats")
+        """Return features from cache if available, otherwise load from disk."""
+        if self._feat_cache is not None:
+            return self._feat_cache.get(feat_path)
+        feats, _ = self._load_feats(feat_path)
+        return feats
+        
+    def _subsample_or_pad_slices(self, feats: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """
+        Subsample or zero-pad a slice feature tensor to a fixed number of slices.
+        
+        Matches the pretraining strategy so that the sequence encoder sees the same
+        length distribution at inference as during SSL pretraining.
+
+        - More slices than target: deterministic evenly-spaced subsampling (np.linspace),
+        preserving anatomical order.
+        - Fewer slices than target: zero-pad and return actual count for masking.
+        - Exactly target slices: return as-is.
+
+        Args:
+            feats: Feature tensor [num_slices, embed_dim]
+
+        Returns:
+            Tuple of (features [num_target_slices, embed_dim], actual_num_real_slices)
+        """
+        num_slices = feats.shape[0]
+
+        if num_slices == self.num_target_slices:
+            return feats, self.num_target_slices
+        elif num_slices > self.num_target_slices:
+            # Uniformly subsample target indices, preserving anatomical order
+            indices = np.sort(np.random.choice(num_slices, size=self.num_target_slices, replace=False))
+            # Evenly spaced indices, preserving anatomical order
+            # indices = np.round(np.linspace(0, num_slices - 1, self.num_target_slices)).astype(int)
+            return feats[indices], self.num_target_slices
+        else:
+            # Zero-pad to target length
+            pad_size = self.num_target_slices - num_slices
+            padded = torch.nn.functional.pad(feats, (0, 0, 0, pad_size), value=0.0)
+            return padded, num_slices # actual number of slices for masking
 
     def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
@@ -337,44 +391,6 @@ class PrecomputedFeatPairDataset(Dataset):
             pad_size = self.max_feature_dim - embed_dim
             x = torch.nn.functional.pad(x, (0, pad_size), mode='constant', value=0)
         return x, embed_dim
-    
-    def _sample_or_pad_slices(self, feats: torch.Tensor) -> Tuple[torch.Tensor, int]:
-        """
-        Select or pad slices to the target number of slices.
-
-        - More slices than target: uniformly subsample (preserving anatomical order).
-          Note that this uses deterministic evenly-spaced sampling (np.linspace) 
-          so that each slice index maps to a consistent relative anatomical position 
-          across volumes and across the two views of a positive pair.
-        - Fewer slices than target: zero-pad and return actual count for masking.
-        - Exactly target slices: return as-is.
-        
-        Args:
-            feats: Feature tensor [num_slices, embed_dim]
-        
-        Returns:
-            Tuple of (features [num_target_slices, embed_dim], actual_num_real_slices)
-        """
-        num_slices = feats.shape[0]
-        target = self.num_target_slices
-        
-        if num_slices == target:
-            return feats, target
-        elif num_slices > target:
-            # Uniformly subsample target indices, preserving anatomical order
-            # indices = np.sort(np.random.choice(num_slices, size=target, replace=False))
-            # Evenly spaced indices, preserving anatomical order
-            # indices = np.round(np.linspace(0, num_slices - 1, target)).astype(int)
-            # Evenly-spaced subsampling with small random jitter
-            base_indices = np.linspace(0, num_slices - 1, target)
-            jitter = np.random.randint(-2, 3, size=target)  # random offset in [-2, +2]
-            indices = np.sort(np.clip(np.round(base_indices + jitter), 0, num_slices - 1).astype(int))
-            return feats[indices], target
-        else:
-            # Zero-pad to target length
-            pad_size = target - num_slices
-            padded = torch.nn.functional.pad(feats, (0, 0, 0, pad_size), value=0.0)
-            return padded, num_slices  # actual number of slices for masking
     
     def __len__(self):
         return len(self.study_ids)
@@ -404,8 +420,8 @@ class PrecomputedFeatPairDataset(Dataset):
         )
         
         # Sample or pad slices to fixed length
-        feats1, seq_len = self._sample_or_pad_slices(feats1)
-        feats2, _ = self._sample_or_pad_slices(feats2)
+        feats1, seq_len = self._subsample_or_pad_slices(feats1)
+        feats2, _ = self._subsample_or_pad_slices(feats2)
         
         # Pad feature dimension to max_feature_dim to ensure consistent batch size
         feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
@@ -439,7 +455,8 @@ class FeatClassificationDataset(Dataset):
                  split: str,
                  annotations_path: str,
                  task: str,
-                 target_columns: List[str]):
+                 target_columns: List[str],
+                 cache_in_memory: bool = False):
         """
         Args:
             feat_dir: Directory containing precomputed features organized as:
@@ -453,6 +470,7 @@ class FeatClassificationDataset(Dataset):
             target_columns: List of column names to use as classification targets
                            For binary/multiclass: single column.
                            For multilabel: multiple columns.
+            cache_in_memory: If True, preload all feature tensors into RAM at init.
         """
         # Validate task
         if task not in ["binary", "multiclass", "multilabel"]:
@@ -502,7 +520,23 @@ class FeatClassificationDataset(Dataset):
                     fname = os.path.basename(f)
                     fid = fname.split(".")[0]
                     self.id_filename_map[fid] = fname
-        
+
+        self._feat_cache = None
+        if cache_in_memory:
+            unique_paths = set()
+            for sample_id in self.sample_ids:
+                filename = self.id_filename_map[sample_id]
+                for model_name in self.slice_encoder_models:
+                    unique_paths.add(os.path.join(self.feat_paths[model_name], filename))
+            self._feat_cache = FeatureCache(unique_paths)
+
+    def _get_feat(self, feat_path: str) -> torch.Tensor:
+        """Return features from cache if available, otherwise load from disk."""
+        if self._feat_cache is not None:
+            return self._feat_cache.get(feat_path)
+        feat, _ = self._load_feat(feat_path)
+        return feat
+
     def __len__(self):
         return len(self.sample_ids)
     
@@ -531,7 +565,7 @@ class FeatClassificationDataset(Dataset):
         
         for encoder in self.slice_encoder_models:
             feat_file = os.path.join(self.feat_paths[encoder], filename)
-            feat, _ = self._load_feat(feat_file)
+            feat = self._get_feat(feat_file)
             seq_lengths.append(feat.shape[0])
             feat_embeds.append(feat)
         
@@ -643,7 +677,8 @@ class MultiViewFeatClassificationDataset(Dataset):
                  split: str,
                  annotations_path: str,
                  task: str,
-                 target_columns: List[str]):
+                 target_columns: List[str],
+                 cache_in_memory: bool = False):
         """
         Args:
             feat_dir: Directory containing precomputed features
@@ -653,6 +688,7 @@ class MultiViewFeatClassificationDataset(Dataset):
             annotations_path: Path to the annotation CSV file
             task: Classification task type ("binary", "multiclass", or "multilabel")
             target_columns: List of column names to use as classification targets
+            cache_in_memory: If True, preload all feature tensors into RAM at init.
         """
         if task not in ["binary", "multiclass", "multilabel"]:
             raise ValueError(f"`task` must be 'binary', 'multiclass', or 'multilabel', got '{task}'")
@@ -700,7 +736,24 @@ class MultiViewFeatClassificationDataset(Dataset):
                         fname = os.path.basename(f)
                         fid = fname.split(".")[0]
                         self.id_filename_map[fid] = fname
-    
+
+        self._feat_cache = None
+        if cache_in_memory:
+            unique_paths = set()
+            for sample_id in self.sample_ids:
+                filename = self.id_filename_map[sample_id]
+                for view_plane in self.view_planes:
+                    for model_name in self.slice_encoder_models:
+                        unique_paths.add(os.path.join(self.feat_paths[view_plane][model_name], filename))
+            self._feat_cache = FeatureCache(unique_paths)
+
+    def _get_feat(self, feat_path: str) -> torch.Tensor:
+        """Return features from cache if available, otherwise load from disk."""
+        if self._feat_cache is not None:
+            return self._feat_cache.get(feat_path)
+        feat, _ = self._load_feat(feat_path)
+        return feat
+
     def __len__(self):
         return len(self.sample_ids)
     
@@ -734,7 +787,7 @@ class MultiViewFeatClassificationDataset(Dataset):
             
             for encoder in self.slice_encoder_models:
                 feat_file = os.path.join(self.feat_paths[view_plane][encoder], filename)
-                feat, _ = self._load_feat(feat_file)
+                feat = self._get_feat(feat_file)
                 seq_lengths.append(feat.shape[0])
                 feat_embeds.append(feat)
             
