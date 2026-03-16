@@ -55,6 +55,10 @@ dependencies = [
     "transformers>=4.51.3",
     "umap-learn>=0.5.11",
     "wandb==0.19.6",
+    "mup>=1.0.0",
+    "yacs>=0.1.8",
+    "fvcore>=0.1.5.post20221221",
+    "tenacity>=9.1.4",
 ]
 
 [build-system]

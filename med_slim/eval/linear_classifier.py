@@ -54,6 +54,7 @@ init_logging()
 logger = logging.getLogger(__name__)
 
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
+JOB_ID = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
 
 
 # =============================================================================
@@ -2245,6 +2246,8 @@ def main(args):
         model_names = cfg["feat_dataset"]["model_name"]
     if isinstance(model_names, str):
         model_names = [model_names]
+    
+    logger.info(f"FM choices: {model_names}")
 
     # Build the channel map: list of (channel_name, feat_dir, plane).
     # Each channel becomes an independent entry in the logistic ensemble.
@@ -2271,9 +2274,9 @@ def main(args):
     target_labels = "_".join(cfg["target_labels"])
     if use_multiview:
         planes_str = "_".join(view_planes)
-        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_multiview_{planes_str}_{CURR_TIME}")
+        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_multiview_{planes_str}_{CURR_TIME}_{JOB_ID}")
     else:
-        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_{view_planes[0]}_{CURR_TIME}")
+        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_{view_planes[0]}_{CURR_TIME}_{JOB_ID}")
     
     # Save pretrained COBRA model config
     checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg["checkpoint_path"]
@@ -2544,9 +2547,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pooling-target",
         type=str,
-        choices=["post_embed", "raw"],
-        default="post_embed",
-        help="Determines which representation to aggregate at inference: "
+        choices=["post_encoder", "post_embed", "raw"],
+        default="raw",
+        help="Which representation level ABMIL attention weights aggregate: "
+             "'post_encoder': after Mamba-2 encoder, "
              "'post_embed': after Embed MLP (default), "
              "'raw': original FM patch embeddings proposed in COBRA paper."
     )

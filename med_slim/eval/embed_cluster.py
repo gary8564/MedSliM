@@ -178,10 +178,16 @@ def _run_multi_dataset(args, accelerator: Accelerator):
     # Load COBRA
     pretrain_config_path = Path(args.checkpoint_path).parent / "config.yaml"
     cobra_cfg = {}
+    pretrain_cfg = {}
     if pretrain_config_path.exists():
         with open(pretrain_config_path) as f:
             pretrain_cfg = yaml.safe_load(f)
         cobra_cfg = pretrain_cfg.get("model", {}).get("cobra", {})
+
+    raw_output_dim = None
+    if args.pooling_target == "raw":
+        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
+        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
 
     cobra_model = load_pretrained_cobra(
         checkpoint_path=args.checkpoint_path,
@@ -191,6 +197,8 @@ def _run_multi_dataset(args, accelerator: Accelerator):
         fm_pooling=args.fm_pooling or "avg_pool",
         sequence_encoder=args.sequence_encoder or "mamba2",
         slice_pooling=args.slice_pooling or "abmil",
+        pooling_target=args.pooling_target,
+        raw_output_dim=raw_output_dim,
     )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
@@ -325,10 +333,16 @@ def _run_single_dataset(args, accelerator: Accelerator):
 
         pretrain_config_path = Path(args.checkpoint_path).parent / "config.yaml"
         cobra_cfg = {}
+        pretrain_cfg = {}
         if pretrain_config_path.exists():
             with open(pretrain_config_path) as f:
                 pretrain_cfg = yaml.safe_load(f)
             cobra_cfg = pretrain_cfg.get("model", {}).get("cobra", {})
+
+        raw_output_dim = None
+        if args.pooling_target == "raw":
+            fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
+            raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
 
         cobra_model = load_pretrained_cobra(
             checkpoint_path=args.checkpoint_path,
@@ -338,6 +352,8 @@ def _run_single_dataset(args, accelerator: Accelerator):
             fm_pooling=args.fm_pooling or "avg_pool",
             sequence_encoder=args.sequence_encoder or "mamba2",
             slice_pooling=args.slice_pooling or "abmil",
+            pooling_target=args.pooling_target,
+            raw_output_dim=raw_output_dim,
         )
         cobra_model = cobra_model.to(accelerator.device)
         cobra_model.eval()
@@ -561,6 +577,13 @@ def main():
     parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "attention"])
     parser.add_argument("--sequence-encoder", type=str, default=None, choices=["mamba2", "transformer"])
     parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
+    parser.add_argument(
+        "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"],
+        default="raw",
+        help="Which representation level ABMIL attention weights aggregate: "
+             "'post_encoder': encoder output, 'post_embed': after Embed MLP (default), "
+             "'raw': original FM patch embeddings."
+    )
     parser.add_argument("--save-embeddings", action="store_true", help="Save embeddings to npz file")
     parser.add_argument("--method", type=str, default="umap", choices=["umap", "tsne"],
                         help="Dimensionality reduction method (default: umap)")

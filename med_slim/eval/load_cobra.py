@@ -79,7 +79,7 @@ def load_pretrained_cobra(
     - fm_pooling (str): Feature aggregation method. Default is "avg_pool".
     - sequence_encoder (str, optional): Override sequence encoder type. If None, uses checkpoint or defaults to "mamba2".
     - slice_pooling (str, optional): Override slice pooling type. If None, uses saved checkpoint.
-    - pooling_target (str): Which representation to pool at inference ('post_embed', 'raw').
+    - pooling_target (str): Which representation to pool at inference ('post_encoder', 'post_embed', 'raw').
     - raw_output_dim (int, optional): FM embedding dimension, required when pooling_target='raw'.
 
     Returns:

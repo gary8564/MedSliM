@@ -407,7 +407,7 @@ def main():
                 f"{np.max([m['peak_attention'] for m in all_metrics]):.3f}]")
     roi_metrics = [m for m in all_metrics if "mass_in_roi" in m]
     if roi_metrics:
-        logger.info(f"ROI-aware samples (merged): {len(roi_metrics)}")
+        logger.info(f"ROI-aware samples: {len(roi_metrics)}")
         logger.info(
             f"Mean mass_in_roi: {np.mean([m['mass_in_roi'] for m in roi_metrics]):.3f} "
             f"(random baseline: {np.mean([m['random_mass_in_roi'] for m in roi_metrics]):.3f})"

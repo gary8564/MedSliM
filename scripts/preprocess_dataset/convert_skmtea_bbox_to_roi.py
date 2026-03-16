@@ -6,10 +6,10 @@ Reads the original annotation JSONs (train.json, val.json, test.json) and the
 existing preprocessed classification CSVs. Outputs augmented CSVs with columns:
 
     roiZ, roiDepth                  
-    roiZ_meniscal_tear,  roiDepth_meniscal_tear
-    roiZ_ligament_tear,  roiDepth_ligament_tear
-    roiZ_cartilage_lesion, roiDepth_cartilage_lesion
-    roiZ_effusion,       roiDepth_effusion
+    roiZ_meniscal_tear,      roiDepth_meniscal_tear
+    roiZ_ligament_tear,      roiDepth_ligament_tear
+    roiZ_cartilage_lesion,   roiDepth_cartilage_lesion
+    roiZ_effusion,           roiDepth_effusion
 
 Scans with no pathology for a given column will have NaN.
 
@@ -53,13 +53,24 @@ def build_roi_dataframe(ann_path: Path) -> pd.DataFrame:
     per-pathology ROI slice ranges plus a merged range.
 
     SKM-TEA bbox format: [x, y, z, dx, dy, dz]
-    Z = slice index along the 3rd volume dimension (LR / RL).
+    Z = voxel index along the 3rd volume dimension (LR / RL).
+
+    Negative deltas: some annotators drew boxes in reverse, producing
+    negative dx/dy/dz. Normalize so z_start <= z_end.
+
+    RL orientation flip: the preprocessing pipeline sorts DICOM slices
+       by ascending SliceLocation.  For LR scans this matches ascending
+       InstanceNumber (= annotation Z order), but for RL scans it is the
+       reverse.  We flip the Z range for RL scans so that the ROI indices
+       align with the preprocessed NIfTI slice ordering.
     """
     with open(ann_path) as f:
         data = json.load(f)
 
     cat_map = {c["id"]: c for c in data["categories"]}
     id_to_scan = {img["id"]: img["scan_id"] for img in data["images"]}
+    id_to_shape = {img["id"]: img["matrix_shape"] for img in data["images"]}
+    id_to_orient = {img["id"]: img["orientation"] for img in data["images"]}
 
     # Collect per-scan, per-pathology Z ranges
     scan_patho_ranges: dict[str, dict[str, list[tuple[int, int]]]] = defaultdict(
@@ -67,7 +78,8 @@ def build_roi_dataframe(ann_path: Path) -> pd.DataFrame:
     )
 
     for ann in data["annotations"]:
-        scan_id = id_to_scan[ann["image_id"]]
+        img_id = ann["image_id"]
+        scan_id = id_to_scan[img_id]
         supercat = cat_map[ann["category_id"]]["supercategory"]
         col = SUPERCATEGORY_TO_COL.get(supercat)
         if col is None:
@@ -75,8 +87,33 @@ def build_roi_dataframe(ann_path: Path) -> pd.DataFrame:
 
         z = int(ann["bbox"][2])
         dz = int(ann["bbox"][5])
-        z_end = z + dz - 1
-        scan_patho_ranges[scan_id][col].append((z, z_end))
+        num_slices = id_to_shape[img_id][2]
+
+        # Normalize: handle negative dz (reverse-drawn boxes)
+        z_start = min(z, z + dz)
+        z_end = max(z, z + dz) - 1
+
+        # Flip Z for RL scans: annotation Z is in InstanceNumber order,
+        # but preprocessed NIfTI is in ascending SliceLocation order which
+        # reverses the axis for RL orientation.
+        z_orient = id_to_orient[img_id][2]  # "LR" or "RL"
+        if z_orient == "RL":
+            z_start_flip = num_slices - 1 - z_end
+            z_end_flip = num_slices - 1 - z_start
+            z_start, z_end = z_start_flip, z_end_flip
+
+        # Clip to valid voxel range [0, num_slices - 1]
+        z_start = max(0, z_start)
+        z_end = min(num_slices - 1, z_end)
+
+        if z_start > z_end:
+            logger.warning(
+                f"Skipping degenerate bbox for {scan_id} ({supercat}): "
+                f"z={z}, dz={dz} -> [{z_start}, {z_end}]"
+            )
+            continue
+
+        scan_patho_ranges[scan_id][col].append((z_start, z_end))
 
     # Healthy scans get NaN ROI columns
     rows = []

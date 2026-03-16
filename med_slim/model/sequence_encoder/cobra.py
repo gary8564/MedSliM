@@ -5,18 +5,21 @@ Unsupervised Foundation Model-Agnostic Slide-Level Representation Learning.
 2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR): 30807-30817, 2024.
 """
 
-from typing import List, Tuple
-from contextlib import contextmanager
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-
+from typing import List, Tuple
+from contextlib import contextmanager
 
 from .mamba2 import Mamba2Enc
 from .transformer import TransformerEncoderLayer
 from med_slim.model.attention_pooling import BatchedABMIL
+from med_slim.logging.setup import init_logging
 
+init_logging()
+logger = logging.getLogger(__name__)
 
 class Embed(nn.Module):
     def __init__(self, dim, embed_dim=1024, dropout=0.25):
@@ -66,7 +69,7 @@ class Cobra(nn.Module):
         sequence_encoder: str = "mamba2",
         fm_pooling: str = "avg_pool",
         slice_pooling: str = "abmil",
-        pooling_target: str = "post_embed",
+        pooling_target: str = "raw",
         raw_output_dim: int = None,
         **kwargs
     ):
@@ -84,9 +87,13 @@ class Cobra(nn.Module):
                 - 'avg_pool': Average pool embeddings across foundation models.
                 - 'attention': Learn attention weights to pool FM embeddings per slice (requires fine-tuning).
             slice_pooling: 'abmil' or 'cls' (cls requires transformer).
-            pooling_target: Which representation to aggregate at inference (ABMIL only).
-                - 'post_embed': Pool from post-Embed-MLP features (default).
-                - 'raw': Pool from original FM patch embeddings, as proposed in COBRA paper.
+            pooling_target: Which representation level to aggregate at inference (ABMIL only).
+                In all modes, ABMIL attention weights are computed from encoder output
+                (providing inter-slice contextual attention). 
+                The pooling_target controls which features those attention weights are applied to:
+                - 'post_encoder': Aggregate encoder output (equivalent to training-time behavior.
+                - 'post_embed': Aggregate post-Embed-MLP features.
+                - 'raw': Aggregate original FM patch embeddings (default). 
             raw_output_dim: FM embedding dimension for the 'raw' pooling target.
                 Required when pooling_target='raw'.
             **kwargs: Additional encoder-specific parameters:
@@ -108,14 +115,13 @@ class Cobra(nn.Module):
         assert slice_pooling in ["abmil", "cls"], f"Invalid slice_pooling '{slice_pooling}'. Must be one of 'abmil', 'cls'."
         if slice_pooling == "cls" and sequence_encoder != "transformer":
                 raise ValueError(f"slice_pooling='cls' requires sequence_encoder='transformer'. Got {sequence_encoder}.")
-        assert pooling_target in ["post_embed", "raw"], (
-            f"Invalid pooling_target '{pooling_target}'. Must be one of 'post_embed', 'raw'."
+        assert pooling_target in ["post_encoder", "post_embed", "raw"], (
+            f"Invalid pooling_target '{pooling_target}'. Must be one of 'post_encoder', 'post_embed', 'raw'."
         )
-        if pooling_target == "raw":
-            if slice_pooling == "cls":
-                raise ValueError("pooling_target='raw' is not compatible with slice_pooling='cls'.")
-            if raw_output_dim is None:
-                raise ValueError("raw_output_dim is required when pooling_target='raw'.")
+        # pooling_target is only used by ABMIL; CLS pooling ignores it
+        # (the CLS branch returns before reaching the pooling_target logic).
+        if pooling_target == "raw" and slice_pooling != "cls" and raw_output_dim is None:
+            raise ValueError("raw_output_dim is required when pooling_target='raw'.")
 
         self.mode = mode
         self.embed_dim = embed_dim
@@ -457,17 +463,25 @@ class Cobra(nn.Module):
         if get_attention:
             return A
 
+        # Attention-weighted aggregation.
         # Training: MIL pooling over encoded features
-        # Inference: MIL pooling over original input features
+        # Inference: MIL pooling over original input features 
+        #            with pooling_target selecting which representation the attention weights aggregate.
         if self.mode == "train":
             pooled = torch.bmm(A, h).squeeze(1)  # [B, embed_dim]
             return self.proj(pooled)
-        else:
-            if self.pooling_target == "raw":
-                raw_x = x[0] if isinstance(x, list) else x
-                return torch.bmm(A, raw_x).squeeze(1)  # [B, raw_output_dim]
-            else:  # post_embed (default)
-                return torch.bmm(A, logits).squeeze(1)  # [B, embed_dim]
+
+        if self.pooling_target == "post_encoder":
+            return torch.bmm(A, h).squeeze(1)        # [B, embed_dim]
+        elif self.pooling_target == "raw":
+            if isinstance(x, list):
+                logger.info("Multi-FM mode: using first FM embedding dimension for raw pooling")
+                raw_x = x[0]
+            else:
+                raw_x = x
+            return torch.bmm(A, raw_x).squeeze(1)    # [B, raw_output_dim]
+        else:  # post_embed
+            return torch.bmm(A, logits).squeeze(1)   # [B, embed_dim]
 
     def forward(
         self, 

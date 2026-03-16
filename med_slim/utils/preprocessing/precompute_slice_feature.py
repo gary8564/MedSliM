@@ -93,9 +93,9 @@ def main():
     parser.add_argument("--num-slices", type=int, default=None, help="Number of slices along depth used by transforms.")
     parser.add_argument("--amp", type=str, default=None, choices=["fp16", "bf16"], 
                         help="Use automatic mixed precision: 'fp16' (faster but can overflow) or 'bf16' (safer, recommended)")
-    parser.add_argument("--model-name", type=str, default="dinov2", choices=["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core"], help="Slice encoder backbone.")
+    parser.add_argument("--model-name", type=str, default="dinov2", choices=["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core", "medimageinsight"], help="Slice encoder backbone.")
     parser.add_argument("--model-repo", type=str, default=None, help="Optional HF repo override for DINO/MedSigLIP/CLIP.")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Local checkpoint path (required for --model-name ark or mri-core).")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Local checkpoint path (required for --model-name ark or mri-core or medimageinsight).")
     parser.add_argument("--local-cache-dir", type=str, default=None, help="Local cache directory to store the model.")
     parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Dataset split to precompute.")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader workers")
@@ -139,7 +139,7 @@ def main():
         num_slices=num_slices,
     )
     
-    print(f"Configuration:")
+    print("Configuration:")
     print(f"  spatial_mode: {spatial_mode}")
     print(f"  num_slices: {num_slices_for_logging}")
     print(f"  batch_size: {batch_size}")

@@ -558,8 +558,8 @@ if __name__ == "__main__":
         "--slice-pooling", type=str, choices=["abmil", "cls"], default=None,
     )
     parser.add_argument(
-        "--pooling-target", type=str, choices=["post_embed", "raw"], default="post_embed",
-        help="Which representation to aggregate at inference.",
+        "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"], default="raw",
+        help="Which representation level ABMIL attention weights aggregate.",
     )
     args = parser.parse_args()
     main(args)

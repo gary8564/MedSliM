@@ -18,16 +18,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
 # kneeMRI only: ROI-based slice attention metrics require roiZ/roiDepth annotations.
-# CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-KMAR50K/2026-02-15-22:14/medslim-epoch2000.pth.tar"
-# FEAT_DIR="/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
-# ANNOTATIONS_PATH="/hpcwork/rwth1833/datasets/preprocessed/kneeMRI/test_multiclass.csv"
-# OUTPUT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/slice_attention_kneeMRI"
-# DATASET_NAME="kneeMRI"
-# PLANE="sagittal"
-# FM_MODEL_NAMES="mri-core"
+CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-02-15-11:55/medslim-epoch2000.pth.tar"
+FEAT_DIR="/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+ANNOTATIONS_PATH="/hpcwork/rwth1833/datasets/preprocessed/MRNet/test.csv"
+OUTPUT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/slice_attention_MRNet"
+DATASET_NAME="MRNet"
+PLANE="sagittal"
+FM_MODEL_NAMES="mri-core"
 
 # Recommended future mode once experiment configs include cobra_config:
-EXPERIMENT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/acl_sagittal_2026-03-13-01:43"
+#EXPERIMENT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/acl_sagittal_2026-03-13-01:43"
 
 # Visualization settings
 SPLIT="test"
@@ -51,25 +51,25 @@ echo "Starting COBRA slice attention visualization ..."
 echo "Checkpoint: ${CHECKPOINT_PATH}"
 echo "Dataset: ${DATASET_NAME}"
 
-# python -m med_slim.eval.slice_attention \
-#   --checkpoint-path "${CHECKPOINT_PATH}" \
-#   --feat-dir "${FEAT_DIR}" \
-#   --annotations-path "${ANNOTATIONS_PATH}" \
-#   --output-dir "${OUTPUT_DIR}" \
-#   --dataset-name "${DATASET_NAME}" \
-#   --plane "${PLANE}" \
-#   --fm-model-names "${FM_MODEL_NAMES}" \
-#   --split "${SPLIT}" \
-#   --batch-size ${BATCH_SIZE} \
-#   ${EXTRA_ARGS}
-
-# Future experiment-dir mode:
 python -m med_slim.eval.slice_attention \
-  --experiment-dir "${EXPERIMENT_DIR}" \
+  --checkpoint-path "${CHECKPOINT_PATH}" \
+  --feat-dir "${FEAT_DIR}" \
+  --annotations-path "${ANNOTATIONS_PATH}" \
+  --output-dir "${OUTPUT_DIR}" \
   --dataset-name "${DATASET_NAME}" \
+  --plane "${PLANE}" \
+  --fm-model-names "${FM_MODEL_NAMES}" \
   --split "${SPLIT}" \
   --batch-size ${BATCH_SIZE} \
   ${EXTRA_ARGS}
+
+# Future experiment-dir mode:
+# python -m med_slim.eval.slice_attention \
+#   --experiment-dir "${EXPERIMENT_DIR}" \
+#   --dataset-name "${DATASET_NAME}" \
+#   --split "${SPLIT}" \
+#   --batch-size ${BATCH_SIZE} \
+#   ${EXTRA_ARGS}
 
 echo "Slice attention visualization complete!"
 echo "Output saved under: ${OUTPUT_DIR}"

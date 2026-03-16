@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem-per-cpu=8G
-#SBATCH --time=12:00:00                 
+#SBATCH --time=14:00:00                 
 #SBATCH --job-name=medslim_ablation_study
 #SBATCH --output=logs/pretrain/stdout_pretrain_ablation_study_abmil_choice_%j.txt    
 #SBATCH --account=p0021834     

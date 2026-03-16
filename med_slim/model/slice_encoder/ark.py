@@ -259,10 +259,8 @@ class ArkFeatureExtractor(nn.Module):
         return features
     
 if __name__ == "__main__":
-    import os
-    
     # Pretrained Ark checkpoint
-    checkpoint_path = "/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
+    checkpoint_path = "/hpcwork/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
     
     # Load the pre-trained Ark model
     feature_extractor = ArkFeatureExtractor(

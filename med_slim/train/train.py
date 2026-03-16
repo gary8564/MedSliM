@@ -247,7 +247,7 @@ def main(args, cfg):
             
             accelerator.backward(loss)
             # Gradient clipping to prevent exploding gradients
-            accelerator.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
             
             loss_val = loss.detach().item()

@@ -30,6 +30,8 @@ MIN_DIST=0.1
 PCA_DIM=50      # set to 0 to disable PCA denoising
 # t-SNE hyperparameters
 PERPLEXITY=30.0
+# Pooling target
+POOLING_TARGET="post_embed"
 # Extra arguments
 EXTRA_ARGS=""
 [[ -n "${MAX_SAMPLES_PER_GROUP}" ]] && EXTRA_ARGS="${EXTRA_ARGS} --max-samples-per-group ${MAX_SAMPLES_PER_GROUP}"
@@ -46,6 +48,7 @@ python -m med_slim.eval.embed_cluster \
   --n-neighbors $N_NEIGHBORS \
   --min-dist $MIN_DIST \
   --pca-dim $PCA_DIM \
+  --pooling-target "${POOLING_TARGET}" \
   --save-embeddings \
   ${EXTRA_ARGS}
 

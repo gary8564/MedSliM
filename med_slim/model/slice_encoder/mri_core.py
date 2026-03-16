@@ -170,7 +170,7 @@ class MriCoreFeatureExtractor(nn.Module):
 
 
 if __name__ == "__main__":
-    checkpoint_path = "/work/rwth1833/models/mri_core/mri_foundation.pth"
+    checkpoint_path = "/hpcwork/rwth1833/models/mri_core/mri_foundation.pth"
     
     extractor = MriCoreFeatureExtractor(checkpoint_path=checkpoint_path)
     
