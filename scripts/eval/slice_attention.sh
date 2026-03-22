@@ -16,24 +16,26 @@
 source .venv/bin/activate
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-### Configuration
-# kneeMRI only: ROI-based slice attention metrics require roiZ/roiDepth annotations.
-CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-02-15-11:55/medslim-epoch2000.pth.tar"
-FEAT_DIR="/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
-ANNOTATIONS_PATH="/hpcwork/rwth1833/datasets/preprocessed/MRNet/test.csv"
-OUTPUT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/slice_attention_MRNet"
-DATASET_NAME="MRNet"
-PLANE="sagittal"
-FM_MODEL_NAMES="mri-core"
+### Configuration — choose ONE mode below
+# MODE 1: experiment-dir (fine-tuned COBRA from linear probing, recommended)
+EXPERIMENT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/meniscal_tear_ligament_tear_cartilage_lesion_effusion_DESS_E2/sagittal_2026-03-17-01:46_65920427"
+FOLD=3                  # Which fold's classifier.pt to load (1, 2, or 3)
+DATASET_NAME="SKM-TEA"
 
-# Recommended future mode once experiment configs include cobra_config:
-#EXPERIMENT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/acl_sagittal_2026-03-13-01:43"
+# MODE 2: explicit checkpoint (pretrained COBRA, no fine-tuning)
+# CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-02-15-11:55/medslim-epoch2000.pth.tar"
+# FEAT_DIR="/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+# ANNOTATIONS_PATH="/hpcwork/rwth1833/datasets/preprocessed/MRNet/test.csv"
+# OUTPUT_DIR="/hpcwork/rwth1833/experiments/MedSliM-linear-probing/slice_attention_MRNet"
+# DATASET_NAME="MRNet"
+# PLANE="sagittal"
+# FM_MODEL_NAMES="mri-core"
 
 # Visualization settings
 SPLIT="test"
-BATCH_SIZE=32
+BATCH_SIZE=8
 NUM_SAMPLES=""          # Leave empty for all samples, or set number (e.g., "50")
-PER_HEAD=true          # Set to true for per-head attention profiles
+PER_HEAD=true           # Set to true for per-head attention profiles
 
 ### Build extra args
 EXTRA_ARGS=""
@@ -48,28 +50,36 @@ fi
 
 ### Run script
 echo "Starting COBRA slice attention visualization ..."
-echo "Checkpoint: ${CHECKPOINT_PATH}"
-echo "Dataset: ${DATASET_NAME}"
 
-python -m med_slim.eval.slice_attention \
-  --checkpoint-path "${CHECKPOINT_PATH}" \
-  --feat-dir "${FEAT_DIR}" \
-  --annotations-path "${ANNOTATIONS_PATH}" \
-  --output-dir "${OUTPUT_DIR}" \
-  --dataset-name "${DATASET_NAME}" \
-  --plane "${PLANE}" \
-  --fm-model-names "${FM_MODEL_NAMES}" \
-  --split "${SPLIT}" \
-  --batch-size ${BATCH_SIZE} \
-  ${EXTRA_ARGS}
+if [[ -n "${EXPERIMENT_DIR}" ]]; then
+  # MODE 1: fine-tuned model from experiment directory
+  echo "Experiment dir: ${EXPERIMENT_DIR}"
+  echo "Fold: ${FOLD}"
+  echo "Dataset: ${DATASET_NAME}"
 
-# Future experiment-dir mode:
-# python -m med_slim.eval.slice_attention \
-#   --experiment-dir "${EXPERIMENT_DIR}" \
-#   --dataset-name "${DATASET_NAME}" \
-#   --split "${SPLIT}" \
-#   --batch-size ${BATCH_SIZE} \
-#   ${EXTRA_ARGS}
+  python -m med_slim.eval.slice_attention \
+    --experiment-dir "${EXPERIMENT_DIR}" \
+    --fold ${FOLD} \
+    --dataset-name "${DATASET_NAME}" \
+    --split "${SPLIT}" \
+    --batch-size ${BATCH_SIZE} \
+    ${EXTRA_ARGS}
+else
+  # MODE 2: pretrained checkpoint (explicit paths)
+  echo "Checkpoint: ${CHECKPOINT_PATH}"
+  echo "Dataset: ${DATASET_NAME}"
+
+  python -m med_slim.eval.slice_attention \
+    --checkpoint-path "${CHECKPOINT_PATH}" \
+    --feat-dir "${FEAT_DIR}" \
+    --annotations-path "${ANNOTATIONS_PATH}" \
+    --output-dir "${OUTPUT_DIR}" \
+    --dataset-name "${DATASET_NAME}" \
+    --plane "${PLANE}" \
+    --fm-model-names "${FM_MODEL_NAMES}" \
+    --split "${SPLIT}" \
+    --batch-size ${BATCH_SIZE} \
+    ${EXTRA_ARGS}
+fi
 
 echo "Slice attention visualization complete!"
-echo "Output saved under: ${OUTPUT_DIR}"

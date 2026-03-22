@@ -174,10 +174,14 @@ def get_volume_attention(
             features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) 
                        for f in batch["features"]]
             
-            # Get attention weights (requires ABMIL slice pooling)
-            attention = cobra_model(features, seq_lengths=seq_lengths, get_attention=True)
-            # attention shape: [B, 1, max_seq_len]
-            attention = attention.squeeze(1).cpu().numpy()  # [B, max_seq_len]
+            # Get per-head attention and aggregate with min across heads.
+            # Min-attention is standard in medical imaging explainability
+            # as it highlights slices that ALL heads agree are important.
+            attention = cobra_model(features, seq_lengths=seq_lengths, get_per_head_attention=True)
+            # attention shape: [B, num_heads, max_seq_len]
+            attention = attention.min(dim=1).values  # [B, max_seq_len]
+            attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            attention = attention.cpu().numpy()
             
             batch_size = attention.shape[0]
             for i in range(batch_size):

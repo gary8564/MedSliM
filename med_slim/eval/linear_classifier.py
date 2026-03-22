@@ -48,6 +48,7 @@ from med_slim.utils.callbacks.early_stopping import EarlyStopping
 from med_slim.utils.metrics.linear import get_loss_criterion, get_eval_metrics, get_num_classes, compute_class_weights_for_weighted_loss
 from med_slim.utils.viz.linear import compute_and_visualize_metrics
 from med_slim.utils.label_metadata import get_dataset_metadata, get_annotation_paths_by_split, build_multiclass_label_names
+from codecarbon import EmissionsTracker
 from med_slim.logging.setup import init_logging
 
 init_logging()
@@ -263,6 +264,19 @@ class MultiViewClassifier(nn.Module):
 # =============================================================================
 # Utility Functions
 # =============================================================================
+def _log_trainable_params(model: nn.Module, accelerator: Accelerator):
+    """Log total and trainable parameter counts."""
+    if not accelerator.is_main_process:
+        return
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    logger.info(
+        f"Parameters: {trainable:,} trainable / {frozen:,} frozen / {total:,} total "
+        f"({100 * trainable / total:.1f}% trainable)"
+    )
+
+
 def _build_optimizer(
     model: nn.Module,
     hyperparams: Dict,
@@ -667,6 +681,7 @@ def evaluate_single_view_classifier(
     cfg: Dict,
     accelerator: Accelerator,
     output_dir: str,
+    track_emissions: bool = True,
 ) -> Dict:
     """Evaluate single-view classifier on test set."""
     task = cfg["task"]
@@ -675,6 +690,15 @@ def evaluate_single_view_classifier(
     # Prepare model and dataloader for distributed evaluation
     model, test_loader = accelerator.prepare(model, test_loader)
     model.eval()
+    
+    tracker = None
+    if track_emissions and accelerator.is_main_process:
+        tracker = EmissionsTracker(
+            project_name="medslim-inference",
+            output_dir=output_dir,
+            log_level="warning",
+        )
+        tracker.start()
     
     all_logits = []
     all_labels = []
@@ -686,6 +710,10 @@ def evaluate_single_view_classifier(
             all_logits.append(outputs["logits"].detach())
             all_labels.append(batch["labels"].detach())
             all_sample_ids.extend(batch["sample_ids"])
+    
+    if tracker is not None:
+        emissions = tracker.stop()
+        logger.info(f"Inference emissions: {emissions:.6f} kg CO2eq")
     
     # Gather predictions from all processes
     all_logits = accelerator.gather_for_metrics(torch.cat(all_logits, dim=0))
@@ -798,6 +826,7 @@ def run_single_view_evaluation(
     if accelerator.is_main_process:
         mode = "Linear Probing" if freeze_cobra else "Fine-tuning"
         logger.info(f"Training mode: {mode}")
+    _log_trainable_params(model, accelerator)
     
     # Train
     training_results = train_single_view_classifier(
@@ -963,6 +992,8 @@ def run_single_view_kfold_evaluation(
             classifier_dropout=linear_hyperparams.get("dropout", 0.5),
             freeze_cobra=freeze_cobra,
         )
+        if fold_idx == 0:
+            _log_trainable_params(model, accelerator)
 
         fold_output_dir = os.path.join(output_dir, f"fold_{fold_idx + 1}")
         if accelerator.is_main_process:
@@ -987,6 +1018,7 @@ def run_single_view_kfold_evaluation(
             cfg=cfg,
             accelerator=accelerator,
             output_dir=fold_output_dir,
+            track_emissions=(fold_idx == 0),
         )
 
         accelerator.wait_for_everyone()
@@ -1139,6 +1171,7 @@ def collect_predictions_per_view_classifier(
         classifier_dropout=linear_hyperparams.get("dropout", 0.5),
         freeze_cobra=freeze_cobra,
     )
+    _log_trainable_params(model, accelerator)
     
     # Create view-specific output directory
     view_output_dir = os.path.join(output_dir, f"{view_plane}")
@@ -1974,6 +2007,7 @@ def evaluate_multiview_classifier(
     cfg: Dict,
     accelerator: Accelerator,
     output_dir: str,
+    track_emissions: bool = True,
 ) -> Dict:
     """
     Evaluate multi-view classifier on test set.
@@ -1987,6 +2021,15 @@ def evaluate_multiview_classifier(
     model, test_loader = accelerator.prepare(model, test_loader)
     model.eval()
     
+    tracker = None
+    if track_emissions and accelerator.is_main_process:
+        tracker = EmissionsTracker(
+            project_name="medslim-inference",
+            output_dir=output_dir,
+            log_level="warning",
+        )
+        tracker.start()
+    
     all_logits = []
     all_labels = []
     all_sample_ids = []
@@ -1999,6 +2042,10 @@ def evaluate_multiview_classifier(
             all_labels.append(batch["labels"].detach())
             all_sample_ids.extend(batch["sample_ids"])
             all_attention.append(outputs["attention_weights"].detach())
+    
+    if tracker is not None:
+        emissions = tracker.stop()
+        logger.info(f"Inference emissions: {emissions:.6f} kg CO2eq")
     
     # Gather predictions from all processes
     all_logits = accelerator.gather_for_metrics(torch.cat(all_logits, dim=0))
@@ -2124,6 +2171,7 @@ def run_multiview_evaluation(
     if accelerator.is_main_process:
         mode = "Linear Probing" if freeze_cobra else "Fine-tuning"
         logger.info(f"Training mode: {mode}")
+    _log_trainable_params(model, accelerator)
     
     # Train
     training_results = train_multiview_classifier(
@@ -2248,6 +2296,13 @@ def main(args):
         model_names = [model_names]
     
     logger.info(f"FM choices: {model_names}")
+
+    if args.fm_pooling == "attention" and len(model_names) == 1:
+        raise ValueError(
+            f"fm_pooling='attention' requires multiple foundation models, but only "
+            f"'{model_names[0]}' was specified. Use fm_pooling='avg_pool' for single-FM "
+            f"inference, or provide multiple models via --fm-model-names."
+        )
 
     # Build the channel map: list of (channel_name, feat_dir, plane).
     # Each channel becomes an independent entry in the logistic ensemble.

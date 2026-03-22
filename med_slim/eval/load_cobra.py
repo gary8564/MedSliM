@@ -139,9 +139,13 @@ def load_pretrained_cobra(
 def load_cobra_from_experiment(
     experiment_dir: str,
     accelerator: Accelerator,
+    fold: Optional[int] = None,
 ) -> Tuple[Cobra, Dict[str, Any]]:
     """
     Load a COBRA model from a linear-probing saved checkpoints and configuration.
+
+    When 'fold' is given the checkpoint is loaded from '{experiment_dir}/fold_{fold}/ckpt/classifier.pt' instead of the
+    default '{experiment_dir}/ckpt/classifier.pt'.
     """
     experiment_dir = Path(experiment_dir)
 
@@ -161,7 +165,10 @@ def load_cobra_from_experiment(
 
     # Model configuration
     seq_enc = cfg.get("sequence_encoder", "mamba2")
-    ckpt_path = experiment_dir / "ckpt" / "classifier.pt"  # Saved classifier checkpoint
+    if fold is not None:
+        ckpt_path = experiment_dir / f"fold_{fold}" / "ckpt" / "classifier.pt"
+    else:
+        ckpt_path = experiment_dir / "ckpt" / "classifier.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"classifier.pt not found at {ckpt_path}")
 

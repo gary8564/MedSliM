@@ -148,23 +148,43 @@ def main():
     parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
     parser.add_argument("--per-head", action="store_true",
                         help="Visualize per-head attention profiles (ABMIL multi-head only)")
+    parser.add_argument("--fold", type=int, default=None,
+                        help="Fold number to load checkpoint from (e.g. 1 -> fold_1/ckpt/classifier.pt)")
     args = parser.parse_args()
     accelerator = Accelerator()
 
     # Configuration
     if args.experiment_dir:
-        cobra_model, exp_cfg = load_cobra_from_experiment(args.experiment_dir, accelerator)
+        cobra_model, exp_cfg = load_cobra_from_experiment(args.experiment_dir, accelerator, fold=args.fold)
         cobra_model = cobra_model.to(accelerator.device)
         cobra_model.eval()
 
         feat_cfg = exp_cfg.get("feat_dataset", {})
-        feat_dir = args.feat_dir or feat_cfg.get("feat_dir")
         plane = args.plane or feat_cfg.get("plane", ["sagittal"])[0]
+
+        if args.feat_dir:
+            feat_dir = args.feat_dir
+        elif feat_cfg.get("sequences"):
+            sequences = feat_cfg["sequences"]
+            seq_name = list(sequences.keys())[0]
+            feat_dir = sequences[seq_name]
+            if len(sequences) > 1:
+                logger.warning(
+                    f"Multiple sequences found ({list(sequences.keys())}); "
+                    f"using first: {seq_name} with corresponding feature directory: {feat_dir}"
+                )
+        else:
+            feat_dir = feat_cfg.get("feat_dir")
         model_names = args.fm_model_names.split() if args.fm_model_names else feat_cfg.get("model_name", ["dinov2"])
         if isinstance(model_names, str):
             model_names = [model_names]
         dataset_name = args.dataset_name or feat_cfg.get("dataset_name")
-        output_dir = args.output_dir or os.path.join(args.experiment_dir, "slice_attention")
+        if args.output_dir:
+            output_dir = args.output_dir
+        elif args.fold is not None:
+            output_dir = os.path.join(args.experiment_dir, f"fold_{args.fold}", "slice_attention")
+        else:
+            output_dir = os.path.join(args.experiment_dir, "slice_attention")
         slice_pooling = args.slice_pooling  # Inferred by load_cobra_from_experiment
         if not args.annotations_path:
             annotations_dir = exp_cfg.get("annotations_dir")

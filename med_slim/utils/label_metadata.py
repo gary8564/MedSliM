@@ -64,7 +64,9 @@ def get_annotation_paths_by_split(
     annot_paths: Dict[str, str] = {}
     for split in splits:
         annot_path = base_dir / f"{split}.csv"
-        if task == "multiclass" and not os.path.exists(annot_path):
+        if task == "binary" and not os.path.exists(annot_path):
+            annot_path = base_dir / f"{split}_binary.csv"
+        elif task == "multiclass" and not os.path.exists(annot_path):
             annot_path = base_dir / f"{split}_multiclass.csv"
         if not os.path.exists(annot_path):
             raise FileNotFoundError(

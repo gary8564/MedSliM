@@ -102,7 +102,8 @@ def plot_embedding_clustering(
     else:
         default_umap_kwargs = {
             'n_neighbors': 30, 
-            'min_dist': 0.0, 
+            'min_dist': 0.1, 
+            'spread': 2.0,
             'metric': 'cosine', 
             'random_state': 42
         }
@@ -152,13 +153,30 @@ def plot_embedding_clustering(
     # Set seaborn style
     sns.set_context("paper", font_scale=1.2)
     sns.set_style("whitegrid")
-    
+    tab10 = sns.color_palette("tab10")
     fig, ax = plt.subplots(figsize=fig_size)
     
     if labels is not None:
         unique_labels = df['Label'].unique()
-        palette = sns.color_palette("tab10", n_colors=len(unique_labels))
-        
+        healthy_terms = {"normal", "healthy", "negative"}
+        abnormal_terms = {"abnormal", "acl", "meniscus", "positive"}
+        palette = None
+        if len(unique_labels) == 2:
+            palette = {}
+            for lab in unique_labels:
+                key = str(lab).lower()
+                if key in healthy_terms:
+                    palette[lab] = tab10[0]
+                elif key in abnormal_terms:
+                    palette[lab] = tab10[1]
+                else:
+                    palette = None
+                    break
+            if palette is not None and len(palette) != 2:
+                palette = None
+        if palette is None:
+            palette = sns.color_palette("tab10", n_colors=len(unique_labels))
+
         sns.scatterplot(
             data=df,
             x='UMAP1',
@@ -176,8 +194,8 @@ def plot_embedding_clustering(
             loc='lower center',
             bbox_to_anchor=(0.5, -0.15),
             ncol=min(len(unique_labels), 5),
-            frameon=False,
-            fontsize=11,
+            frameon=True,
+            fontsize=14,
             markerscale=1.2,
         )
     else:
@@ -198,7 +216,7 @@ def plot_embedding_clustering(
     sns.despine(left=True, bottom=True)
     
     if title:
-        ax.set_title(title, fontsize=14, fontweight='bold', pad=10)
+        ax.set_title(title, fontsize=18, fontweight='bold', pad=10)
     
     fig.tight_layout()
     

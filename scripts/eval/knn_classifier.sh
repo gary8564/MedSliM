@@ -18,12 +18,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
 CONFIG_PATH="./med_slim/configs/linear_classifier.yml"
-CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-03-13-16:48/medslim-epoch2000.pth.tar"
+CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-03-15-04:23/medslim-epoch2000.pth.tar"
 SEQUENCE_ENCODER="mamba2"
-FM_POOLING="avg_pool"
 SLICE_POOLING="cls"
-FM_MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark"
-POOLING_TARGET="post_embed"
+FM_MODEL_NAMES="mri-core medimageinsight ark"
+POOLING_TARGET="raw"
 NB_KNN="10 20 50 100 200"
 TEMPERATURE=0.07
 
@@ -42,7 +41,6 @@ echo "Starting KNN evaluation..."
 python ./med_slim/eval/knn_classifier.py \
   --config "${CONFIG_PATH}" \
   --fm-model-names "${FM_MODEL_NAMES}" \
-  --fm-pooling "${FM_POOLING}" \
   --sequence-encoder "${SEQUENCE_ENCODER}" \
   --pooling-target "${POOLING_TARGET}" \
   --nb-knn ${NB_KNN} \

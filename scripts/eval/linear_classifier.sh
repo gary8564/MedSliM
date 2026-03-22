@@ -7,9 +7,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G 
-#SBATCH --time=1:00:00                 
-#SBATCH --job-name=lp_binary_classification_%j
-#SBATCH --output=stdout_lp_binary_classification_%j.txt    
+#SBATCH --time=2:00:00                 
+#SBATCH --job-name=mrnet_meniscus_%j
+#SBATCH --output=stdout_mrnet_meniscus_%j.txt    
 #SBATCH --account=p0021834    
 
 ### Setup
@@ -22,9 +22,9 @@ CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI
 FINE_TUNE=false  # whether to fine-tune COBRA backbone
 FM_POOLING="avg_pool"  # Options: "avg_pool", "attention" (attention requires fine-tuning COBRA)
 SEQUENCE_ENCODER="mamba2"
-FM_MODEL_NAMES="mri-core medimageinsight ark" 
+FM_MODEL_NAMES="mri-core medimageinsight ark dinov2 dinov3 rad-dino biomedclip medsiglip" 
 POOLING_TARGET="raw"
-N_FOLDS=5
+N_FOLDS=3
 EXTRA_ARGS=""
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --checkpoint-path ${CHECKPOINT_PATH}"

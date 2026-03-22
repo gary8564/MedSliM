@@ -419,7 +419,7 @@ def main(args):
         model_names = cfg["feat_dataset"]["model_name"]
     if isinstance(model_names, str):
         model_names = [model_names]
-
+        
     # Only single-view KNN is supported
     if len(view_planes) > 1:
         raise ValueError("Only single-view KNN is supported.")
@@ -471,7 +471,7 @@ def main(args):
         accelerator=accelerator,
         model_config=cobra_cfg,
         encoder_type=cfg.get("encoder_type", "momentum"),
-        fm_pooling=args.fm_pooling,
+        fm_pooling="avg_pool",
         sequence_encoder=args.sequence_encoder,
         slice_pooling=args.slice_pooling,
         pooling_target=args.pooling_target,
@@ -550,9 +550,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--sequence-encoder", type=str, choices=["mamba2", "transformer"], default=None,
-    )
-    parser.add_argument(
-        "--fm-pooling", type=str, choices=["avg_pool", "attention"], default="avg_pool",
     )
     parser.add_argument(
         "--slice-pooling", type=str, choices=["abmil", "cls"], default=None,

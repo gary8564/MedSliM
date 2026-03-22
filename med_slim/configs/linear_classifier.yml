@@ -37,16 +37,19 @@ freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning 
 #     model_name: ["dinov2"]
 
 feat_dataset:
-  dataset_name: "kneeMRI"
-  feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
+  dataset_name: "MRNet"
+  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
   plane:
     - "sagittal"
     # - "coronal"
     # - "axial"
+  # sequences: 
+  #   DESS_E1: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive"
+    # DESS_E2: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E2/slices_raw/adaptive"
   model_name:
     - "mri-core"
 
-annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/MRNet"
 
 # ------------------------------------------------------------------------------
 # Output directory configuration
@@ -58,10 +61,10 @@ output_dir: "/hpcwork/rwth1833/experiments/MedSliM-linear-probing"
 # ------------------------------------------------------------------------------
 # Note: For fine-tuning, use lower learning rate and enable early stopping
 hyperparams:
-  batch_size: 1
+  batch_size: 8
   base_lr: 1e-5 # Base learning rate for linear heads (and optionally for fm_attn)
   backbone_lr_scale: 0.1 # COBRA backbone learning rate = base_lr * backbone_lr_scale when fine-tuning COBRA
-  weight_decay: 0.01  # L2 regularization to prevent overfitting
+  weight_decay: 0.1 #0.01  # L2 regularization to prevent overfitting
   warmup_ratio: 0.1  
   max_epochs: 100
   num_workers: 4
@@ -76,4 +79,4 @@ hyperparams:
   # Multi-view attention aggregator hyperparameters
   attention:
     hidden_dim: 512
-    dropout: 0.1
+    dropout: 0.25
