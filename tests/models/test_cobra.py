@@ -124,7 +124,7 @@ def test_cobra_transformer_cls_pooling():
         dropout=0.0,
         mode="train",
         sequence_encoder="transformer",
-        pooling="cls",
+        slice_pooling="cls",
     ).to(DEVICE).eval()
 
     # Verify CLS token exists and ABMIL modules don't
@@ -168,7 +168,7 @@ def test_cobra_transformer_cls_attention():
         dropout=0.0,
         mode="train",
         sequence_encoder="transformer",
-        pooling="cls",
+        slice_pooling="cls",
     ).to(DEVICE).eval()
 
     seq_lengths = torch.tensor([3, 6], dtype=torch.long, device=DEVICE)
@@ -192,7 +192,7 @@ def test_cobra_transformer_cls_attention():
 
 def test_cobra_cls_pooling_requires_transformer():
     """CLS pooling should raise error when used with mamba2 encoder."""
-    with pytest.raises(ValueError, match="pooling='cls' requires sequence_encoder='transformer'"):
+    with pytest.raises(ValueError, match="slice_pooling='cls' requires sequence_encoder='transformer'"):
         Cobra(
             embed_dim=768,
             contrast_dim=128,
@@ -201,7 +201,7 @@ def test_cobra_cls_pooling_requires_transformer():
             num_layers=1,
             mode="train",
             sequence_encoder="mamba2",
-            pooling="cls",
+            slice_pooling="cls",
         )
 
 
@@ -231,6 +231,7 @@ def get_pretrained_cobra_from_huggingface(config: dict):
         num_layers=config['num_layers'],
         dropout=config['dropout'],
         mode="inference",
+        pooling_target="post_encoder",
         d_state=config['d_state'],
         att_dim=config['att_dim'],
     )
@@ -268,6 +269,7 @@ def test_cobra_parameter_count_vs_original():
         num_layers=config['num_layers'],
         dropout=config['dropout'],
         mode="inference",
+        pooling_target="post_encoder",
         d_state=config['d_state'],
         att_dim=config['att_dim'],
     )

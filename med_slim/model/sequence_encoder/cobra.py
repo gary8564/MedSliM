@@ -14,7 +14,7 @@ from typing import List, Tuple
 from contextlib import contextmanager
 
 from .mamba2 import Mamba2Enc
-from .transformer import TransformerEncoderLayer
+from .transformer import TransformerEncoderLayer, VarlenTransformerEncoder
 from med_slim.model.attention_pooling import BatchedABMIL
 from med_slim.logging.setup import init_logging
 
@@ -118,10 +118,15 @@ class Cobra(nn.Module):
         assert pooling_target in ["post_encoder", "post_embed", "raw"], (
             f"Invalid pooling_target '{pooling_target}'. Must be one of 'post_encoder', 'post_embed', 'raw'."
         )
-        # pooling_target is only used by ABMIL; CLS pooling ignores it
-        # (the CLS branch returns before reaching the pooling_target logic).
-        if pooling_target == "raw" and slice_pooling != "cls" and raw_output_dim is None:
-            raise ValueError("raw_output_dim is required when pooling_target='raw'.")
+        # pooling_target is only used by ABMIL at inference; CLS pooling ignores it.
+        # raw_output_dim is only needed for inference when aggregating raw FM embeddings.
+        if (
+            mode == "inference"
+            and pooling_target == "raw"
+            and slice_pooling != "cls"
+            and raw_output_dim is None
+        ):
+            raise ValueError("raw_output_dim is required when pooling_target='raw' in inference mode.")
 
         self.mode = mode
         self.embed_dim = embed_dim
@@ -343,7 +348,6 @@ class Cobra(nn.Module):
             Embedded features [total_seq_len, embed_dim]
         """
         if input_feature_dims is not None:
-            batch_size = cu_seqlens.shape[0] - 1
             total_seq_len = x.shape[0]
             
             # Calculate sequence lengths
@@ -637,7 +641,6 @@ class Cobra(nn.Module):
         get_attention=False, 
         get_per_head_attention=False,
         return_slice_embeddings=False,
-        seq_lengths=None,
         use_packed: bool = False,
         **kwargs,
     ):
@@ -653,7 +656,7 @@ class Cobra(nn.Module):
             get_per_head_attention: If True, return per-head attention [B, num_heads, num_slices] (ABMIL only).
             return_slice_embeddings: If True, return slice-level embeddings [B, num_slices, embed_dim] before pooling.
             use_packed: If True, use packed sequence for variable sequence length handling.
-            **kwargs: Mode-specific parameters
+            **kwargs: Mode-specific parameters:
                 Padded mode:
                     - seq_lengths: Actual sequence lengths [B] for masking padded positions.
                 Packed mode:
@@ -678,8 +681,6 @@ class Cobra(nn.Module):
                 **kwargs,
             )
         else:
-            if kwargs.get('seq_lengths') is None:
-                raise ValueError("seq_lengths is required for padded mode.")
             return self._forward(
                 x,
                 input_feature_dims=input_feature_dims,

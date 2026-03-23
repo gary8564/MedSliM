@@ -1,8 +1,6 @@
 import torch
 import torch._dynamo
 import torch._inductor.config as inductor_config
-import torch._dynamo
-import torch._inductor.config as inductor_config
 import pytest
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
@@ -188,10 +186,6 @@ def test_training_with_transformer_encoder():
             input_feature_dims_1=size1, input_feature_dims_2=size2,
             seq_lengths=seq_lens,
             m=0.99,
-            use_packed=True,
-            cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
-            max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
-            seq_idx1=seq_idx1, seq_idx2=seq_idx2,
         )
         assert torch.isfinite(loss).all(), f"Loss is not finite: {loss}"
 
@@ -209,6 +203,87 @@ def test_training_with_transformer_encoder():
     params_after = [p.detach() for p in model.parameters() if p.requires_grad]
     changed = any(not torch.allclose(b, a) for b, a in zip(params_before, params_after))
     assert changed, "Model parameters did not update during transformer training"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Packed transformer requires CUDA for FlashAttention")
+def test_training_with_transformer_packed_sequences():
+    """Test training with transformer encoder and packed sequences (FlashAttention varlen)."""
+    torch.manual_seed(0)
+
+    batch_size = 4
+    num_batches = 2
+    num_slices = 8
+    feature_dim = 16
+    
+    accelerator = Accelerator(cpu=not torch.cuda.is_available())
+
+    model = MoCo(
+        embed_dim=64,
+        contrast_dim=16,
+        accelerator=accelerator,
+        input_dims=[feature_dim],
+        num_heads=2,
+        num_layers=1,
+        T=0.2,
+        dropout=0.0,
+        att_dim=32,
+        sequence_encoder="transformer",
+    ).to(DEVICE).train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+
+    ds = RandomPairDataset(
+        length=batch_size * num_batches,
+        num_slices=num_slices,
+        max_feature_dim=feature_dim,
+        true_feature_dim=feature_dim,
+    )
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=True,
+                        collate_fn=ssl_packed_collate_fn)
+
+    params_before = _clone_params(model)
+
+    total_loss = 0.0
+    steps = 0
+    for batch in loader:
+        x1 = batch["feats1"].to(DEVICE, dtype=torch.float32)
+        x2 = batch["feats2"].to(DEVICE, dtype=torch.float32)
+        sizes1 = batch["orig_embed_dim1"].to(DEVICE, dtype=torch.long)
+        sizes2 = batch["orig_embed_dim2"].to(DEVICE, dtype=torch.long)
+        cu_seqlens1 = batch["cu_seqlens1"].to(DEVICE)
+        cu_seqlens2 = batch["cu_seqlens2"].to(DEVICE)
+        max_seqlen1 = batch["max_seqlen1"]
+        max_seqlen2 = batch["max_seqlen2"]
+        seq_idx1 = batch["seq_idx1"].to(DEVICE)
+        seq_idx2 = batch["seq_idx2"].to(DEVICE)
+
+        # Varlen FlashAttention requires fp16/bf16 activations
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            loss = model(
+                x1, x2,
+                input_feature_dims_1=sizes1, input_feature_dims_2=sizes2,
+                m=0.99,
+                use_packed=True,
+                cu_seqlens1=cu_seqlens1, cu_seqlens2=cu_seqlens2,
+                max_seqlen1=max_seqlen1, max_seqlen2=max_seqlen2,
+                seq_idx1=seq_idx1, seq_idx2=seq_idx2,
+            )
+        assert torch.isfinite(loss).all(), f"Loss is not finite: {loss}"
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.detach().item()
+        steps += 1
+
+    assert steps == num_batches
+    avg_loss = total_loss / steps
+    assert avg_loss > 0.0 and torch.isfinite(torch.tensor(avg_loss))
+
+    params_after = [p.detach() for p in model.parameters() if p.requires_grad]
+    changed = any(not torch.allclose(b, a) for b, a in zip(params_before, params_after))
+    assert changed, "Model parameters did not update during packed transformer training"
 
 
 def test_training_semi_supervised_with_labels():
@@ -331,10 +406,11 @@ def test_training_semi_supervised_all_labeled():
     for batch in loader:
         x1 = batch["feats1"].to(DEVICE, dtype=torch.float32)
         x2 = batch["feats2"].to(DEVICE, dtype=torch.float32)
+        seq_lens = batch["seq_len"].to(DEVICE, dtype=torch.long)
         labels = batch["label"].to(DEVICE, dtype=torch.float32)
         has_label = batch["has_label"].to(DEVICE)
 
-        loss = model(x1, x2, m=0.99, labels=labels, has_label=has_label)
+        loss = model(x1, x2, seq_lengths=seq_lens, m=0.99, labels=labels, has_label=has_label)
         assert torch.isfinite(loss).all(), f"Loss is not finite: {loss}"
 
         optimizer.zero_grad(set_to_none=True)

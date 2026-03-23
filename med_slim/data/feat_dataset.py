@@ -12,8 +12,6 @@ from glob import glob
 from tqdm import tqdm
 from safetensors import safe_open
 from collections import defaultdict
-from torch.nn.utils.rnn import pad_sequence
-
 from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
@@ -65,65 +63,74 @@ def ssl_packed_collate_fn(batch):
     """
     Packed sequence collate function for PrecomputedFeatPairDataset.
     
-    Instead of padding all sequences to max_seq_len (wasting memory/compute),
-    concatenates all sequences and uses cumulative sequence lengths (cu_seqlens)
-    to track document boundaries.
+    Concatenates variable-length sequences and uses cumulative sequence lengths
+    (cu_seqlens) to track boundaries to avoid padding waste. 
+    Uses ``seq_len`` from each item to pack only real slices.
+    
+    Designed for use with ``PrecomputedFeatPairDataset(use_packed=True)``, which
+    returns raw variable-length sequences without subsampling or zero-padding.
+    
+    Both views in a positive pair always share the same sequence length (same exam /
+    plane / MRI sequence), so cu_seqlens and seq_idx are identical for both views.
     
     Efficient for:
-    - Mamba2: Uses seq_idx or cu_seqlens to avoid passing states in between
+    - Mamba2: Uses seq_idx to avoid passing states across sequence boundaries
     - Transformer with FlashAttention/varlen_attn: Uses cu_seqlens for variable-length attention
     
     Returns:
         dict with keys:
-            - feats1: packed features with shape [total_seq_len, max_feat_dim]
-            - feats2: packed features with shape [total_seq_len, max_feat_dim]  
-            - cu_seqlens1: cumulative sequence lengths for view 1 with shape [B+1]
-            - cu_seqlens2: cumulative sequence lengths for view 2 with shape [B+1]
-            - max_seqlen1: max sequence length in batch for view 1
-            - max_seqlen2: max sequence length in batch for view 2
-            - seq_idx1: index for each token with shape [total_seq_len] (needed for Mamba2)
-            - seq_idx2: index for each token with shape [total_seq_len] (needed for Mamba2)
-            - orig_embed_dim1: original embedding dimensions with shape [B]
-            - orig_embed_dim2: original embedding dimensions with shape [B]
+            - feats1, feats2: packed features [total_real_seq_len, max_feat_dim]
+            - cu_seqlens1, cu_seqlens2: cumulative sequence lengths [B+1] 
+            - max_seqlen1, max_seqlen2: max real sequence length in batch
+            - seq_idx1, seq_idx2: document index per token [total_real_seq_len]
+            - orig_embed_dim1, orig_embed_dim2: original embedding dimensions [B]
+            - label (optional): stacked labels [B, C] when annotations exist
+            - has_label (optional): boolean tensor [B] when annotations exist
     """
-    feats1_list = [item["feats1"] for item in batch]
-    feats2_list = [item["feats2"] for item in batch]
+    batch_size = len(batch)
     orig_embed_dims1 = torch.stack([item["orig_embed_dim1"].to(dtype=torch.long) for item in batch], dim=0)
     orig_embed_dims2 = torch.stack([item["orig_embed_dim2"].to(dtype=torch.long) for item in batch], dim=0)
     
-    batch_size = len(batch)
+    feats1_list = [item["feats1"] for item in batch]
+    feats2_list = [item["feats2"] for item in batch]
+    seq_lens = torch.tensor([f.shape[0] for f in feats1_list], dtype=torch.int32)
     
-    # Get sequence lengths
-    seq_lens1 = torch.tensor([feat.shape[0] for feat in feats1_list], dtype=torch.int32)
-    seq_lens2 = torch.tensor([feat.shape[0] for feat in feats2_list], dtype=torch.int32)
+    assert all(f1.shape[0] == f2.shape[0] for f1, f2 in zip(feats1_list, feats2_list)), (
+        "feats1 and feats2 must have the same sequence length per sample "
+        "(positive pairs come from the same MRI exam/plane/sequence)."
+    )
     
     # Compute cumulative sequence lengths (cu_seqlens)
-    cu_seqlens1 = torch.zeros(batch_size + 1, dtype=torch.int32)
-    cu_seqlens2 = torch.zeros(batch_size + 1, dtype=torch.int32)
-    cu_seqlens1[1:] = torch.cumsum(seq_lens1, dim=0)
-    cu_seqlens2[1:] = torch.cumsum(seq_lens2, dim=0)
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
     
-    # Pack features: concatenate all sequences along sequence length dimension
-    feats1_packed = torch.cat(feats1_list, dim=0)  # [total_seq_len1, max_feat_dim]
-    feats2_packed = torch.cat(feats2_list, dim=0)  # [total_seq_len2, max_feat_dim]
+    # Pack features: concatenate variable-length sequences
+    feats1_packed = torch.cat(feats1_list, dim=0)  # [total_seq_len, max_feat_dim]
+    feats2_packed = torch.cat(feats2_list, dim=0)  # [total_seq_len, max_feat_dim]
     
     # Vectorized building seq_idx: repeat each batch index by its sequence length
-    seq_idx1 = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens1)
-    seq_idx2 = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens2)
+    seq_idx = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens)
     
-    return {
-        "feats1": feats1_packed,  # [total_seq_len, max_feat_dim]
+    result = {
+        "feats1": feats1_packed,   # [total_real_seq_len, max_feat_dim]
         "feats2": feats2_packed,
-        "cu_seqlens1": cu_seqlens1,  # [B+1]
-        "cu_seqlens2": cu_seqlens2,
-        "max_seqlen1": seq_lens1.max().item(),
-        "max_seqlen2": seq_lens2.max().item(),
-        "seq_idx1": seq_idx1,  # [total_seq_len] 
-        "seq_idx2": seq_idx2,
+        "cu_seqlens1": cu_seqlens,  # [B+1] — shared across both views
+        "cu_seqlens2": cu_seqlens,
+        "max_seqlen1": seq_lens.max().item(),
+        "max_seqlen2": seq_lens.max().item(),
+        "seq_idx1": seq_idx,        # [total_real_seq_len]
+        "seq_idx2": seq_idx,
         "orig_embed_dim1": orig_embed_dims1,  # [B]
         "orig_embed_dim2": orig_embed_dims2,
         "batch_size": batch_size,
     }
+    
+    # Forward labels for semi-supervised contrastive learning
+    if "label" in batch[0]:
+        result["label"] = torch.stack([item["label"] for item in batch], dim=0)
+        result["has_label"] = torch.stack([item["has_label"] for item in batch], dim=0)
+    
+    return result
 
 
 def linear_classifier_collate_fn(batch):
@@ -264,7 +271,8 @@ class PrecomputedFeatPairDataset(Dataset):
                  split: str, 
                  max_feature_dim: int,
                  num_target_slices: int = 32,
-                 cache_in_memory: bool = False):
+                 cache_in_memory: bool = False,
+                 use_packed: bool = False):
         """
         Args:
             feat_dirs: List of dataset config dictionaries. Each dict must have:
@@ -280,8 +288,10 @@ class PrecomputedFeatPairDataset(Dataset):
             max_feature_dim: Maximum feature dimension for padding
             num_target_slices: Target number of slices for all outputs. Volumes with more slices 
                                are uniformly subsampled (order-preserving); volumes with fewer are 
-                               zero-padded. Default: 32.
+                               zero-padded. Default: 32. Ignored when use_packed=True.
             cache_in_memory: If True, preload all feature tensors into RAM at init to eliminate per-epoch disk I/O.
+            use_packed: If True, return raw variable-length sequences (no subsampling or
+                        zero-padding). Must be used with ssl_packed_collate_fn in the DataLoader.
         """
         self.feat_dirs = feat_dirs
         self.slice_encoder_models = slice_encoder_models
@@ -289,6 +299,7 @@ class PrecomputedFeatPairDataset(Dataset):
         self.split = split
         self.max_feature_dim = max_feature_dim
         self.num_target_slices = num_target_slices
+        self.use_packed = use_packed
         
         self.feat_dir_map = {}
         self.feat_path_dict = self._get_feat_path_dict_by_study_id()
@@ -488,19 +499,6 @@ class PrecomputedFeatPairDataset(Dataset):
         """Number of labels (0 if no annotations)."""
         return self._num_labels
 
-    def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
-        """
-        Pad the embedding dimension to the largest embedding dimension in the batch by padding with zeros if it is smaller than the target dimension.
-        Pad the embedding dimension to the largest embedding dimension in the batch by padding with zeros if it is smaller than the target dimension.
-        """
-        seq_len, embed_dim = x.shape
-        
-        if embed_dim < self.max_feature_dim:
-            pad_size = self.max_feature_dim - embed_dim
-            x = torch.nn.functional.pad(x, (0, pad_size), mode='constant', value=0)
-            x = torch.nn.functional.pad(x, (0, pad_size), mode='constant', value=0)
-        return x, embed_dim
-    
     def _load_feats(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
         with safe_open(feat_path, framework="pt", device="cpu") as f:
             feats = f.get_tensor("feats").clone()
@@ -589,9 +587,14 @@ class PrecomputedFeatPairDataset(Dataset):
             f"plane {selected_view_plane}."
         )
         
-        # Sample or pad slices to fixed length
-        feats1, seq_len = self._subsample_or_pad_slices(feats1)
-        feats2, _ = self._subsample_or_pad_slices(feats2)
+        if self.use_packed:
+            # Packed mode: keep raw variable-length sequences (no subsampling / zero-padding).
+            # The packed collate will concatenate them and build cu_seqlens.
+            seq_len = feats1.shape[0]
+        else:
+            # Padded mode: subsample or zero-pad to fixed length
+            feats1, seq_len = self._subsample_or_pad_slices(feats1)
+            feats2, _ = self._subsample_or_pad_slices(feats2)
         
         # Pad feature dimension to max_feature_dim to ensure consistent batch size
         feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
@@ -601,8 +604,8 @@ class PrecomputedFeatPairDataset(Dataset):
             f"Expected embed_dim to be equal, but got {feats1.shape[1]} and {feats2.shape[1]}!"
         
         result = {
-            "feats1": feats1,                # [num_target_slices, max_feature_dim]
-            "feats2": feats2,                # [num_target_slices, max_feature_dim]
+            "feats1": feats1,                # [seq_len, max_feature_dim]
+            "feats2": feats2,                # [seq_len, max_feature_dim]
             "orig_embed_dim1": torch.as_tensor(orig_embed_dim1, dtype=torch.long),
             "orig_embed_dim2": torch.as_tensor(orig_embed_dim2, dtype=torch.long),
             "seq_len": torch.as_tensor(seq_len, dtype=torch.long),

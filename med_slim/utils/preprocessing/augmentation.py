@@ -474,22 +474,9 @@ class CropOrPad2D(tio.Transform):
         target_shape[in_plane_axes[0]] = self.target_size[0]
         target_shape[in_plane_axes[1]] = self.target_size[1]
         target_shape = tuple(target_shape.tolist())
-        # Get current spatial shape
-        current_shape = np.array(subject.spatial_shape)
-        
-        # Detect slice axis 
-        slice_axis = _slice_axis_from_subject(subject)
-        
-        # Build target shape: crop in-plane dims to (target_w, target_h), keep slice dim unchanged
-        target_shape = np.array(current_shape, copy=True)
-        in_plane_axes = [i for i in range(3) if i != slice_axis]
-        target_shape[in_plane_axes[0]] = self.target_size[0]
-        target_shape[in_plane_axes[1]] = self.target_size[1]
-        target_shape = tuple(target_shape.tolist())
         
         # Use CropOrPad with the computed target shape
         crop_or_pad = CropOrPad(
-            target_shape=tuple(target_shape),
             target_shape=tuple(target_shape),
             padding_mode=self.padding_mode,
             random_center=self.random_center,

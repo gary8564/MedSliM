@@ -8,14 +8,11 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem-per-cpu=8G
 #SBATCH --time=14:00:00                 
-#SBATCH --job-name=medslim_ablation_study
-#SBATCH --output=logs/pretrain/stdout_pretrain_ablation_study_abmil_choice_%j.txt    
-#SBATCH --account=p0021834     
+#SBATCH --job-name=pretrain
+#SBATCH --output=logs/pretrain/stdout_pretrain_%j.txt    
+#SBATCH --account=rwth1833     
 
 ### Setup
-# Load Intel libraries (required by Triton for mamba_ssm kernels)
-module load intel 2>/dev/null || true
-
 # Load Intel libraries (required by Triton for mamba_ssm kernels)
 module load intel 2>/dev/null || true
 
@@ -28,7 +25,6 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 # Multi-GPU settings
-NUM_GPUS=1
 NUM_GPUS=1
 
 ### Configuration
@@ -73,6 +69,7 @@ PLANES=""
 # Sequence encoder and pooling
 SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
 POOLING="abmil"                    # abmil (default) or cls (requires transformer encoder)
+USE_PACKED=true                   # true: packed sequences (no padding waste); false: random subsampling + padding
 
 ### Build command arguments
 EXTRA_ARGS=""
@@ -80,6 +77,7 @@ EXTRA_ARGS=""
 [[ "${CURRICULUM}" == true ]] && EXTRA_ARGS+=" --curriculum"
 [[ -n "${MODEL_NAMES}" ]]  && EXTRA_ARGS+=" --model-names ${MODEL_NAMES}"
 [[ -n "${PLANES}" ]]       && EXTRA_ARGS+=" --planes ${PLANES}"
+[[ "${USE_PACKED}" == true ]] && EXTRA_ARGS+=" --use-packed"
 
 ### Run
 accelerate launch --num_processes=$NUM_GPUS --mixed_precision=bf16 \

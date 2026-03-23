@@ -5,6 +5,7 @@ from .feat_dataset import (
     FeatClassificationDataset, 
     UnlabeledFeatDataset,
     MultiViewFeatClassificationDataset,
+    ssl_packed_collate_fn,
     linear_classifier_collate_fn, 
     multiview_classifier_collate_fn,
 )

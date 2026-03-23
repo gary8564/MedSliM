@@ -26,6 +26,7 @@ from pathlib import Path
 
 from med_slim.model.ssl import MoCo
 from med_slim.data import PrecomputedFeatPairDataset
+from med_slim.data.feat_dataset import ssl_packed_collate_fn
 
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 
@@ -128,8 +129,12 @@ def main(args, cfg):
         print(f"Using local SSD feature cache: {local_base}")
     slice_encoder_models = feat_cfg["model_name"]
     view_planes = feat_cfg["plane"]
+    use_packed = getattr(args, "use_packed", False)
     num_target_slices = feat_cfg.get("num_target_slices", 32)
-    print(f"Slice sampling: all sequences will be sampled/padded to {num_target_slices} slices")
+    if use_packed:
+        print("Packed mode: using raw variable-length sequences (no subsampling / zero-padding)")
+    else:
+        print(f"Pad-or-sample mode: all sequences will be sampled/padded to {num_target_slices} slices")
     dataset = PrecomputedFeatPairDataset(
         feat_dirs=feat_dirs,
         slice_encoder_models=slice_encoder_models,
@@ -138,6 +143,7 @@ def main(args, cfg):
         max_feature_dim=max_feature_dim,
         num_target_slices=num_target_slices,
         cache_in_memory=True,
+        use_packed=use_packed,
     )
 
     if dataset.has_annotations:
@@ -148,10 +154,9 @@ def main(args, cfg):
     # Optional: convert to SyncBatchNorm when training across processes for parity with DDP
     if accelerator.num_processes > 1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    # DataLoader
     per_device_batch_size = max(1, int(global_batch_size / max(1, accelerator.num_processes)))
     print(f"Batch size per device: {per_device_batch_size}")
+    print(f"Sequence mode: {'packed' if use_packed else 'random subsampling'}")
     
     loader = DataLoader(
         dataset,
@@ -162,6 +167,7 @@ def main(args, cfg):
         pin_memory=True,
         persistent_workers=True,  # Keep workers alive between epochs
         prefetch_factor=4,  # Prefetch 4 batches per worker
+        collate_fn=ssl_packed_collate_fn if use_packed else None,
     )
 
     # Prepare with accelerator
@@ -229,14 +235,14 @@ def main(args, cfg):
                 # Packed sequence mode
                 x1 = batch["feats1"].to(dtype=torch.float32)
                 x2 = batch["feats2"].to(dtype=torch.float32)
-                cu_seqlens1 = batch["cu_seqlens1"].to(device=device)
-                cu_seqlens2 = batch["cu_seqlens2"].to(device=device)
+                cu_seqlens1 = batch["cu_seqlens1"].to(device=accelerator.device)
+                cu_seqlens2 = batch["cu_seqlens2"].to(device=accelerator.device)
                 max_seqlen1 = batch["max_seqlen1"]
                 max_seqlen2 = batch["max_seqlen2"]
                 sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
                 sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
-                seq_idx1 = batch["seq_idx1"].to(device=device)
-                seq_idx2 = batch["seq_idx2"].to(device=device)
+                seq_idx1 = batch["seq_idx1"].to(device=accelerator.device)
+                seq_idx2 = batch["seq_idx2"].to(device=accelerator.device)
                 
                 with accelerator.autocast():
                     loss = model(
@@ -292,10 +298,6 @@ def main(args, cfg):
                     num_labeled = has_label.sum().item()
                     log_dict["train/labeled_ratio"] = num_labeled / has_label.shape[0]
                 wandb.log(log_dict, step=global_step)
-
-        # Synchronization barrier: ensure all ranks finished the epoch before logging/checkpointing
-        # This helps catch GPU desync issues early rather than hanging during the next epoch
-        accelerator.wait_for_everyone()
 
         # Synchronization barrier: ensure all ranks finished the epoch before logging/checkpointing
         # This helps catch GPU desync issues early rather than hanging during the next epoch
@@ -393,6 +395,16 @@ if __name__ == "__main__":
             "Curriculum learning mode: Load model weights from --resume checkpoint but "
             "reset optimizer state and epoch counter. Use this when increasing datasets "
             "(e.g., pretrain on MRNet, then continue with MRNet+fastMRI). "
+        ),
+    )
+    parser.add_argument(
+        "--use-packed",
+        action="store_true",
+        help=(
+            "Use packed sequences instead of padded sequences for pretraining. "
+            "Packed mode concatenates variable-length sequences and uses cu_seqlens "
+            "to track boundaries, avoiding padding waste. "
+            "Requires Mamba2 (seq_idx) or Transformer with FlashAttention (varlen_attn)."
         ),
     )
     args = parser.parse_args()
