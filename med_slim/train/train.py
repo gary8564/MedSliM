@@ -64,7 +64,8 @@ def main(args, cfg):
 
     # Initialize Weights & Biases on main process
     if accelerator.is_main_process:
-        run_name = f"MRNet-fastMRI-KMAR50K-{args.sequence_encoder}-{args.pooling}-{CURR_TIME}"
+        msp_tag = "-msp" if cfg.get("msp", {}).get("enabled", False) else ""
+        run_name = f"MRNet-fastMRI-KMAR50K-{args.sequence_encoder}-{args.pooling}{msp_tag}-{CURR_TIME}"
         wandb.init(
             project="MedSliM-pretraining",
             name=run_name,
@@ -89,6 +90,17 @@ def main(args, cfg):
     if pooling == "abmil":
         encoder_kwargs["att_dim"] = cobra_cfg.get("attn_dim", 256)
     
+    # MSP (Masked Slice Prediction) config
+    msp_cfg = cfg.get("msp", {})
+    msp_enabled = msp_cfg.get("enabled", False)
+    msp_ctx_enabled = msp_enabled and msp_cfg.get("lambda_ctx", 0.0) > 0
+    if msp_enabled:
+        print("MSP enabled: Masked Slice Prediction auxiliary objective")
+        if msp_ctx_enabled:
+            print(f"Context loss enabled (lambda_ctx={msp_cfg['lambda_ctx']}, "
+                  f"distance_weighted={msp_cfg.get('ctx_distance_weighted', True)}, "
+                  f"warmup={msp_cfg.get('ctx_warmup_epochs', None)})")
+
     # Build model
     print("Creating model...")
     model = MoCo(
@@ -102,6 +114,14 @@ def main(args, cfg):
         dropout=cobra_cfg["dropout"],
         sequence_encoder=sequence_encoder,
         pooling=pooling,
+        msp_enabled=msp_enabled,
+        msp_lambda_mask=msp_cfg.get("lambda_mask", 1.0),
+        msp_lambda_ctx=msp_cfg.get("lambda_ctx", 0.0),
+        msp_mask_ratio=tuple(msp_cfg.get("mask_ratio", [0.3, 0.5])),
+        msp_predictor_depth=msp_cfg.get("predictor_depth", 2),
+        msp_predictor_dim=msp_cfg.get("predictor_dim", None),
+        msp_max_seq_len=msp_cfg.get("max_seq_len", 512),
+        msp_ctx_distance_weighted=msp_cfg.get("ctx_distance_weighted", True),
         **encoder_kwargs,
     )
 
@@ -223,6 +243,10 @@ def main(args, cfg):
             curr_lr = adjust_learning_rate(optimizer, e + i / iters_per_epoch, scaled_lr, cfg)
             curr_m = adjust_moco_momentum(e + i / iters_per_epoch, cfg)
 
+            if msp_ctx_enabled:
+                curr_ctx_lambda = adjust_msp_ctx_lambda(e + i / iters_per_epoch, cfg)
+                accelerator.unwrap_model(model).msp_lambda_ctx = curr_ctx_lambda
+
             optimizer.zero_grad(set_to_none=True)
             
             # Semi-supervised mode: pass labels when available (SupCon for labeled, InfoNCE for unlabeled)
@@ -245,7 +269,7 @@ def main(args, cfg):
                 seq_idx2 = batch["seq_idx2"].to(device=accelerator.device)
                 
                 with accelerator.autocast():
-                    loss = model(
+                    result = model(
                         x1, x2,
                         input_feature_dims_1=sizes1, input_feature_dims_2=sizes2,
                         m=curr_m,
@@ -265,7 +289,7 @@ def main(args, cfg):
                 seq_lens = batch["seq_len"].to(dtype=torch.long)
             
                 with accelerator.autocast():
-                    loss = model(
+                    result = model(
                         x1, x2, 
                         input_feature_dims_1=sizes1, input_feature_dims_2=sizes2, 
                         seq_lengths=seq_lens, 
@@ -274,6 +298,13 @@ def main(args, cfg):
                         has_label=has_label,
                     )
             
+            if isinstance(result, dict):
+                loss = result["loss"]
+                loss_components = {k: v.item() for k, v in result.items() if k != "loss"}
+            else:
+                loss = result
+                loss_components = {}
+
             # NaN check
             if torch.isnan(loss) or torch.isinf(loss):
                 raise RuntimeError(f"NaN/Inf loss detected at epoch {e+1} with iter {i}.")
@@ -294,6 +325,10 @@ def main(args, cfg):
                     "train/lr": curr_lr,
                     "train/momentum": curr_m,
                 }
+                for comp_name, comp_val in loss_components.items():
+                    log_dict[f"train/{comp_name}"] = comp_val
+                if msp_ctx_enabled:
+                    log_dict["train/msp_lambda_ctx"] = curr_ctx_lambda
                 if has_label is not None:
                     num_labeled = has_label.sum().item()
                     log_dict["train/labeled_ratio"] = num_labeled / has_label.shape[0]
@@ -317,6 +352,7 @@ def main(args, cfg):
                     "optimizer": optimizer.state_dict(),
                     "sequence_encoder": sequence_encoder,
                     "pooling": pooling,
+                    "msp_enabled": msp_enabled,
                 }
                 ckpt_name = f"medslim-epoch{e+1}.pth.tar"
                 torch.save(
@@ -345,6 +381,31 @@ def adjust_moco_momentum(epoch, cfg):
         1.0 - cfg["train"]["momentum"]
     )
     return m
+
+
+def adjust_msp_ctx_lambda(epoch, cfg):
+    """
+    Progressive warmup of the MSP context-loss coefficient λ_ctx.
+
+    Follows the V-JEPA 2.1 training recipe (Mur-Labadia et al., 2026)
+    which linearly warms up λ over a configurable epoch range to prevent
+    the context loss from dominating early training and degrading global
+    representations.
+
+    Returns the effective λ_ctx for the current epoch.
+    """
+    msp_cfg = cfg.get("msp", {})
+    base_lambda = msp_cfg.get("lambda_ctx", 0.0)
+    warmup = msp_cfg.get("ctx_warmup_epochs", None)
+    if warmup is None or base_lambda == 0.0:
+        return base_lambda
+    warmup_start, warmup_end = warmup
+    if epoch < warmup_start:
+        return 0.0
+    if epoch >= warmup_end:
+        return base_lambda
+    progress = (epoch - warmup_start) / max(1, warmup_end - warmup_start)
+    return base_lambda * progress
 
 
 if __name__ == "__main__":
@@ -407,6 +468,38 @@ if __name__ == "__main__":
             "Requires Mamba2 (seq_idx) or Transformer with FlashAttention (varlen_attn)."
         ),
     )
+    # MSP (Masked Slice Prediction) arguments
+    parser.add_argument(
+        "--msp",
+        action="store_true",
+        help="Enable Masked Slice Prediction (MSP) auxiliary objective.",
+    )
+    parser.add_argument(
+        "--msp-lambda-mask",
+        type=float,
+        default=None,
+        help="Weight for MSP loss on masked positions. Overrides config msp.lambda_mask.",
+    )
+    parser.add_argument(
+        "--msp-lambda-ctx",
+        type=float,
+        default=None,
+        help=(
+            "Weight for context loss on visible positions (V-JEPA 2.1). "
+            "Overrides config msp.lambda_ctx."
+        ),
+    )
+    parser.add_argument(
+        "--msp-mask-ratio",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("MIN", "MAX"),
+        help=(
+            "Contiguous masking ratio range (min max). "
+            "Example: --msp-mask-ratio 0.3 0.5. Overrides config msp.mask_ratio."
+        ),
+    )
     args = parser.parse_args()
     
     # Validate arg parser
@@ -438,6 +531,21 @@ if __name__ == "__main__":
         cfg["feat_dataset"]["plane"] = args.planes
         print(f"CLI override: planes={args.planes}")
     
+    if "msp" not in cfg:
+        cfg["msp"] = {}
+    if args.msp:
+        cfg["msp"]["enabled"] = True
+        print("CLI override: MSP enabled")
+    if args.msp_lambda_mask is not None:
+        cfg["msp"]["lambda_mask"] = args.msp_lambda_mask
+        print(f"CLI override: msp.lambda_mask={args.msp_lambda_mask}")
+    if args.msp_lambda_ctx is not None:
+        cfg["msp"]["lambda_ctx"] = args.msp_lambda_ctx
+        print(f"CLI override: msp.lambda_ctx={args.msp_lambda_ctx}")
+    if args.msp_mask_ratio is not None:
+        cfg["msp"]["mask_ratio"] = args.msp_mask_ratio
+        print(f"CLI override: msp.mask_ratio={args.msp_mask_ratio}")
+
     # Cross-FM contrastive learning requires at least 2 foundation models
     if len(cfg["feat_dataset"]["model_name"]) < 2:
         raise ValueError(

@@ -71,6 +71,13 @@ SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
 POOLING="abmil"                    # abmil (default) or cls (requires transformer encoder)
 USE_PACKED=true                   # true: packed sequences (no padding waste); false: random subsampling + padding
 
+# Masked Slice Prediction (MSP) — JEPA-style auxiliary objective
+# L = L_InfoNCE + lambda_mask * L_MSP + lambda_ctx * L_ctx
+USE_MSP=true                      # true: enable MSP; false: pure InfoNCE (default)
+MSP_LAMBDA_MASK=""                # Weight for MSP loss (leave empty for config default: 1.0)
+MSP_LAMBDA_CTX=""                 # Weight for V-JEPA 2.1 context loss (leave empty for config default: 0.0)
+MSP_MASK_RATIO=""                 # Contiguous masking ratio "min max" (leave empty for config default: "0.3 0.5")
+
 ### Build command arguments
 EXTRA_ARGS=""
 [[ -n "${RESUME_PATH}" ]]  && EXTRA_ARGS+=" --resume ${RESUME_PATH}"
@@ -78,6 +85,10 @@ EXTRA_ARGS=""
 [[ -n "${MODEL_NAMES}" ]]  && EXTRA_ARGS+=" --model-names ${MODEL_NAMES}"
 [[ -n "${PLANES}" ]]       && EXTRA_ARGS+=" --planes ${PLANES}"
 [[ "${USE_PACKED}" == true ]] && EXTRA_ARGS+=" --use-packed"
+[[ "${USE_MSP}" == true ]]    && EXTRA_ARGS+=" --msp"
+[[ -n "${MSP_LAMBDA_MASK}" ]] && EXTRA_ARGS+=" --msp-lambda-mask ${MSP_LAMBDA_MASK}"
+[[ -n "${MSP_LAMBDA_CTX}" ]]  && EXTRA_ARGS+=" --msp-lambda-ctx ${MSP_LAMBDA_CTX}"
+[[ -n "${MSP_MASK_RATIO}" ]]  && EXTRA_ARGS+=" --msp-mask-ratio ${MSP_MASK_RATIO}"
 
 ### Run
 accelerate launch --num_processes=$NUM_GPUS --mixed_precision=bf16 \

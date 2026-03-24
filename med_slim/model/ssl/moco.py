@@ -15,6 +15,10 @@ An Empirical Study of Training Self-Supervised Vision Transformers.
     https://arxiv.org/abs/2306.00984
 [5] Guinot, Julien, et al. "Semi-Supervised Contrastive Learning of Musical
     Representations." ISMIR 2024. https://arxiv.org/abs/2407.13840
+[6] Assran, Mahmoud, et al. "Self-Supervised Learning from Images with a Joint-Embedding
+    Predictive Architecture." CVPR 2023. https://arxiv.org/abs/2301.08243
+[7] Mur-Labadia, Lorenzo, et al. "V-JEPA 2.1: Unlocking Dense Features in Video
+    Self-Supervised Learning." 2026. https://arxiv.org/abs/2603.14482
 """
 
 import torch
@@ -24,6 +28,11 @@ from typing import List, Optional
 from accelerate import Accelerator
 
 from med_slim.model.sequence_encoder.cobra import Cobra
+from med_slim.model.ssl.msp_predictor import MSPPredictor
+from med_slim.model.ssl.masking import (
+    generate_contiguous_slice_mask,
+    generate_contiguous_slice_mask_packed,
+)
 
 class MoCo(nn.Module): 
     """
@@ -51,6 +60,14 @@ class MoCo(nn.Module):
         dropout: float = 0.25,
         sequence_encoder: str = "mamba2",
         pooling: str = "abmil",
+        msp_enabled: bool = False,
+        msp_lambda_mask: float = 1.0,
+        msp_lambda_ctx: float = 0.0,
+        msp_mask_ratio: tuple = (0.3, 0.5),
+        msp_predictor_depth: int = 2,
+        msp_predictor_dim: int | None = None,
+        msp_max_seq_len: int = 512,
+        msp_ctx_distance_weighted: bool = True,
         **kwargs,
     ):
         """
@@ -66,6 +83,18 @@ class MoCo(nn.Module):
             dropout: Dropout rate.
             sequence_encoder: "mamba2" (default) or "transformer".
             pooling: Slice pooling method - "abmil" (default) or "cls" (requires transformer).
+            msp_enabled: Enable Masked Slice Prediction auxiliary objective.
+            msp_lambda_mask: Weight for MSP loss on masked positions.
+            msp_lambda_ctx: Base weight λ for context loss on visible positions (V-JEPA 2.1).  Set to 0 to disable.  
+                When msp_ctx_distance_weighted=True, each visible slice receives
+                per-token weight λ_i = λ / sqrt(d_min) following Eq. 3 of V-JEPA 2.1 (Mur-Labadia et al., 2026).
+                When msp_ctx_distance_weighted=False, all visible slices contribute equally (uniform weight).
+            msp_mask_ratio: (min_ratio, max_ratio) for contiguous masking.
+            msp_predictor_depth: Number of residual MLP blocks in the MSP predictor.
+            msp_predictor_dim: Hidden dimension of the MSP predictor. Defaults to embed_dim // 4.
+            msp_max_seq_len: Maximum sequence length for positional embeddings.
+            msp_ctx_distance_weighted: Use V-JEPA 2.1 inverse-sqrt-distance weighting for context loss (Eq. 3).  
+                When msp_ctx_distance_weighted=False, all visible slices contribute equally (uniform weight).
             **kwargs: Encoder/pooling-specific parameters (passed to Cobra):
                 - d_state (int): Mamba2 internal state dim (default: 128)
                 - dim_feedforward (int): Transformer FFN hidden size (default: 4 * embed_dim)
@@ -80,6 +109,11 @@ class MoCo(nn.Module):
 
         self.T = T
         self.accelerator = accelerator
+        self.msp_enabled = msp_enabled
+        self.msp_lambda_mask = msp_lambda_mask
+        self.msp_lambda_ctx = msp_lambda_ctx
+        self.msp_mask_ratio = tuple(msp_mask_ratio)
+        self.msp_ctx_distance_weighted = msp_ctx_distance_weighted
 
         # Shared encoder kwargs
         encoder_kwargs = dict(
@@ -103,6 +137,18 @@ class MoCo(nn.Module):
             nn.Linear(2 * contrast_dim,contrast_dim),
             nn.BatchNorm1d(contrast_dim),
         )
+
+        # MSP components
+        if self.msp_enabled:
+            self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
+            nn.init.normal_(self.mask_token, std=0.02)
+            self.msp_predictor = MSPPredictor(
+                embed_dim=embed_dim,
+                hidden_dim=msp_predictor_dim,
+                num_layers=msp_predictor_depth,
+                max_seq_len=msp_max_seq_len,
+                dropout=dropout,
+            )
 
         for param_b, param_m in zip(self.base_encoder.parameters(), self.momentum_encoder.parameters()):
             param_m.data.copy_(param_b.data)  # initialize the momentum encoder with the base encoder
@@ -241,6 +287,198 @@ class MoCo(nn.Module):
         
         return loss * (2 * self.T)
 
+    @staticmethod
+    def _distance_weights(
+        visible_positions: torch.Tensor,
+        mask_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute inverse-sqrt-distance weights for context tokens.
+
+        Implements Eq. 3 of Mur-Labadia et al. (2026):
+            λ_i = λ / sqrt(d_min(i, M))
+
+        The base λ is applied externally via msp_lambda_ctx.
+
+        Args:
+            visible_positions: 1-D indices of visible slices [N_vis].
+            mask_positions: 1-D indices of masked slices [N_mask].
+
+        Returns:
+            Normalized per-token weights [N_vis] (float, same device).
+        """
+        dists = (visible_positions.unsqueeze(1) - mask_positions.unsqueeze(0)).abs()  # [N_vis, N_mask]
+        d_min = dists.min(dim=1).values.float().clamp(min=1.0)  # [N_vis]
+        w = 1.0 / d_min.sqrt()
+        w = w * (w.numel() / w.sum().clamp(min=1e-8))
+        return w
+
+    def _compute_msp_loss(
+        self,
+        x1: torch.Tensor,
+        *,
+        input_feature_dims_1: torch.Tensor | None = None,
+        seq_lengths: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute Masked Slice Prediction loss.
+
+        Masks a contiguous block of slices from one FM-view, runs the student
+        encoder on the masked sequence, and predicts the teacher encoder's
+        hidden states at masked positions via the MSP predictor.
+
+        Returns:
+            (loss_msp, loss_ctx): MSP loss on masked positions and optional
+            context loss on visible positions.
+        """
+        B, num_slices, _ = x1.shape
+        device = x1.device
+
+        # Determine valid lengths per sample
+        if seq_lengths is not None:
+            eff_lengths = seq_lengths
+        else:
+            eff_lengths = torch.full((B,), num_slices, dtype=torch.long, device=device)
+
+        # Generate contiguous slice mask [B, num_slices]
+        slice_mask = generate_contiguous_slice_mask(
+            eff_lengths, mask_ratio_range=self.msp_mask_ratio, max_seq_len=num_slices,
+        ).to(device)
+
+        # Student: mask and encode masked FM-view to get per-slice hidden states
+        h_student = self.base_encoder(
+            x1,
+            input_feature_dims=input_feature_dims_1,
+            seq_lengths=seq_lengths,
+            return_slice_embeddings=True,
+            slice_mask=slice_mask,
+            mask_token=self.mask_token,
+        )  # [B, num_slices, embed_dim]
+
+        # Teacher: encode full FM-view to get per-slice hidden states (targets)
+        with torch.no_grad():
+            h_teacher = self.momentum_encoder(
+                x1,
+                input_feature_dims=input_feature_dims_1,
+                seq_lengths=seq_lengths,
+                return_slice_embeddings=True,
+            )  # [B, num_slices, embed_dim]
+
+        # Build valid mask (exclude padding from loss)
+        valid_mask = torch.ones(B, num_slices, dtype=torch.bool, device=device)
+        if seq_lengths is not None:
+            positions = torch.arange(num_slices, device=device).unsqueeze(0)
+            valid_mask = positions < seq_lengths.unsqueeze(1)
+
+        # MSP loss: masked slice positions only
+        masked_valid = slice_mask & valid_mask  # [B, num_slices]
+        h_s_masked = h_student[masked_valid]    # [N_masked, embed_dim]
+        h_t_masked = h_teacher[masked_valid]    # [N_masked, embed_dim]
+
+        # Position indices (column index within each sample)
+        pos_masked = masked_valid.nonzero()[:, 1]  # [N_masked]
+
+        h_pred = self.msp_predictor(h_s_masked, pos_masked)
+        loss_msp = F.mse_loss(h_pred, h_t_masked.detach())
+
+        # Context loss: visible (non-masked and non-padded) slice positions
+        loss_ctx = torch.tensor(0.0, device=device)
+        if self.msp_lambda_ctx > 0:
+            visible_valid = (~slice_mask) & valid_mask
+            if visible_valid.any():
+                h_s_vis = h_student[visible_valid]     # [N_vis, embed_dim]
+                h_t_vis = h_teacher[visible_valid]
+
+                if self.msp_ctx_distance_weighted:
+                    vis_pos = visible_valid.nonzero()[:, 1]
+                    mask_pos = masked_valid.nonzero()[:, 1]
+                    w = self._distance_weights(vis_pos, mask_pos)  # [N_vis]
+                    per_token = ((h_s_vis - h_t_vis.detach()) ** 2).mean(dim=1)
+                    loss_ctx = (w * per_token).mean()
+                else:
+                    loss_ctx = F.mse_loss(h_s_vis, h_t_vis.detach())
+
+        return loss_msp, loss_ctx
+
+    def _compute_msp_loss_packed(
+        self,
+        x1: torch.Tensor,
+        *,
+        input_feature_dims_1: torch.Tensor = None,
+        cu_seqlens1: torch.Tensor = None,
+        max_seqlen1: int = None,
+        seq_idx1: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute Masked Slice Prediction loss (packed mode).
+
+        Same logic as _compute_msp_loss but operates on packed tensors.
+
+        Returns:
+            (loss_msp, loss_ctx)
+        """
+        device = x1.device
+
+        # Generate contiguous slice mask [total_seq_len]
+        slice_mask = generate_contiguous_slice_mask_packed(
+            cu_seqlens1, mask_ratio_range=self.msp_mask_ratio,
+        ).to(device)
+
+        # Student: encode masked view → per-slice hidden states
+        h_student = self.base_encoder(
+            x1,
+            input_feature_dims=input_feature_dims_1,
+            use_packed=True,
+            cu_seqlens=cu_seqlens1,
+            max_seqlen=max_seqlen1,
+            seq_idx=seq_idx1,
+            return_slice_embeddings=True,
+            slice_mask=slice_mask,
+            mask_token=self.mask_token,
+        )  # [total_seq_len, embed_dim]
+
+        # Teacher: encode full view → per-slice hidden states
+        with torch.no_grad():
+            h_teacher = self.momentum_encoder(
+                x1,
+                input_feature_dims=input_feature_dims_1,
+                use_packed=True,
+                cu_seqlens=cu_seqlens1,
+                max_seqlen=max_seqlen1,
+                seq_idx=seq_idx1,
+                return_slice_embeddings=True,
+            )  # [total_seq_len, embed_dim]
+
+        # MSP loss: masked slice positions only
+        h_s_masked = h_student[slice_mask]  # [N_masked, embed_dim]
+        h_t_masked = h_teacher[slice_mask]
+
+        # Local positions within each sequence
+        global_indices = slice_mask.nonzero().squeeze(-1)
+        sample_ids = seq_idx1[global_indices].long()
+        local_positions = global_indices - cu_seqlens1[sample_ids]
+
+        h_pred = self.msp_predictor(h_s_masked, local_positions)
+        loss_msp = F.mse_loss(h_pred, h_t_masked.detach())
+
+        # Context loss: visible (non-masked and non-padded) slice positions
+        loss_ctx = torch.tensor(0.0, device=device)
+        if self.msp_lambda_ctx > 0:
+            visible_mask = ~slice_mask
+            if visible_mask.any():
+                h_s_vis = h_student[visible_mask]
+                h_t_vis = h_teacher[visible_mask]
+
+                if self.msp_ctx_distance_weighted:
+                    vis_global = visible_mask.nonzero().squeeze(-1)
+                    w = self._distance_weights(vis_global, global_indices)
+                    per_token = ((h_s_vis - h_t_vis.detach()) ** 2).mean(dim=1)
+                    loss_ctx = (w * per_token).mean()
+                else:
+                    loss_ctx = F.mse_loss(h_s_vis, h_t_vis.detach())
+
+        return loss_msp, loss_ctx
+
     def _forward(
         self, 
         x1, 
@@ -252,7 +490,7 @@ class MoCo(nn.Module):
         seq_lengths: torch.Tensor = None,
         labels: torch.Tensor | None = None,
         has_label: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | dict:
         """        
         Args:
             x1: First view features [B, num_slices, feature_dim]
@@ -289,10 +527,33 @@ class MoCo(nn.Module):
                 x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths
             )
 
-        return (
+        loss_infonce = (
             self.contrastive_loss(q1, k2, labels=labels, has_label=has_label) + 
             self.contrastive_loss(q2, k1, labels=labels, has_label=has_label)
         )
+
+        if not self.msp_enabled:
+            return loss_infonce
+
+        # MSP branch: masked slice prediction on the first FM-view
+        loss_msp, loss_ctx = self._compute_msp_loss(
+            x1,
+            input_feature_dims_1=input_feature_dims_1,
+            seq_lengths=seq_lengths,
+        )
+
+        total_loss = (
+            loss_infonce
+            + self.msp_lambda_mask * loss_msp
+            + self.msp_lambda_ctx * loss_ctx
+        )
+
+        return {
+            "loss": total_loss,
+            "loss_infonce": loss_infonce.detach(),
+            "loss_msp": loss_msp.detach(),
+            "loss_ctx": loss_ctx.detach(),
+        }
     
     def _forward_packed(
         self,
@@ -349,10 +610,35 @@ class MoCo(nn.Module):
                 seq_idx=seq_idx2,
             )
 
-        return (
+        loss_infonce = (
             self.contrastive_loss(q1, k2, labels=labels, has_label=has_label) + 
             self.contrastive_loss(q2, k1, labels=labels, has_label=has_label)
         )
+
+        if not self.msp_enabled:
+            return loss_infonce
+
+        # MSP branch: masked slice prediction on view_1
+        loss_msp, loss_ctx = self._compute_msp_loss_packed(
+            x1,
+            input_feature_dims_1=input_feature_dims_1,
+            cu_seqlens1=cu_seqlens1,
+            max_seqlen1=max_seqlen1,
+            seq_idx1=seq_idx1,
+        )
+
+        total_loss = (
+            loss_infonce
+            + self.msp_lambda_mask * loss_msp
+            + self.msp_lambda_ctx * loss_ctx
+        )
+
+        return {
+            "loss": total_loss,
+            "loss_infonce": loss_infonce.detach(),
+            "loss_msp": loss_msp.detach(),
+            "loss_ctx": loss_ctx.detach(),
+        }
 
     def forward(
         self, 
@@ -364,7 +650,7 @@ class MoCo(nn.Module):
         m: float = 0.99,
         use_packed: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | dict:
         """        
         Args:
             x1: First view features
@@ -386,7 +672,8 @@ class MoCo(nn.Module):
                     - seq_idx1, seq_idx2: Document index per token with shape [total_seq_len]
             
         Returns:
-            Contrastive loss.
+            When MSP is disabled: scalar contrastive loss.
+            When MSP is enabled: dict with keys loss (total), loss_infonce, loss_msp, and loss_ctx.
         """
         if use_packed:
             return self._forward_packed(

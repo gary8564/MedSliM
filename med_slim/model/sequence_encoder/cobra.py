@@ -492,6 +492,8 @@ class Cobra(nn.Module):
         cu_seqlens: torch.Tensor = None,
         max_seqlen: int = None,
         seq_idx: torch.Tensor = None,
+        slice_mask: torch.Tensor = None,
+        mask_token: torch.Tensor = None,
         **_,  # Ignore extra kwargs
     ) -> torch.Tensor:
         """Forward pass for packed/variable-length sequences."""
@@ -502,6 +504,14 @@ class Cobra(nn.Module):
             logits = self._embed_inference_forward(x)
         else:
             logits = self._embed_ssl_forward_packed(x, cu_seqlens, input_feature_dims)
+        
+        # MSP: replace masked positions with mask_token
+        if slice_mask is not None and mask_token is not None:
+            logits = torch.where(
+                slice_mask.unsqueeze(-1),
+                mask_token.expand_as(logits),
+                logits,
+            )
         
         # Sequence encoder
         if self.sequence_encoder == "transformer" and hasattr(self, 'varlen_seq_enc'):
@@ -554,6 +564,8 @@ class Cobra(nn.Module):
         get_per_head_attention=False,
         return_slice_embeddings=False,
         seq_lengths=None,
+        slice_mask=None,
+        mask_token=None,
         **_,
     ):
         """Forward pass main function."""
@@ -562,6 +574,14 @@ class Cobra(nn.Module):
             logits = self._embed_inference_forward(x)
         else:
             logits = self._embed_ssl_forward(x, input_feature_dims)
+
+        # MSP: replace masked positions with mask_token
+        if slice_mask is not None and mask_token is not None:
+            logits = torch.where(
+                slice_mask.unsqueeze(-1).expand_as(logits),
+                mask_token.unsqueeze(0).expand_as(logits),
+                logits,
+            )
 
         # Build attention mask if seq_lengths is provided
         mask = None
@@ -642,6 +662,8 @@ class Cobra(nn.Module):
         get_per_head_attention=False,
         return_slice_embeddings=False,
         use_packed: bool = False,
+        slice_mask=None,
+        mask_token=None,
         **kwargs,
     ):
         """
@@ -656,6 +678,10 @@ class Cobra(nn.Module):
             get_per_head_attention: If True, return per-head attention [B, num_heads, num_slices] (ABMIL only).
             return_slice_embeddings: If True, return slice-level embeddings [B, num_slices, embed_dim] before pooling.
             use_packed: If True, use packed sequence for variable sequence length handling.
+            slice_mask: Optional boolean mask for MSP. True = masked.
+                - Padded mode: [B, num_slices]
+                - Packed mode: [total_seq_len]
+            mask_token: Learnable mask-token embedding [1, embed_dim] (for masked slice prediction).
             **kwargs: Mode-specific parameters:
                 Padded mode:
                     - seq_lengths: Actual sequence lengths [B] for masking padded positions.
@@ -678,6 +704,8 @@ class Cobra(nn.Module):
                 input_feature_dims=input_feature_dims,
                 get_attention=get_attention,
                 return_slice_embeddings=return_slice_embeddings,
+                slice_mask=slice_mask,
+                mask_token=mask_token,
                 **kwargs,
             )
         else:
@@ -687,5 +715,7 @@ class Cobra(nn.Module):
                 get_attention=get_attention,
                 get_per_head_attention=get_per_head_attention,
                 return_slice_embeddings=return_slice_embeddings,
+                slice_mask=slice_mask,
+                mask_token=mask_token,
                 **kwargs,
             )

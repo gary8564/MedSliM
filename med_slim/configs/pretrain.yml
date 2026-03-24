@@ -107,3 +107,20 @@ train:
     patience: 10
   save_ckpt_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K"
 
+# Masked Slice Prediction (MSP): JEPA-style auxiliary objective.
+# Predicts teacher encoder hidden states for contiguously masked slices.
+# Combined with InfoNCE: L = L_InfoNCE + lambda_mask * L_MSP + lambda_ctx * L_ctx
+# Set enabled: false to fall back to pure InfoNCE (default MedSliM behavior).
+msp:
+  enabled: false
+  lambda_mask: 1.0        # Weight for MSP loss on masked positions
+  lambda_ctx: 0.0         # Base weight λ for context loss on visible positions (V-JEPA 2.1); 0 = disabled
+  mask_ratio: [0.3, 0.5]  # [min_ratio, max_ratio] for contiguous masking
+  predictor_depth: 2      # Number of residual MLP blocks in the MSP predictor
+  predictor_dim: null      # Hidden dim of predictor (null = embed_dim // 4)
+  max_seq_len: 512        # Max sequence length for positional embeddings
+  ctx_distance_weighted: true  # Per-token weight λ_i = λ / sqrt(d_min); false = uniform weight
+  ctx_warmup_epochs: null      # [start, end] epoch range for linear warmup of lambda_ctx; 
+                               # null = no warmup
+                               # Example: ctx_warmup_epochs: [50, 150] linearly ramps lambda_ctx from 0 to lambda_ctx over epochs 50–150
+
