@@ -29,7 +29,7 @@ NUM_GPUS=1
 
 ### Configuration
 # Checkpoint to resume from (leave empty for training from scratch)
-#RESUME_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/test-run-MRNet/2026-02-08-18:35/medslim-epoch2000.pth.tar"
+# RESUME_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-03-23-15:57/medslim-epoch2700.pth.tar"
 
 # Curriculum learning: load model weights only, reset optimizer and epoch.
 # Set to true when adding new datasets or adding new slice encoder models.
@@ -69,7 +69,7 @@ PLANES=""
 # Sequence encoder and pooling
 SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
 POOLING="abmil"                    # abmil (default) or cls (requires transformer encoder)
-USE_PACKED=true                   # true: packed sequences (no padding waste); false: random subsampling + padding
+USE_PACKED=false                   # true: packed sequences (no padding waste); false: random subsampling + padding
 
 # Masked Slice Prediction (MSP) — JEPA-style auxiliary objective
 # L = L_InfoNCE + lambda_mask * L_MSP + lambda_ctx * L_ctx

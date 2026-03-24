@@ -119,7 +119,7 @@ def main(args, cfg):
         msp_lambda_ctx=msp_cfg.get("lambda_ctx", 0.0),
         msp_mask_ratio=tuple(msp_cfg.get("mask_ratio", [0.3, 0.5])),
         msp_predictor_depth=msp_cfg.get("predictor_depth", 2),
-        msp_predictor_dim=msp_cfg.get("predictor_dim", None),
+        msp_predictor_dim=msp_cfg.get("predictor_dim") if isinstance(msp_cfg.get("predictor_dim"), int) else None,
         msp_max_seq_len=msp_cfg.get("max_seq_len", 512),
         msp_ctx_distance_weighted=msp_cfg.get("ctx_distance_weighted", True),
         **encoder_kwargs,
@@ -396,8 +396,8 @@ def adjust_msp_ctx_lambda(epoch, cfg):
     """
     msp_cfg = cfg.get("msp", {})
     base_lambda = msp_cfg.get("lambda_ctx", 0.0)
-    warmup = msp_cfg.get("ctx_warmup_epochs", None)
-    if warmup is None or base_lambda == 0.0:
+    warmup = msp_cfg.get("ctx_warmup_epochs")
+    if not isinstance(warmup, list) or base_lambda == 0.0:
         return base_lambda
     warmup_start, warmup_end = warmup
     if epoch < warmup_start:
@@ -513,7 +513,7 @@ if __name__ == "__main__":
         cfg_data = yaml.safe_load(f)
 
     template_env = Environment(loader=FileSystemLoader(searchpath="./"))
-    template = template_env.from_string(str(cfg_data))
+    template = template_env.from_string(yaml.dump(cfg_data, default_flow_style=False))
     # Render the template with the values from the config_data
     cfg = yaml.safe_load(template.render(**cfg_data))
     
