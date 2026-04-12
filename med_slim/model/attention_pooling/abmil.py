@@ -32,7 +32,6 @@ class BatchedABMIL(nn.Module):
         super(BatchedABMIL, self).__init__()
 
         self.activation = activation
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
         # attention_V = tanh(V h_k)
         self.attention_V = nn.ModuleList([

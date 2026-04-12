@@ -168,19 +168,3 @@ class MriCoreFeatureExtractor(nn.Module):
         features = rearrange(features, '(b d) e -> b d e', b=B)  # [B, D, 768]
         return features
 
-
-if __name__ == "__main__":
-    checkpoint_path = "/hpcwork/rwth1833/models/mri_core/mri_foundation.pth"
-    
-    extractor = MriCoreFeatureExtractor(checkpoint_path=checkpoint_path)
-    
-    # Freeze parameters
-    for param in extractor.parameters():
-        param.requires_grad = False
-    
-    total_params = sum(p.numel() for p in extractor.parameters())
-    print(f"{total_params:,} total parameters.")
-    
-    trainable_params = sum(p.numel() for p in extractor.parameters() if p.requires_grad)
-    print(f"{trainable_params:,} trainable parameters.")
-    print(f"Embed dim: {extractor.embed_dim}")

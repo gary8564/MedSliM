@@ -258,24 +258,3 @@ class ArkFeatureExtractor(nn.Module):
         features = rearrange(features, '(b d) e -> b d e', b=B) # [(B D), embed_dim] -> [B, D, embed_dim]
         return features
     
-if __name__ == "__main__":
-    # Pretrained Ark checkpoint
-    checkpoint_path = "/hpcwork/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
-    
-    # Load the pre-trained Ark model
-    feature_extractor = ArkFeatureExtractor(
-        model_checkpoint_path=checkpoint_path,
-        device="cpu",
-        use_projector=True
-    )
-    
-    for name, param in feature_extractor.model.named_parameters():
-        param.requires_grad = False
-
-    # Print model statistics
-    total_params = sum(p.numel() for p in feature_extractor.model.parameters())
-    print(f"{total_params:,} total parameters.")
-    total_trainable_params = sum(
-        p.numel() for p in feature_extractor.model.parameters() if p.requires_grad)
-    print(f"{total_trainable_params:,} training parameters.")
-    

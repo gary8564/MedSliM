@@ -11,18 +11,19 @@ An Empirical Study of Training Self-Supervised Vision Transformers.
 """
 import torch
 import os
-import builtins
 import argparse
 import yaml
 import math
+import logging
 import wandb
 from torch.utils.data import DataLoader
 from jinja2 import Environment, FileSystemLoader
-from pprint import pprint
 from datetime import datetime
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from tqdm import tqdm
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from med_slim.model.ssl import MoCo
 from med_slim.data import PrecomputedFeatPairDataset
@@ -55,12 +56,8 @@ def main(args, cfg):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
 
-    if not accelerator.is_main_process:
-        def print_pass(*_args, **_kwargs):
-            pass
-        builtins.print = print_pass
-
-    pprint(cfg)
+    if accelerator.is_main_process:
+        logger.info("Config:\n%s", yaml.dump(cfg, default_flow_style=False))
 
     # Initialize Weights & Biases on main process
     if accelerator.is_main_process:
@@ -90,7 +87,7 @@ def main(args, cfg):
         encoder_kwargs["att_dim"] = cobra_cfg.get("attn_dim", 256)
     
     # Build model
-    print("Creating model...")
+    logger.info("Creating model...")
     model = MoCo(
         embed_dim=cobra_cfg["embed_dim"],
         contrast_dim=cobra_cfg["contrast_dim"],
@@ -106,7 +103,7 @@ def main(args, cfg):
     )
 
     model_params = sum(p.numel() for p in model.parameters())
-    print(f"Number of model parameters: {model_params}")
+    logger.info("Number of model parameters: {model_params}")
     
     # Learning rate scaling rule 
     base_lr = float(cfg["train"]["learning_rate"])
@@ -120,21 +117,24 @@ def main(args, cfg):
     feat_cfg = cfg["feat_dataset"]
     feat_dirs = feat_cfg["datasets"]
 
-    # If features were staged to local SSD, rewrite base paths
+    # If features were staged to local SSD, rewrite base paths.
+    # MEDSLIM_FEAT_BASE_OVERRIDE replaces the longest common prefix of all
+    # feat_dir entries, so it works regardless of the original absolute paths.
     local_base = os.environ.get("MEDSLIM_FEAT_BASE_OVERRIDE")
     if local_base:
-        hpcwork_base = "/hpcwork/rwth1833/feat_caches"
+        original_dirs = [ds["feat_dir"] for ds in feat_dirs]
+        common_prefix = os.path.commonpath(original_dirs)
         for ds in feat_dirs:
-            ds["feat_dir"] = ds["feat_dir"].replace(hpcwork_base, local_base)
-        print(f"Using local SSD feature cache: {local_base}")
+            ds["feat_dir"] = ds["feat_dir"].replace(common_prefix, local_base, 1)
+        logger.info("Using local SSD feature cache: {local_base} (replaced prefix: {common_prefix})")
     slice_encoder_models = feat_cfg["model_name"]
     view_planes = feat_cfg["plane"]
     use_packed = getattr(args, "use_packed", False)
     num_target_slices = feat_cfg.get("num_target_slices", 32)
     if use_packed:
-        print("Packed mode: using raw variable-length sequences (no subsampling / zero-padding)")
+        logger.info("Packed mode: using raw variable-length sequences (no subsampling / zero-padding)")
     else:
-        print(f"Pad-or-sample mode: all sequences will be sampled/padded to {num_target_slices} slices")
+        logger.info("Pad-or-sample mode: all sequences will be sampled/padded to {num_target_slices} slices")
     dataset = PrecomputedFeatPairDataset(
         feat_dirs=feat_dirs,
         slice_encoder_models=slice_encoder_models,
@@ -147,16 +147,16 @@ def main(args, cfg):
     )
 
     if dataset.has_annotations:
-        print(f"Semi-supervised mode: {dataset.num_labels} labels detected")
+        logger.info("Semi-supervised mode: {dataset.num_labels} labels detected")
     else:
-        print("Self-supervised mode: no annotations (pure InfoNCE)")
+        logger.info("Self-supervised mode: no annotations (pure InfoNCE)")
 
     # Optional: convert to SyncBatchNorm when training across processes for parity with DDP
     if accelerator.num_processes > 1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     per_device_batch_size = max(1, int(global_batch_size / max(1, accelerator.num_processes)))
-    print(f"Batch size per device: {per_device_batch_size}")
-    print(f"Sequence mode: {'packed' if use_packed else 'random subsampling'}")
+    logger.info("Batch size per device: {per_device_batch_size}")
+    logger.info("Sequence mode: {'packed' if use_packed else 'random subsampling'}")
     
     loader = DataLoader(
         dataset,
@@ -173,43 +173,22 @@ def main(args, cfg):
     # Prepare with accelerator
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
     
-    # Load checkpoint if args.resume is provided
     start_epoch = 0
     if args.resume and os.path.isfile(args.resume):
-        print(f"Loading checkpoint '{args.resume}'")
+        logger.info("Loading checkpoint '{args.resume}'")
         checkpoint = torch.load(args.resume, map_location="cpu")
-        # TODO: Remove this once all checkpoints are updated
-        # Handle legacy checkpoint key names (mamba_enc -> seq_enc)
-        # Old checkpoints used "mamba_enc" but new code uses generic "seq_enc"
-        state_dict = checkpoint["state_dict"]
-        
-        # Handle legacy checkpoint key formats
-        remapped_state_dict = {}
-        for key, value in state_dict.items():
-            new_key = key
-            # Remap legacy mamba_enc -> seq_enc
-            if "mamba_enc" in new_key:
-                new_key = new_key.replace("mamba_enc", "seq_enc")
-            # Skip removed varlen_seq_enc keys from old checkpoints
-            #TODO: remove this once all checkpoints are updated
-            if "varlen_seq_enc" in new_key:
-                continue
-            remapped_state_dict[new_key] = value        
-        if any("mamba_enc" in k for k in state_dict.keys()):
-            print("Detected legacy checkpoint format, remapping keys: mamba_enc -> seq_enc")
-        
-        accelerator.unwrap_model(model).load_state_dict(remapped_state_dict)
+        accelerator.unwrap_model(model).load_state_dict(checkpoint["state_dict"])
         
         if args.curriculum:
             # Curriculum learning: load model weights only, reset optimizer and epoch
             # Use this when changing datasets (e.g., MRNet -> MRNet+fastMRI)
-            print("Curriculum learning mode: loaded model weights, reset optimizer and epoch counter")
-            print("Starting fresh training from epoch 0 with new dataset configuration")
+            logger.info("Curriculum learning mode: loaded model weights, reset optimizer and epoch counter")
+            logger.info("Starting fresh training from epoch 0 with new dataset configuration")
         else:
             # Standard resume: continue training from saved state
             start_epoch = checkpoint.get("epoch", 0)
             optimizer.load_state_dict(checkpoint["optimizer"])
-            print(f"Resuming training from epoch {start_epoch}")
+            logger.info("Resuming training from epoch {start_epoch}")
     else:
         if args.resume:
             raise FileNotFoundError(f"No checkpoint found at '{args.resume}'")
@@ -305,7 +284,7 @@ def main(args, cfg):
 
         if accelerator.is_main_process:
             avg_loss = total_loss / len(loader)
-            print(f"Epoch {e+1}; loss: {avg_loss:.4f}; lr: {curr_lr:.5f}")
+            logger.info("Epoch {e+1}; loss: {avg_loss:.4f}; lr: {curr_lr:.5f}")
             wandb.log({
                 "train/epoch": e + 1,
                 "train/epoch_loss": avg_loss,
@@ -432,11 +411,11 @@ if __name__ == "__main__":
             raise ValueError(f"Unknown model name(s) {unknown}. Known: {list(fm_choices.keys())}")
         cfg["feat_dataset"]["model_name"] = args.model_names
         cfg["model"]["cobra"]["input_dims"] = sorted(set(fm_choices[m] for m in args.model_names))
-        print(f"CLI override: model_names={args.model_names}, input_dims={cfg['model']['cobra']['input_dims']}")
+        logger.info("CLI override: model_names={args.model_names}, input_dims={cfg['model']['cobra']['input_dims']}")
     
     if args.planes:
         cfg["feat_dataset"]["plane"] = args.planes
-        print(f"CLI override: planes={args.planes}")
+        logger.info("CLI override: planes={args.planes}")
     
     # Cross-FM contrastive learning requires at least 2 foundation models
     if len(cfg["feat_dataset"]["model_name"]) < 2:
@@ -450,14 +429,14 @@ if __name__ == "__main__":
     # otherwise (fresh start/curriculum learning) create a new saved checkpoint folder
     if args.resume and not args.curriculum:
         save_dir = str(Path(args.resume).parent)
-        print(f"Resuming from checkpoint, saving to existing directory: {save_dir}")
+        logger.info("Resuming from checkpoint, saving to existing directory: {save_dir}")
     else:
         save_dir = f"{cfg['train']['save_ckpt_path']}/{CURR_TIME}"
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         with open(os.path.join(save_dir, "config.yaml"), "w") as f:
             yaml.dump(cfg, f, sort_keys=False, default_flow_style=False)
         if args.curriculum:
-            print(f"Curriculum learning: saving new checkpoints to separate directory: {save_dir}")
+            logger.info("Curriculum learning: saving new checkpoints to separate directory: {save_dir}")
     
     # Update config with the resolved save directory
     cfg["train"]["save_ckpt_path"] = save_dir

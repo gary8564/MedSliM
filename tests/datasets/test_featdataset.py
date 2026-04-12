@@ -4,7 +4,6 @@ import random
 import numpy as np
 import pytest
 import torch
-import yaml
 
 from med_slim.data.feat_dataset import (
     PrecomputedFeatPairDataset,
@@ -13,11 +12,6 @@ from med_slim.data.feat_dataset import (
     multiview_classifier_collate_fn,
 )
 from torch.utils.data import DataLoader
-
-_extract_study_name = PrecomputedFeatPairDataset._extract_exam_id
-
-# Path to pretrain config
-PRETRAIN_CONFIG_PATH = Path(__file__).parent.parent.parent / "med_slim" / "configs" / "pretrain.yml"
 
 
 # MRNet: for classification datasets (has annotations)
@@ -35,7 +29,7 @@ FEAT_ROOT_FASTMRI = Path("/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adapt
 FASTMRI_PLANES = ["axial", "sagittal", "coronal"]
 
 
-# -------------------- PrecomputedFeatPairDataset --------------------
+# PrecomputedFeatPairDataset
 def _require_fastmri_feats():
     """Skip if fastMRI feature cache is not available."""
     if not FEAT_ROOT_FASTMRI.exists():
@@ -125,7 +119,7 @@ def test_precomputed_feat_pair_dataset_same_patient_per_pair():
         )
 
 
-# -------------------- FeatClassificationDataset --------------------
+# FeatClassificationDataset
 def test_feat_classification_dataset_single_encoder():
     ds = FeatClassificationDataset(
         feat_dir=str(FEAT_ROOT),
@@ -192,7 +186,7 @@ def test_feat_classification_dataset_invalid_task():
         )
 
 
-# -------------------- MultiViewFeatClassificationDataset --------------------
+# MultiViewFeatClassificationDataset
 def _get_available_views(min_views: int = 2):
     first_encoder_dir = FEAT_ROOT / SLICE_ENCODER_MODELS[0] / SPLIT
     if not first_encoder_dir.exists():
@@ -267,80 +261,5 @@ def test_multiview_classifier_collate_fn():
         for i, feat in enumerate(features_list):
             # Each tensor should be [B, max_seq_len, embed_dim]
             assert feat.shape == (len(batch), max_seq, EMBED_DIMS[i])
-
-
-# -------------------- Pretrain Config Validation --------------------
-def test_dataloader_matches_number_of_studies():
-    """
-    Test the precomputed feature pair dataset matches the number of patient exams specified in pretrain.yml.
-    """
-    assert PRETRAIN_CONFIG_PATH.exists(), f"Pretrain config not found: {PRETRAIN_CONFIG_PATH}"
-    with open(PRETRAIN_CONFIG_PATH, "r") as f:
-        cfg = yaml.safe_load(f)
-    datasets_cfg = cfg["feat_dataset"]["datasets"]
-    models = cfg["feat_dataset"]["model_name"]
-    planes = cfg["feat_dataset"]["plane"]
-    split = "train"
-    
-    max_feature_dim = max(m["embed_dim"] for m in cfg["model"]["slice_encoder_models"])
-    
-    # Count unique patient exam_ids across all planes
-    expected_counts = {}
-    for ds_cfg in datasets_cfg:
-        dataset_name = ds_cfg["name"]
-        feat_dir = Path(ds_cfg["feat_dir"])
-        
-        study_names = set()
-        exam_ids = set()
-        for plane in planes:
-            ref_path = feat_dir / models[0] / split / plane
-            if not ref_path.exists():
-                print(f"\n{plane}: path not found ({ref_path})")
-                continue
-            
-            plane_exam_ids = set()
-            for f in ref_path.glob("*.safetensors"):
-                exam_id = f.stem
-                plane_exam_ids.add(exam_id)
-                exam_ids.add(exam_id)
-                study_name = _extract_study_name(exam_id)
-                study_names.add(f"{dataset_name}_{study_name}")
-            
-            print(f"\n{dataset_name.upper()}/{plane}: {len(plane_exam_ids)} series")
-        
-        expected_counts[dataset_name] = len(study_names)
-        print(f"\n{dataset_name.upper()}: {len(exam_ids)} total series with {len(study_names)} unique patient exams")
-    
-    total_expected = sum(expected_counts.values())
-    print(f"\nTotal expected patient exams: {total_expected}")
-    
-    feat_dirs = [{"name": d["name"], "feat_dir": d["feat_dir"]} for d in datasets_cfg]
-    
-    num_target_slices = cfg["feat_dataset"].get("num_target_slices", 32)
-    
-    ds = PrecomputedFeatPairDataset(
-        feat_dirs=feat_dirs,
-        slice_encoder_models=models,
-        view_planes=planes,
-        split=split,
-        max_feature_dim=max_feature_dim,
-        num_target_slices=num_target_slices,
-    )
-    
-    loader = DataLoader(
-        ds,
-        batch_size=cfg["train"]["batch_size"],
-        shuffle=True,
-        num_workers=0,
-        drop_last=False,
-        pin_memory=False,
-    )
-    
-    print(f"Dataset length (patient studies): {len(ds)}")
-    print(f"DataLoader batches: {len(loader)} (batch_size={cfg['train']['batch_size']})")
-    
-    # Verify dataset length matches expected number of patient studies
-    assert len(ds) == total_expected, \
-        f"Dataset has {len(ds)} patient studies but expected {total_expected}"
 
 

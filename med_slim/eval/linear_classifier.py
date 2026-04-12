@@ -1,7 +1,7 @@
 """
 Linear Probing Evaluation for pretrained MedSliM SSL Model.
 
-- Single-channel classification: Train linear classifier head one one specific (sequence, plane).
+- Single-channel classification: Train linear classifier head on one specific (sequence, plane).
 - Multi-channel classification (logistic regression ensemble):
   1. Train independent single-channel classifiers for each channel
   2. Collect predictions from each channel
@@ -58,9 +58,7 @@ CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 JOB_ID = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
 
 
-# =============================================================================
 # Classifier Head and Attention Aggregator
-# =============================================================================
 class ClassifierHead(nn.Module):
     """MLP classifier head for linear probing."""
     def __init__(self, input_dim: int, num_classes: int, hidden_dim: int = 512, dropout: float = 0.5):
@@ -261,9 +259,7 @@ class MultiViewClassifier(nn.Module):
         return {"logits": logits, "attention_weights": attention_weights, "view_embeddings": view_embeddings, "embedding": aggregated_emb}
 
 
-# =============================================================================
 # Utility Functions
-# =============================================================================
 def _log_trainable_params(model: nn.Module, accelerator: Accelerator):
     """Log total and trainable parameter counts."""
     if not accelerator.is_main_process:
@@ -543,9 +539,7 @@ def eval_per_epoch(model: nn.Module,
     
     return avg_val_loss, val_metrics, val_attentions
         
-# =============================================================================
 # Single-View Training and Evaluation
-# =============================================================================
 def train_single_view_classifier(
     model: SingleViewClassifier,
     train_loader: DataLoader,
@@ -637,7 +631,7 @@ def train_single_view_classifier(
                 log_dict[f"{prefix}val/{name}"] = value
             wandb.log(log_dict)
             if epoch % 10 == 0:
-                print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.4f}, val_loss={avg_val_loss:.4f}, val_auroc={val_auroc:.4f}")
+                logger.info("Epoch %d: train_loss=%.4f, val_loss=%.4f, val_auroc=%.4f", epoch + 1, avg_train_loss, avg_val_loss, val_auroc)
         
         # Save best model
         if val_auroc > best_val_auroc:
@@ -1106,9 +1100,7 @@ def run_single_view_kfold_evaluation(
     return best_fold_eval if best_fold_eval else {}
 
 
-# =============================================================================
 # Multi-View Logistic Regression Ensemble
-# =============================================================================
 def collect_predictions_per_view_classifier(
     cobra_model: Cobra,
     train_subset: Dataset,
@@ -1871,9 +1863,7 @@ def run_multiview_logistic_ensemble_kfold(
     return best_fold_eval if best_fold_eval else {}
 
 
-# =============================================================================
 # Attention-based Multi-View Inference
-# =============================================================================
 def train_multiview_classifier(
     model: MultiViewClassifier,
     train_loader: DataLoader,
@@ -2239,9 +2229,7 @@ def run_multiview_evaluation(
     return eval_results
 
 
-# =============================================================================
 # Main Entry Point
-# =============================================================================
 
 def main(args):
     """Main function for linear probing evaluation."""

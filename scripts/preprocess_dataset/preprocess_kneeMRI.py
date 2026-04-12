@@ -98,13 +98,13 @@ def main():
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="/hpcwork/rwth1833/datasets/kneeMRI",
+        required=True,
         help="Root folder containing kneeMRI dataset",
     )
     parser.add_argument(
         "--save-dir",
         type=str,
-        default="/home/rwth1833/datasets/preprocessed/kneeMRI",
+        required=True,
         help="Output directory for NIfTI and metadata",
     )
     parser.add_argument(

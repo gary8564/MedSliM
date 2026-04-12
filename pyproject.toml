@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = [
   { name="Chia-Hao Chang", email="chia.hao.chang@rwth-aachen.de" },
 ]
-description = ""
+description = "MedSliM: Self-supervised pretraining of a sequence encoder over precomputed 2D foundation model slice features for 3D medical image analysis."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -34,8 +34,8 @@ def get_transforms(model_name: str,
             - 'crop': CropOrPad to target size
         random_rotate: Whether to random rotate the image
         random_center: Whether to random center the crop
-        invert_intensity: Whether to invert the intensity of 
-        to_tensor: Whether to convert the torchioimage to a tensor
+        invert_intensity: Whether to invert the intensity of the image
+        to_tensor: Whether to convert the TorchIO image to a tensor
     Returns:
         Tuple of (train_transform, val_transform)
     """

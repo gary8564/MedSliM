@@ -1,5 +1,4 @@
 import logging
-import sys
 
 # ANSI escape sequences for colors
 _RESET = "\x1b[0m"

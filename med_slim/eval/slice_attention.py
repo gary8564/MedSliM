@@ -446,7 +446,7 @@ def main():
         p_metrics = [m for m in all_metrics if key in m]
         if p_metrics:
             display = format_display_name(pcol, display_map)
-            logger.info(f"--- {display} ({len(p_metrics)} samples) ---")
+            logger.info(f"{display} ({len(p_metrics)} samples)")
             logger.info(
                 f"  mass_in_roi: {np.mean([m[key] for m in p_metrics]):.3f} "
                 f"(random: {np.mean([m[f'random_mass_in_roi_{pcol}'] for m in p_metrics]):.3f})"

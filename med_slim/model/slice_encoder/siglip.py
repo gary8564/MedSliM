@@ -1,19 +1,15 @@
 import torch.nn as nn
 import torch
-import logging
 from transformers import AutoModel
 from einops import rearrange
 from pathlib import Path
-from med_slim.logging.setup import init_logging
-init_logging()
-logger = logging.getLogger(__name__)
 
 class SigLipFeatureExtractor(nn.Module):
     def __init__(self, 
                  model_repo: str,
                  local_cache_dir: str = None):
         """
-        Initialize the MedSigLIP    .
+        Initialize the MedSigLIP feature extractor.
         
         Args:
             model_repo: Pre-trained MedSigLIP model repository on Hugging Face (e.g., "google/medsiglip-448")
@@ -50,18 +46,3 @@ class SigLipFeatureExtractor(nn.Module):
         features = rearrange(features, '(b d) e -> b d e', b=B) # [(B D), embed_dim] -> [B, D, embed_dim]
         return features
 
-if __name__ == "__main__":
-    # Load pre-trained MedSigLIP model
-    feature_extractor = SigLipFeatureExtractor(model_repo='google/medsiglip-448')
-    
-    # Freeze the model
-    for name, param in feature_extractor.model.named_parameters():
-        param.requires_grad = False
-    
-    # Total parameters and trainable parameters.
-    total_params = sum(p.numel() for p in feature_extractor.model.parameters())
-    print(f"{total_params:,} total parameters.")
-    total_trainable_params = sum(
-        p.numel() for p in feature_extractor.model.parameters() if p.requires_grad)
-    print(f"{total_trainable_params:,} training parameters.")
-    

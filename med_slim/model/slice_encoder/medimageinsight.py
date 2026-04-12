@@ -101,19 +101,3 @@ class MedImageInsightFeatureExtractor(nn.Module):
         features = torch.cat(outputs, dim=0)  # [B*D, embed_dim]
         features = rearrange(features, "(b d) e -> b d e", b=B)
         return features
-
-if __name__ == "__main__":
-    checkpoint_path = "/hpcwork/rwth1833/models/MedImageInsights"
-    
-    extractor = MedImageInsightFeatureExtractor(model_dir=checkpoint_path)
-    
-    # Freeze parameters
-    for param in extractor.parameters():
-        param.requires_grad = False
-    
-    total_params = sum(p.numel() for p in extractor.parameters())
-    print(f"{total_params:,} total parameters.")
-    
-    trainable_params = sum(p.numel() for p in extractor.parameters() if p.requires_grad)
-    print(f"{trainable_params:,} trainable parameters.")
-    print(f"Embed dim: {extractor.embed_dim}")

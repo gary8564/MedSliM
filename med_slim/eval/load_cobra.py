@@ -94,43 +94,30 @@ def load_pretrained_cobra(
     
     state_dict = torch.load(checkpoint_path, map_location=accelerator.device, weights_only=False)
     if sequence_encoder is None:
-        sequence_encoder = state_dict.get("sequence_encoder", "mamba2")  # Default for older checkpoints
-        sequence_encoder = state_dict.get("sequence_encoder", "mamba2")  # Default for older checkpoints
+        sequence_encoder = state_dict.get("sequence_encoder", "mamba2")
     if slice_pooling is None:
-        slice_pooling = state_dict.get("pooling", "abmil")  # Default for older checkpoints
+        slice_pooling = state_dict.get("pooling", "abmil")
     logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, pooling_target={pooling_target}")
     
     model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target, raw_output_dim)
     
-    # Extract encoder weights from checkpoint
-    if "state_dict" not in list(state_dict.keys()):
+    if "state_dict" not in state_dict:
         raise ValueError(f"`state_dict` key not found in saved model checkpoint {checkpoint_path}.")
     
     chkpt = state_dict["state_dict"]
+    prefix = f"{encoder_type}_encoder."
+    proj_prefix = f"{encoder_type}_encoder.proj"
 
-    # Handle legacy checkpoint key names (mamba_enc -> seq_enc)
-    has_legacy_mamba = any("mamba_enc" in k for k in chkpt.keys())
-    if has_legacy_mamba:
-        logger.info("Detected legacy checkpoint format, remapping keys: mamba_enc -> seq_enc")
-    
     cobra_weights = {}
     for k, v in chkpt.items():
-        if f"{encoder_type}_encoder" in k and f"{encoder_type}_encoder.proj" not in k:
-            # Remove encoder prefix (e.g., "base_encoder." or "momentum_encoder.")
-            new_key = k.split(f"{encoder_type}_encoder.")[-1]
-            # Remap legacy key names
-            if has_legacy_mamba:
-                new_key = new_key.replace("mamba_enc", "seq_enc")
-            #TODO: remove this once all checkpoints are updated
-            # Skip removed varlen_seq_enc keys from old checkpoints
-            if "varlen_seq_enc" in new_key:
-                continue
+        if k.startswith(prefix) and not k.startswith(proj_prefix):
+            new_key = k[len(prefix):]
             cobra_weights[new_key] = v
     
-    if len(cobra_weights) == 0:
+    if not cobra_weights:
         raise ValueError(f"No {encoder_type} encoder weights found in checkpoint.")
     
-    # strict=False: proj layer exists in pretrained model but excluded from checkpoint (not used in inference mode)
+    # strict=False: proj layer is excluded (not used in inference mode)
     model.load_state_dict(cobra_weights, strict=False)
     logger.info(f"{encoder_type.capitalize()} COBRA model loaded successfully.")
     

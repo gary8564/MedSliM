@@ -398,10 +398,8 @@ class AttentionLiereRotator(torch.nn.Module):
 
             # skew to rotation via exponent
             matrices = [torch.linalg.matrix_exp(A.float()) for A in matrices]
-            # -- Fact: Matrix exponent of block diagonal matrix is also block diagonal consisting of matrix exponents of the blocks
-            # -- source https://math.stackexchange.com/questions/3836462/matrix-exponential-of-a-block-diagonal-matrix
-            # -- TODO: make it work with lower than fp32 precision (if possible in torch)
-
+            # Fact: Matrix exponent of block diagonal matrix is also block diagonal consisting of matrix exponents of the blocks
+            # source https://math.stackexchange.com/questions/3836462/matrix-exponential-of-a-block-diagonal-matrix
             # stacking as bigger block diagonal matrix (returning to head_dim x head_dim), then sparsing
             matrices = torch.block_diag(*matrices)
 

@@ -58,11 +58,11 @@ init_logging()
 logger = logging.getLogger(__name__)
 
 DATASET_DIRS = {
-    "MRNet": "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop",
-    "fastMRI": "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adaptive",
-    "KMAR-50K": "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive",
-    "kneeMRI": "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop",
-    "SKM-TEA": "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive",
+    "MRNet": "/path/to/feat_caches/MRNet/slices_raw/crop",
+    "fastMRI": "/path/to/feat_caches/fastMRI/slices_raw/adaptive",
+    "KMAR-50K": "/path/to/feat_caches/KMAR-50K/slices_raw/adaptive",
+    "kneeMRI": "/path/to/feat_caches/kneeMRI/slices_raw/crop",
+    "SKM-TEA": "/path/to/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive",
 }
 
 

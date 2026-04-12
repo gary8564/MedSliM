@@ -48,7 +48,7 @@ def visualize_binary_metrics(
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
-    # ------------------------------- AUPRC ---------------------------------
+    # AUPRC
     precision, recall, _ = precision_recall_curve(y_true, y_pred_prob)
     auprc = auc(recall, precision)
 
@@ -64,7 +64,7 @@ def visualize_binary_metrics(
     fig.savefig(os.path.join(output_dir, f"auprc{filename}.png"), dpi=300)
     plt.close(fig)
 
-    # ------------------------------- ROC-AUC ---------------------------------
+    # ROC-AUC
     fprs, tprs, thresholds = roc_curve(y_true, y_pred_prob)
     roc_auc = auc(fprs, tprs)
 
@@ -81,7 +81,7 @@ def visualize_binary_metrics(
     fig.savefig(os.path.join(output_dir, f"roc{filename}.png"), dpi=300)
     plt.close(fig)
 
-    # -------------------------- Confusion Matrix -------------------------
+    # Confusion matrix (Youden's J threshold)
     # Youden’s J to pick a threshold
     youden = tprs - fprs
     best_idx = youden.argmax()
@@ -105,7 +105,7 @@ def visualize_binary_metrics(
     fig.savefig(os.path.join(output_dir, f"confusion_matrix{filename}.png"), dpi=300)
     plt.close(fig)
 
-    logger.info(f"------Label {class_label}--------")
+    logger.info(f"Label: {class_label}")
     logger.info(f"Number of positive samples: {np.sum(y_true)}")
     logger.info(f"Confusion Matrix:\n{cm}")
     logger.info(f"Sensitivity: {sens:.3f}")
@@ -147,7 +147,6 @@ def visualize_multilabel_metrics(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # ---- Per-label plots + collect ROC data for combined plot ----
     per_label_fpr = {}
     per_label_tpr = {}
     per_label_aurocs = []
@@ -173,7 +172,7 @@ def visualize_multilabel_metrics(
         per_label_aurocs.append(roc_auc)
         per_label_auprcs.append(auprc)
 
-    # ---- Combined macro-averaged ROC curve ----
+    # Combined macro-averaged ROC curve
     fpr_grid = np.linspace(0.0, 1.0, 1000)
     mean_tpr = np.zeros_like(fpr_grid)
 

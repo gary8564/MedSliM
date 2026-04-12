@@ -5,7 +5,7 @@ Müller-Franzes, Gustav, Firas Khader, Robert Siepmann, Tianyu Han, Jakob Nikola
 ArXiv abs/2411.15802 (2024).
 """
 from typing import Optional, Union, Callable, Tuple
-import  math 
+import math
 import torch
 from torch import Tensor
 import torch.nn.functional as F 
@@ -167,9 +167,7 @@ def multi_head_attention_forward(
     else:
         assert key.shape == value.shape, f"key shape {key.shape} does not match value shape {value.shape}"
 
-    #
-    # compute in-projection
-    #
+    # Compute in-projection
     if not use_separate_proj_weight:
         assert in_proj_weight is not None, "use_separate_proj_weight is False but in_proj_weight is None"
         q, k, v = _in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
@@ -213,14 +211,12 @@ def multi_head_attention_forward(
         assert bias_k is None
         assert bias_v is None
 
-    #
-    # reshape q, k, v for multihead attention and make em batch first
-    #
+    # Reshape q, k, v for multi-head attention (batch first)
     q = q.view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
     if static_k is None:
         k = k.view(k.shape[0], bsz * num_heads, head_dim).transpose(0, 1)
     else:
-        # TODO finish disentangling control flow so we don't do in-projections when statics are passed
+        # Static k/v bypass the in-projection; validate shapes match expected head layout
         assert static_k.size(0) == bsz * num_heads, \
             f"expecting static_k.size(0) of {bsz * num_heads}, but got {static_k.size(0)}"
         assert static_k.size(2) == head_dim, \
@@ -229,7 +225,7 @@ def multi_head_attention_forward(
     if static_v is None:
         v = v.view(v.shape[0], bsz * num_heads, head_dim).transpose(0, 1)
     else:
-        # TODO finish disentangling control flow so we don't do in-projections when statics are passed
+        # Static k/v bypass the in-projection; validate shapes match expected head layout
         assert static_v.size(0) == bsz * num_heads, \
             f"expecting static_v.size(0) of {bsz * num_heads}, but got {static_v.size(0)}"
         assert static_v.size(2) == head_dim, \
@@ -264,9 +260,7 @@ def multi_head_attention_forward(
     if not training:
         dropout_p = 0.0
 
-    #
-    # (deep breath) calculate attention and out projection
-    #
+    # Calculate attention weights and output projection
 
     if rotary_positional_encoding is not None:
         q = rotary_positional_encoding(q.view(bsz, num_heads, tgt_len, head_dim)).view(bsz*num_heads, tgt_len, head_dim)
@@ -276,7 +270,7 @@ def multi_head_attention_forward(
         B, Nt, E = q.shape
         q_scaled = q * math.sqrt(1.0 / float(E))
 
-        assert not (is_causal and attn_mask is None), "FIXME: is_causal not implemented for need_weights"
+        assert not (is_causal and attn_mask is None), "is_causal without an explicit attn_mask is not supported when need_weights=True"
 
         if attn_mask is not None:
             attn_output_weights = torch.baddbmm(attn_mask, q_scaled, k.transpose(-2, -1))

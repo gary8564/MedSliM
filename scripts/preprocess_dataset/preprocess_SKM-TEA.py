@@ -186,13 +186,13 @@ def main():
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="/hpcwork/rwth1833/datasets/SKM-TEA/qdess/v1-release",
+        required=True,
         help="Root folder of the SKM-TEA v1 release",
     )
     parser.add_argument(
         "--save-dir",
         type=str,
-        default="/hpcwork/rwth1833/datasets/preprocessed/SKM-TEA",
+        required=True,
         help="Output directory for NIfTI and metadata CSVs",
     )
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers")

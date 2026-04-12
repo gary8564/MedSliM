@@ -59,8 +59,8 @@ def combine_annotation_csv(data_dir, split):
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess MRNet")
-    parser.add_argument("--data-dir", type=str, default="/hpcwork/rwth1833/datasets/MRNet/MRNet-v1.0", help="Root folder containing the MRNet dataset")
-    parser.add_argument("--save-dir", type=str, default="/hpcwork/rwth1833/datasets/preprocessed/MRNet", help="Output directory for NIfTI and metadata")
+    parser.add_argument("--data-dir", type=str, required=True, help="Root folder containing the MRNet dataset")
+    parser.add_argument("--save-dir", type=str, required=True, help="Output directory for NIfTI and metadata")
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

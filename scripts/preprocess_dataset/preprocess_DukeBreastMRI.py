@@ -193,9 +193,9 @@ def substract_post_contrast_from_pre_contrast(path_patient):
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess Duke Breast MRI: T1 pre and first post to NIfTI")
-    parser.add_argument("--data-dir", type=str, default="/hpcwork/rwth1833/datasets/DukeBreastMRI/Duke-Breast-Cancer-MRI_v2_20220609", help="Root folder containing the extracted NBIA files")
-    parser.add_argument("--mapping-file", type=str, default="/hpcwork/rwth1833/datasets/DukeBreastMRI/Duke-Breast-Cancer-MRI_v2_20220609/Breast-Cancer-MRI-filepath_filename-mapping.xlsx", help="File path mapping tables	")
-    parser.add_argument("--save-dir", type=str, default="/hpcwork/rwth1833/datasets/preprocessed/DukeBreastMRI", help="Output directory for NIfTI and metadata")
+    parser.add_argument("--data-dir", type=str, required=True, help="Root folder containing the extracted NBIA files")
+    parser.add_argument("--mapping-file", type=str, required=True, help="File path mapping tables	")
+    parser.add_argument("--save-dir", type=str, required=True, help="Output directory for NIfTI and metadata")
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
