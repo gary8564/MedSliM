@@ -64,20 +64,23 @@ def scan2nifti(scan_id, save_dir):
     # Image position and orientation (row and column direction cosines)
     image_position = np.array(images[0].ImagePositionPatient, float)
     image_orientation = np.array(images[0].ImageOrientationPatient, float)
-    row_vec = image_orientation[:3]
-    col_vec = image_orientation[3:]
-    slice_normal_vec = np.cross(row_vec, col_vec)
+    row_cosines = image_orientation[:3]   # direction of increasing column index (along a row)
+    col_cosines = image_orientation[3:]   # direction of increasing row index (down a column)
+    slice_cosines = np.cross(row_cosines, col_cosines)
 
-    # Construct affine matrix
+    # Construct affine in DICOM (LPS) coordinate system.
+    # Volume from to_volume() has shape (Rows, Cols, Slices):
+    #   axis 0 (row index)    → moves in column direction → col_cosines
+    #   axis 1 (column index) → moves in row direction    → row_cosines
     affine = np.eye(4)
-    affine[:3, 0] = row_vec * col_spacing
-    affine[:3, 1] = col_vec * row_spacing
-    affine[:3, 2] = slice_normal_vec * slice_spacing
+    affine[:3, 0] = col_cosines * row_spacing
+    affine[:3, 1] = row_cosines * col_spacing
+    affine[:3, 2] = slice_cosines * slice_spacing
     affine[:3, 3] = image_position
-    # affine = torch.zeros((4,4))
-    # affine[0, 0] = scan.spacings[0]
-    # affine[1, 1] = scan.spacings[1]
-    # affine[2, 2] = scan.spacings[2]
+
+    # Convert from DICOM LPS to NIfTI RAS: negate x (L→R) and y (P→A)
+    affine[0, :] *= -1
+    affine[1, :] *= -1
 
     # Return the scan as a 3D numpy array volume and affine transform to world coordinates
     img_vol = scan.to_volume()

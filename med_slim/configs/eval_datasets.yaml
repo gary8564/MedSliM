@@ -24,7 +24,7 @@ datasets:
       effusion: Effusion
 
   kneeMRI:
-    task: binary
+    task: multiclass
     target_labels: [acl]
     label_display_names:
       acl: ACL Tear

@@ -29,7 +29,7 @@ NUM_GPUS=1
 
 ### Configuration
 # Checkpoint to resume from (leave empty for training from scratch)
-# RESUME_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-03-23-15:57/medslim-epoch2700.pth.tar"
+# RESUME_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-03-24-16:00/medslim-epoch1750.pth.tar"
 
 # Curriculum learning: load model weights only, reset optimizer and epoch.
 # Set to true when adding new datasets or adding new slice encoder models.
@@ -68,12 +68,13 @@ PLANES=""
 
 # Sequence encoder and pooling
 SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
-POOLING="abmil"                    # abmil (default) or cls (requires transformer encoder)
-USE_PACKED=false                   # true: packed sequences (no padding waste); false: random subsampling + padding
+POOLING="abmil"                    # abmil (default), cross_attention, or cls (requires transformer encoder)
+USE_PACKED=false                   # true: packed sequences (no padding waste); false: evenly-spaced subsampling + padding
+PHYSICAL_PE=true                  # true: sinusoidal PE from physical slice positions (mm); essential for cross-domain
 
 # Masked Slice Prediction (MSP) — JEPA-style auxiliary objective
 # L = L_InfoNCE + lambda_mask * L_MSP + lambda_ctx * L_ctx
-USE_MSP=true                      # true: enable MSP; false: pure InfoNCE (default)
+USE_MSP=false                      # true: enable MSP; false: pure InfoNCE (default)
 MSP_LAMBDA_MASK=""                # Weight for MSP loss (leave empty for config default: 1.0)
 MSP_LAMBDA_CTX=""                 # Weight for V-JEPA 2.1 context loss (leave empty for config default: 0.0)
 MSP_MASK_RATIO=""                 # Contiguous masking ratio "min max" (leave empty for config default: "0.3 0.5")
@@ -85,6 +86,7 @@ EXTRA_ARGS=""
 [[ -n "${MODEL_NAMES}" ]]  && EXTRA_ARGS+=" --model-names ${MODEL_NAMES}"
 [[ -n "${PLANES}" ]]       && EXTRA_ARGS+=" --planes ${PLANES}"
 [[ "${USE_PACKED}" == true ]] && EXTRA_ARGS+=" --use-packed"
+[[ "${PHYSICAL_PE}" == true ]] && EXTRA_ARGS+=" --physical-pe"
 [[ "${USE_MSP}" == true ]]    && EXTRA_ARGS+=" --msp"
 [[ -n "${MSP_LAMBDA_MASK}" ]] && EXTRA_ARGS+=" --msp-lambda-mask ${MSP_LAMBDA_MASK}"
 [[ -n "${MSP_LAMBDA_CTX}" ]]  && EXTRA_ARGS+=" --msp-lambda-ctx ${MSP_LAMBDA_CTX}"

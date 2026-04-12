@@ -21,7 +21,7 @@ def test_slicedataset_shapes_and_metadata():
     H_crop, W_crop = tuple(cfg["img_size"])
     D = 32 
 
-    train_tf, _ = get_transforms(model_name=model_name, num_slices=D)
+    train_tf, _ = get_transforms(model_name=model_name, plane=plane, num_slices=D)
 
     # Dataset length should match CSV length
     df = pd.read_csv(DATA_ROOT / f"{split}.csv", index_col="ID")

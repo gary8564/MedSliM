@@ -111,6 +111,10 @@ def ssl_packed_collate_fn(batch):
     # Vectorized building seq_idx: repeat each batch index by its sequence length
     seq_idx = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens)
     
+    # Pack physical positions the same way as features
+    phys_pos_list = [item["physical_positions"] for item in batch]
+    phys_pos_packed = torch.cat(phys_pos_list, dim=0)  # [total_seq_len]
+    
     result = {
         "feats1": feats1_packed,   # [total_real_seq_len, max_feat_dim]
         "feats2": feats2_packed,
@@ -123,6 +127,7 @@ def ssl_packed_collate_fn(batch):
         "orig_embed_dim1": orig_embed_dims1,  # [B]
         "orig_embed_dim2": orig_embed_dims2,
         "batch_size": batch_size,
+        "physical_positions": phys_pos_packed,  # [total_real_seq_len]
     }
     
     # Forward labels for semi-supervised contrastive learning
@@ -508,6 +513,36 @@ class PrecomputedFeatPairDataset(Dataset):
         assert metadata["model_name"] in self.slice_encoder_models, f"Expected model name to be in {self.slice_encoder_models}, but got {metadata['model_name']}!"
         return feats, metadata
 
+    @staticmethod
+    def _compute_physical_positions(
+        selected_indices: np.ndarray,
+        num_slices: int,
+        slice_spacing_mm: float | None,
+        num_target_slices: int,
+    ) -> torch.Tensor:
+        """
+        Compute physical positions (in mm) for the selected slice indices.
+
+        When `slice_spacing_mm` is available (from precomputed features safetensors metadata),
+        positions are in absolute millimeters.  
+        Otherwise, fallback to normalized positions in [0, 1] (fraction of volume depth).
+
+        Padded positions (beyond `len(selected_indices)`) are set to 0.
+
+        Returns:
+            Tensor [num_target_slices] of physical positions.
+        """
+        if slice_spacing_mm is not None and slice_spacing_mm > 0:
+            positions = selected_indices.astype(np.float32) * slice_spacing_mm
+        else:
+            # Normalized fallback
+            denom = max(num_slices - 1, 1)
+            positions = selected_indices.astype(np.float32) / denom
+
+        pos_tensor = torch.zeros(num_target_slices, dtype=torch.float32)
+        pos_tensor[: len(positions)] = torch.from_numpy(positions)
+        return pos_tensor
+
     def _get_feats(self, feat_path: str) -> torch.Tensor:
         """Return features from cache if available, otherwise load from disk."""
         if self._feat_cache is not None:
@@ -515,39 +550,51 @@ class PrecomputedFeatPairDataset(Dataset):
         feats, _ = self._load_feats(feat_path)
         return feats
         
-    def _subsample_or_pad_slices(self, feats: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    @staticmethod
+    def _compute_subsample_indices(num_slices: int, num_target: int) -> np.ndarray:
+        """
+        Compute deterministic evenly-spaced indices for subsampling.
+
+        Returns indices into the original [0, num_slices) range.  When
+        ``num_slices <= num_target``, returns ``np.arange(num_slices)``
+        (no subsampling).
+        """
+        if num_slices <= num_target:
+            return np.arange(num_slices)
+        return np.round(np.linspace(0, num_slices - 1, num_target)).astype(int)
+
+    def _subsample_or_pad_slices(
+        self, feats: torch.Tensor, indices: np.ndarray | None = None
+    ) -> Tuple[torch.Tensor, int, np.ndarray]:
         """
         Subsample or zero-pad a slice feature tensor to a fixed number of slices.
-        
-        Matches the pretraining strategy so that the sequence encoder sees the same
-        length distribution at inference as during SSL pretraining.
 
-        - More slices than target: deterministic evenly-spaced subsampling (np.linspace),
-        preserving anatomical order.
-        - Fewer slices than target: zero-pad and return actual count for masking.
-        - Exactly target slices: return as-is.
+        Uses deterministic evenly-spaced subsampling (linspace) to preserve
+        anatomical coverage proportionally.  Both FM views in a positive pair
+        share the same indices so that they see identical anatomy.
 
         Args:
-            feats: Feature tensor [num_slices, embed_dim]
+            feats: Feature tensor [num_slices, embed_dim].
+            indices: Pre-computed subsampling indices (optional).  
+                     When None, computed via `_compute_subsample_indices`.
 
         Returns:
-            Tuple of (features [num_target_slices, embed_dim], actual_num_real_slices)
+            Tuple of (features [num_target_slices, embed_dim],
+                      actual_num_real_slices,
+                      selected_indices into original volume).
         """
         num_slices = feats.shape[0]
 
-        if num_slices == self.num_target_slices:
-            return feats, self.num_target_slices
-        elif num_slices > self.num_target_slices:
-            # Uniformly subsample target indices, preserving anatomical order
-            indices = np.sort(np.random.choice(num_slices, size=self.num_target_slices, replace=False))
-            # Evenly spaced indices, preserving anatomical order
-            # indices = np.round(np.linspace(0, num_slices - 1, self.num_target_slices)).astype(int)
-            return feats[indices], self.num_target_slices
-        else:
+        if indices is None:
+            indices = self._compute_subsample_indices(num_slices, self.num_target_slices)
+
+        if num_slices <= self.num_target_slices:
             # Zero-pad to target length
             pad_size = self.num_target_slices - num_slices
             padded = torch.nn.functional.pad(feats, (0, 0, 0, pad_size), value=0.0)
-            return padded, num_slices # actual number of slices for masking
+            return padded, num_slices, indices
+        else:
+            return feats[indices], self.num_target_slices, indices
 
     def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
@@ -581,20 +628,40 @@ class PrecomputedFeatPairDataset(Dataset):
         feats1 = self._get_feats(feat_path1)
         feats2 = self._get_feats(feat_path2)
         
-        assert feats1.shape[0] == feats2.shape[0], (
+        num_slices = feats1.shape[0]
+        assert num_slices == feats2.shape[0], (
             f"Expected same number of slices for positive pair (same patient with same view plane and MRI sequence), "
             f"but got {feats1.shape[0]} and {feats2.shape[0]} for study {study_id}, "
             f"plane {selected_view_plane}."
         )
+
+        # Read slice spacing from safetensors metadata (if available).
+        # Only need to read from one FM — both share the same geometry.
+        slice_spacing_mm = None
+        try:
+            with safe_open(feat_path1, framework="pt", device="cpu") as f:
+                meta = f.metadata()
+            spacing_str = meta.get("slice_spacing_mm")
+            if spacing_str is not None:
+                slice_spacing_mm = float(spacing_str)
+        except Exception:
+            logger.warning(f"Failed to read slice spacing from {feat_path1}. "
+                           f"Fallback to normalized positions.")
         
         if self.use_packed:
-            # Packed mode: keep raw variable-length sequences (no subsampling / zero-padding).
-            # The packed collate will concatenate them and build cu_seqlens.
-            seq_len = feats1.shape[0]
+            seq_len = num_slices
+            indices = np.arange(num_slices)
         else:
-            # Padded mode: subsample or zero-pad to fixed length
-            feats1, seq_len = self._subsample_or_pad_slices(feats1)
-            feats2, _ = self._subsample_or_pad_slices(feats2)
+            # Compute shared indices once for both views (identical slices)
+            indices = self._compute_subsample_indices(num_slices, self.num_target_slices)
+            feats1, seq_len, indices = self._subsample_or_pad_slices(feats1, indices)
+            feats2, _, _ = self._subsample_or_pad_slices(feats2, indices)
+        
+        # Physical positions for sinusoidal PE
+        physical_positions = self._compute_physical_positions(
+            indices, num_slices, slice_spacing_mm, 
+            num_slices if self.use_packed else self.num_target_slices,
+        )
         
         # Pad feature dimension to max_feature_dim to ensure consistent batch size
         feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
@@ -609,6 +676,7 @@ class PrecomputedFeatPairDataset(Dataset):
             "orig_embed_dim1": torch.as_tensor(orig_embed_dim1, dtype=torch.long),
             "orig_embed_dim2": torch.as_tensor(orig_embed_dim2, dtype=torch.long),
             "seq_len": torch.as_tensor(seq_len, dtype=torch.long),
+            "physical_positions": physical_positions,  # [num_target_slices] in mm
         }
         
         # Add labels for semi-supervised contrastive learning

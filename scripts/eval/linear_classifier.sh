@@ -8,9 +8,9 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G 
 #SBATCH --time=2:00:00                 
-#SBATCH --job-name=mrnet_meniscus_%j
-#SBATCH --output=stdout_mrnet_meniscus_%j.txt    
-#SBATCH --account=p0021834    
+#SBATCH --job-name=skm-tea_dess_e2_%j
+#SBATCH --output=stdout_skm-tea_dess_e2_%j.txt    
+#SBATCH --account=rwth1833    
 
 ### Setup
 source .venv/bin/activate
@@ -18,11 +18,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
 CONFIG_PATH="./med_slim/configs/linear_classifier.yml"
-CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-03-15-04:23/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
+CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-03-24-16:00/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
 FINE_TUNE=false  # whether to fine-tune COBRA backbone
 FM_POOLING="avg_pool"  # Options: "avg_pool", "attention" (attention requires fine-tuning COBRA)
 SEQUENCE_ENCODER="mamba2"
-FM_MODEL_NAMES="mri-core medimageinsight ark dinov2 dinov3 rad-dino biomedclip medsiglip" 
+FM_MODEL_NAMES="mri-core" 
 POOLING_TARGET="raw"
 N_FOLDS=3
 EXTRA_ARGS=""

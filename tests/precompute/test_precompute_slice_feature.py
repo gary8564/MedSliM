@@ -62,6 +62,7 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
 
                 _, val_tf = get_transforms(
                     model_name=self.model_name,
+                    plane="axial",
                     num_slices=self.num_slices,
                     spatial_mode="resample",
                 )
@@ -90,6 +91,7 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
 
             _, val_tf = get_transforms(
                 model_name=self.model_name,
+                plane="axial",
                 num_slices=self.num_slices,
                 spatial_mode="resample",
             )
@@ -124,6 +126,7 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
 
             _, val_tf = get_transforms(
                 model_name=self.model_name,
+                plane="axial",
                 num_slices=self.num_slices,
                 spatial_mode="resample",
             )
@@ -155,6 +158,7 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
 
             _, val_tf = get_transforms(
                 model_name=self.model_name,
+                plane="axial",
                 num_slices=None,
                 spatial_mode="resample",
             )
@@ -181,6 +185,7 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
 
             _, val_tf = get_transforms(
                 model_name=self.model_name,
+                plane="axial",
                 num_slices=self.num_slices,
                 spatial_mode="resample",
             )

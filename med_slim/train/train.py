@@ -34,7 +34,7 @@ CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 def validate_args(args) -> None:
     """Validate arguments parser."""
     valid_encoders = ["mamba2", "transformer"]
-    valid_poolings = ["abmil", "cls"]
+    valid_poolings = ["abmil", "cross_attention", "cls"]
     
     if args.sequence_encoder not in valid_encoders:
         raise ValueError(f"Invalid sequence_encoder '{args.sequence_encoder}'. Must be one of {valid_encoders}")
@@ -74,6 +74,7 @@ def main(args, cfg):
     # Validate encoder/pooling combination
     sequence_encoder = args.sequence_encoder
     pooling = args.pooling
+    physical_pe = getattr(args, "physical_pe", False)
     
     # Build encoder-specific kwargs
     cobra_cfg = cfg["model"]["cobra"]
@@ -87,7 +88,7 @@ def main(args, cfg):
         encoder_kwargs["norm_first"] = cobra_cfg.get("transformer_norm_first", True)
         encoder_kwargs["dim_feedforward"] = cobra_cfg.get("transformer_dim_feedforward", 4 * cobra_cfg["embed_dim"])
     
-    if pooling == "abmil":
+    if pooling in ("abmil", "cross_attention"):
         encoder_kwargs["att_dim"] = cobra_cfg.get("attn_dim", 256)
     
     # MSP (Masked Slice Prediction) config
@@ -103,6 +104,8 @@ def main(args, cfg):
 
     # Build model
     print("Creating model...")
+    if physical_pe:
+        print("Physical positional encoding ENABLED (sinusoidal, keyed on mm positions)")
     model = MoCo(
         embed_dim=cobra_cfg["embed_dim"],
         contrast_dim=cobra_cfg["contrast_dim"],
@@ -114,6 +117,7 @@ def main(args, cfg):
         dropout=cobra_cfg["dropout"],
         sequence_encoder=sequence_encoder,
         pooling=pooling,
+        physical_pe=physical_pe,
         msp_enabled=msp_enabled,
         msp_lambda_mask=msp_cfg.get("lambda_mask", 1.0),
         msp_lambda_ctx=msp_cfg.get("lambda_ctx", 0.0),
@@ -255,6 +259,11 @@ def main(args, cfg):
             if labels is not None:
                 labels = labels.to(dtype=torch.float32)
             
+            # Physical positions for sinusoidal PE (shared between views)
+            phys_pos = batch.get("physical_positions")
+            if phys_pos is not None:
+                phys_pos = phys_pos.to(dtype=torch.float32)
+
             if use_packed:
                 # Packed sequence mode
                 x1 = batch["feats1"].to(dtype=torch.float32)
@@ -279,6 +288,7 @@ def main(args, cfg):
                         seq_idx1=seq_idx1, seq_idx2=seq_idx2,
                         labels=labels,
                         has_label=has_label,
+                        physical_positions=phys_pos,
                     )
             else:
             
@@ -296,6 +306,7 @@ def main(args, cfg):
                         m=curr_m,
                         labels=labels,
                         has_label=has_label,
+                        physical_positions=phys_pos,
                     )
             
             if isinstance(result, dict):
@@ -352,6 +363,7 @@ def main(args, cfg):
                     "optimizer": optimizer.state_dict(),
                     "sequence_encoder": sequence_encoder,
                     "pooling": pooling,
+                    "physical_pe": physical_pe,
                     "msp_enabled": msp_enabled,
                 }
                 ckpt_name = f"medslim-epoch{e+1}.pth.tar"
@@ -445,9 +457,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pooling",
         type=str,
-        choices=["abmil", "cls"],
+        choices=["abmil", "cross_attention", "cls"],
         default="abmil",
-        help="Pooling method: 'abmil' (default) or 'cls'. Note: 'cls' requires transformer encoder.",
+        help="Pooling method: 'abmil' (default), 'cross_attention', or 'cls'. Note: 'cls' requires transformer encoder.",
+    )
+    parser.add_argument(
+        "--physical-pe",
+        action="store_true",
+        help=(
+            "Enable sinusoidal physical positional encoding keyed on slice "
+            "positions in mm. Requires slice_spacing_mm in safetensors metadata "
+            "(falls back to normalised positions when unavailable)."
+        ),
     )
     parser.add_argument(
         "--curriculum",

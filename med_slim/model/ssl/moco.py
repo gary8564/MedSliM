@@ -60,6 +60,7 @@ class MoCo(nn.Module):
         dropout: float = 0.25,
         sequence_encoder: str = "mamba2",
         pooling: str = "abmil",
+        physical_pe: bool = False,
         msp_enabled: bool = False,
         msp_lambda_mask: float = 1.0,
         msp_lambda_ctx: float = 0.0,
@@ -82,7 +83,9 @@ class MoCo(nn.Module):
             T: Softmax temperature for contrastive loss.
             dropout: Dropout rate.
             sequence_encoder: "mamba2" (default) or "transformer".
-            pooling: Slice pooling method - "abmil" (default) or "cls" (requires transformer).
+            pooling: Slice pooling method - "abmil" (default), "cross_attention", or "cls" (requires transformer).
+            physical_pe: Add sinusoidal positional encoding from physical
+                slice positions (mm) before the sequence encoder.
             msp_enabled: Enable Masked Slice Prediction auxiliary objective.
             msp_lambda_mask: Weight for MSP loss on masked positions.
             msp_lambda_ctx: Base weight λ for context loss on visible positions (V-JEPA 2.1).  Set to 0 to disable.  
@@ -124,6 +127,7 @@ class MoCo(nn.Module):
             num_layers=num_layers,
             sequence_encoder=sequence_encoder,
             slice_pooling=pooling,
+            physical_pe=physical_pe,
             **kwargs,
         )
 
@@ -490,6 +494,7 @@ class MoCo(nn.Module):
         seq_lengths: torch.Tensor = None,
         labels: torch.Tensor | None = None,
         has_label: torch.Tensor | None = None,
+        physical_positions: torch.Tensor | None = None,
     ) -> torch.Tensor | dict:
         """        
         Args:
@@ -501,30 +506,32 @@ class MoCo(nn.Module):
             seq_lengths: Actual sequence lengths with shape [B] for masking padded positions.
                          Shared across both views since positive pairs come from the same exam/plane.
             labels: Optional multi-label tensor [B, C] for semi-supervised contrastive learning.
-                    Each row is a binary vector indicating class labels [abnormal, acl, meniscus].
-                    Only used for samples where has_label=True. When None, InfoNCE is used.
             has_label: Optional boolean tensor [B] indicating which samples have classification labels.
-                       Unlabeled samples use standard InfoNCE; labeled samples use SupCon multi-positive targets.
+            physical_positions: Physical slice positions in mm [B, num_slices] for sinusoidal PE.
             
         Returns:
             Contrastive loss.
         """
-        # Compute query features
+        pe_kwargs = dict(physical_positions=physical_positions)
+
         q1 = self.predictor(self.base_encoder(
-            x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths
+            x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths,
+            **pe_kwargs,
         ))
         q2 = self.predictor(self.base_encoder(
-            x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths
+            x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths,
+            **pe_kwargs,
         ))
        
         with torch.no_grad():
-            self._update_momentum_encoder(m=m) # Update the momentum encoder
-            # Compute key features through momentum encoder
+            self._update_momentum_encoder(m=m)
             k1 = self.momentum_encoder(
-                x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths
+                x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths,
+                **pe_kwargs,
             )
             k2 = self.momentum_encoder(
-                x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths
+                x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths,
+                **pe_kwargs,
             )
 
         loss_infonce = (
@@ -570,44 +577,39 @@ class MoCo(nn.Module):
         seq_idx2: torch.Tensor = None,
         labels: torch.Tensor | None = None,
         has_label: torch.Tensor | None = None,
+        physical_positions: torch.Tensor | None = None,
         **_,  # Ignore extra kwargs
     ):
         """Forward pass for packed sequences (no padding waste)."""
-        # Compute query features 
-        q1 = self.predictor(self.base_encoder(
-            x1, 
-            input_feature_dims=input_feature_dims_1,
+        packed_kwargs1 = dict(
             use_packed=True,
             cu_seqlens=cu_seqlens1,
             max_seqlen=max_seqlen1,
             seq_idx=seq_idx1,
-        ))
-        q2 = self.predictor(self.base_encoder(
-            x2,
-            input_feature_dims=input_feature_dims_2,
+            physical_positions=physical_positions,
+        )
+        packed_kwargs2 = dict(
             use_packed=True,
             cu_seqlens=cu_seqlens2,
             max_seqlen=max_seqlen2,
             seq_idx=seq_idx2,
+            physical_positions=physical_positions,
+        )
+
+        q1 = self.predictor(self.base_encoder(
+            x1, input_feature_dims=input_feature_dims_1, **packed_kwargs1,
+        ))
+        q2 = self.predictor(self.base_encoder(
+            x2, input_feature_dims=input_feature_dims_2, **packed_kwargs2,
         ))
        
         with torch.no_grad():
             self._update_momentum_encoder(m=m)
             k1 = self.momentum_encoder(
-                x1,
-                input_feature_dims=input_feature_dims_1,
-                use_packed=True,
-                cu_seqlens=cu_seqlens1,
-                max_seqlen=max_seqlen1,
-                seq_idx=seq_idx1,
+                x1, input_feature_dims=input_feature_dims_1, **packed_kwargs1,
             )
             k2 = self.momentum_encoder(
-                x2,
-                input_feature_dims=input_feature_dims_2,
-                use_packed=True,
-                cu_seqlens=cu_seqlens2,
-                max_seqlen=max_seqlen2,
-                seq_idx=seq_idx2,
+                x2, input_feature_dims=input_feature_dims_2, **packed_kwargs2,
             )
 
         loss_infonce = (
@@ -649,6 +651,7 @@ class MoCo(nn.Module):
         input_feature_dims_2: torch.Tensor | None = None, 
         m: float = 0.99,
         use_packed: bool = False,
+        physical_positions: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | dict:
         """        
@@ -661,11 +664,13 @@ class MoCo(nn.Module):
             input_feature_dims_2: Original feature dims per-sample for x2 with shape [B].
             m: Momentum parameter for momentum encoder update. Default: 0.99.
             use_packed: If True, use packed sequence for variable sequence length handling.
+            physical_positions: Physical slice positions in mm for sinusoidal PE.
+                - Padded mode: [B, num_slices]
+                - Packed mode: [total_seq_len]
             
             **kwargs: Additional mode-specific parameters for variable sequence length handling:
                 Padded mode:
-                    - seq_lengths_1: Actual sequence lengths for x1 with shape [B]
-                    - seq_lengths_2: Actual sequence lengths for x2 with shape [B]
+                    - seq_lengths: Actual sequence lengths with shape [B]
                 Packed mode:
                     - cu_seqlens1, cu_seqlens2: Cumulative sequence lengths with shape [B+1]
                     - max_seqlen1, max_seqlen2: Max sequence length in batch for x1 and x2
@@ -681,6 +686,7 @@ class MoCo(nn.Module):
                 input_feature_dims_1=input_feature_dims_1,
                 input_feature_dims_2=input_feature_dims_2,
                 m=m,
+                physical_positions=physical_positions,
                 **kwargs,
             )
         else:
@@ -689,6 +695,7 @@ class MoCo(nn.Module):
                 input_feature_dims_1=input_feature_dims_1,
                 input_feature_dims_2=input_feature_dims_2,
                 m=m,
+                physical_positions=physical_positions,
                 **kwargs,
             )
     

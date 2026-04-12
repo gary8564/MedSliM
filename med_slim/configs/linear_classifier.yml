@@ -37,19 +37,19 @@ freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning 
 #     model_name: ["dinov2"]
 
 feat_dataset:
-  dataset_name: "MRNet"
-  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+  dataset_name: "kneeMRI"
+  feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
   plane:
     - "sagittal"
     # - "coronal"
     # - "axial"
   # sequences: 
-  #   DESS_E1: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive"
+    # DESS_E1: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive"
     # DESS_E2: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E2/slices_raw/adaptive"
   model_name:
     - "mri-core"
 
-annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/MRNet"
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
 
 # ------------------------------------------------------------------------------
 # Output directory configuration

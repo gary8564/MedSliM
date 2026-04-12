@@ -15,11 +15,39 @@ from contextlib import contextmanager
 
 from .mamba2 import Mamba2Enc
 from .transformer import TransformerEncoderLayer, VarlenTransformerEncoder
-from med_slim.model.attention_pooling import BatchedABMIL
+from med_slim.model.attention_pooling import BatchedABMIL, CrossAttentionPooling
 from med_slim.logging.setup import init_logging
 
 init_logging()
 logger = logging.getLogger(__name__)
+
+
+def sinusoidal_position_encoding(
+    positions: torch.Tensor,
+    dim: int,
+    base: float = 10000.0,
+) -> torch.Tensor:
+    """
+    Compute sinusoidal positional encoding from continuous positions (e.g. mm).
+
+    PE(p, 2i)   = sin(p / base^{2i/d})
+    PE(p, 2i+1) = cos(p / base^{2i/d})
+
+    Args:
+        positions: Arbitrary-shape tensor of positions (e.g. in millimeters).
+        dim: Embedding dimensionality (must be even).
+        base: Frequency base (default 10000, following Vaswani et al.).
+
+    Returns:
+        Sinusoidal encoding with shape ``(*positions.shape, dim)``.
+    """
+    assert dim % 2 == 0, "Embedding dimension must be even for sinusoidal PE"
+    half = dim // 2
+    freq_indices = torch.arange(half, device=positions.device, dtype=positions.dtype)
+    inv_freq = 1.0 / (base ** (freq_indices / half))  
+    angles = positions.unsqueeze(-1) * inv_freq 
+    return torch.cat([angles.sin(), angles.cos()], dim=-1) 
+
 
 class Embed(nn.Module):
     def __init__(self, dim, embed_dim=1024, dropout=0.25):
@@ -71,6 +99,7 @@ class Cobra(nn.Module):
         slice_pooling: str = "abmil",
         pooling_target: str = "raw",
         raw_output_dim: int = None,
+        physical_pe: bool = False,
         **kwargs
     ):
         """
@@ -86,7 +115,7 @@ class Cobra(nn.Module):
             fm_pooling: 'avg_pool' or 'attention' in inference mode.
                 - 'avg_pool': Average pool embeddings across foundation models.
                 - 'attention': Learn attention weights to pool FM embeddings per slice (requires fine-tuning).
-            slice_pooling: 'abmil' or 'cls' (cls requires transformer).
+            slice_pooling: 'abmil', 'cross_attention', or 'cls' (cls requires transformer).
             pooling_target: Which representation level to aggregate at inference (ABMIL only).
                 In all modes, ABMIL attention weights are computed from encoder output
                 (providing inter-slice contextual attention). 
@@ -96,6 +125,9 @@ class Cobra(nn.Module):
                 - 'raw': Aggregate original FM patch embeddings (default). 
             raw_output_dim: FM embedding dimension for the 'raw' pooling target.
                 Required when pooling_target='raw'.
+            physical_pe: If True, add sinusoidal positional encoding based on
+                physical slice positions (in mm) before the sequence encoder.
+                Requires ``physical_positions`` to be passed during forward.
             **kwargs: Additional encoder-specific parameters:
                 - d_state: Mamba2 state dimension (default: 128)
                 - dim_feedforward: Transformer FFN dimension (default: 4*embed_dim)
@@ -112,18 +144,18 @@ class Cobra(nn.Module):
         assert sequence_encoder in ["mamba2", "transformer"]
         if mode == "inference":
             assert fm_pooling in ["avg_pool", "attention"], f"Invalid fm_pooling '{fm_pooling}'. Must be one of 'avg_pool', 'attention'."
-        assert slice_pooling in ["abmil", "cls"], f"Invalid slice_pooling '{slice_pooling}'. Must be one of 'abmil', 'cls'."
+        assert slice_pooling in ["abmil", "cross_attention", "cls"], (
+            f"Invalid slice_pooling '{slice_pooling}'. Must be one of 'abmil', 'cross_attention', 'cls'."
+        )
         if slice_pooling == "cls" and sequence_encoder != "transformer":
                 raise ValueError(f"slice_pooling='cls' requires sequence_encoder='transformer'. Got {sequence_encoder}.")
         assert pooling_target in ["post_encoder", "post_embed", "raw"], (
             f"Invalid pooling_target '{pooling_target}'. Must be one of 'post_encoder', 'post_embed', 'raw'."
         )
-        # pooling_target is only used by ABMIL at inference; CLS pooling ignores it.
-        # raw_output_dim is only needed for inference when aggregating raw FM embeddings.
         if (
             mode == "inference"
             and pooling_target == "raw"
-            and slice_pooling != "cls"
+            and slice_pooling not in ("cls", "cross_attention")
             and raw_output_dim is None
         ):
             raise ValueError("raw_output_dim is required when pooling_target='raw' in inference mode.")
@@ -135,6 +167,7 @@ class Cobra(nn.Module):
         self.sequence_encoder = sequence_encoder
         self.fm_pooling = fm_pooling
         self.slice_pooling = slice_pooling
+        self.physical_pe = physical_pe
 
         self.embed = nn.ModuleDict({str(d): Embed(d, embed_dim) for d in input_dims})
         self.norm = nn.LayerNorm(embed_dim)
@@ -193,12 +226,13 @@ class Cobra(nn.Module):
             nn.BatchNorm1d(contrast_dim),
         )
 
-        # ABMIL pooling modules
+        # Slice-level pooling modules
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
 
         self.attn = None
+        self.cross_attn_pool = None
         if self.slice_pooling == "abmil":
             self.attn = nn.ModuleList([
                 BatchedABMIL(
@@ -210,6 +244,12 @@ class Cobra(nn.Module):
                 )
                 for _ in range(self.num_heads)
             ])
+        elif self.slice_pooling == "cross_attention":
+            self.cross_attn_pool = CrossAttentionPooling(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+            )
         
         # FM attention pooling for inference mode
         # Learns to weight different foundation model embeddings at each slice position
@@ -225,6 +265,27 @@ class Cobra(nn.Module):
                 n_heads=1,
                 activation='softmax',
             )
+
+    def _apply_physical_pe(
+        self,
+        logits: torch.Tensor,
+        physical_positions: torch.Tensor,
+        seq_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Add sinusoidal PE keyed on physical positions (mm) to embedded features.
+
+        PE at padded positions is zeroed out so that padding remains inert.
+        Without this, PE(0) = [0, 1, 0, 1, ...] (cos(0)=1) would inject a
+        non-zero signal into padded positions and make position 0mm ambiguous
+        with padding.
+        """
+        pe = sinusoidal_position_encoding(physical_positions, self.embed_dim)
+        if seq_lengths is not None and logits.dim() == 3:
+            # Padded mode: zero out PE beyond each sample's real sequence length
+            mask = self._build_mask(seq_lengths, logits.shape[1])  # [B, T]
+            pe = pe * mask.unsqueeze(-1)  # [B, T, 1]
+        return logits + pe
 
     @property
     def output_dim(self) -> int:
@@ -494,6 +555,7 @@ class Cobra(nn.Module):
         seq_idx: torch.Tensor = None,
         slice_mask: torch.Tensor = None,
         mask_token: torch.Tensor = None,
+        physical_positions: torch.Tensor = None,
         **_,  # Ignore extra kwargs
     ) -> torch.Tensor:
         """Forward pass for packed/variable-length sequences."""
@@ -505,6 +567,10 @@ class Cobra(nn.Module):
         else:
             logits = self._embed_ssl_forward_packed(x, cu_seqlens, input_feature_dims)
         
+        # Physical positional encoding (packed: positions is 1-D [total_seq_len])
+        if self.physical_pe and physical_positions is not None:
+            logits = self._apply_physical_pe(logits, physical_positions)
+
         # MSP: replace masked positions with mask_token
         if slice_mask is not None and mask_token is not None:
             logits = torch.where(
@@ -530,15 +596,20 @@ class Cobra(nn.Module):
             return h
         
         # Slice feature aggregation
-        if self.mode == "train":
-            h_padded, mask = self._packed_to_padded(h, cu_seqlens, max_seqlen)
-            A = self._abmil_pooling(h_padded, mask)
-        else:
-            A = self._abmil_pooling(h)
+        h_padded, mask = self._packed_to_padded(h, cu_seqlens, max_seqlen)
+
+        if self.slice_pooling == "cross_attention":
+            if get_attention:
+                pooled, attn = self.cross_attn_pool(h_padded, mask=mask, return_attention=True)
+                return [attn[i, :, :cu_seqlens[i+1]-cu_seqlens[i]] for i in range(batch_size)]
+            pooled = self.cross_attn_pool(h_padded, mask=mask)
+            return self.proj(pooled) if self.mode == "train" else pooled
+        
+        # ABMIL path
+        A = self._abmil_pooling(h_padded, mask)
         
         if get_attention:
             return [A[i, :, :cu_seqlens[i+1]-cu_seqlens[i]] for i in range(batch_size)]
-        
         
         if self.mode == "train":
             pooled = torch.bmm(A, h_padded).squeeze(1)
@@ -566,6 +637,7 @@ class Cobra(nn.Module):
         seq_lengths=None,
         slice_mask=None,
         mask_token=None,
+        physical_positions=None,
         **_,
     ):
         """Forward pass main function."""
@@ -574,6 +646,10 @@ class Cobra(nn.Module):
             logits = self._embed_inference_forward(x)
         else:
             logits = self._embed_ssl_forward(x, input_feature_dims)
+
+        # Physical positional encoding (padded: positions is [B, num_slices])
+        if self.physical_pe and physical_positions is not None:
+            logits = self._apply_physical_pe(logits, physical_positions, seq_lengths)
 
         # MSP: replace masked positions with mask_token
         if slice_mask is not None and mask_token is not None:
@@ -624,6 +700,14 @@ class Cobra(nn.Module):
             pooled = h[:, 0, :]
             return self.proj(pooled) if self.mode == "train" else pooled
 
+        # Cross-attention pooling
+        if self.slice_pooling == "cross_attention":
+            if get_attention or get_per_head_attention:
+                _, attn = self.cross_attn_pool(h, mask=mask, return_attention=True)
+                return attn  # [B, 1, num_slices]
+            pooled = self.cross_attn_pool(h, mask=mask)
+            return self.proj(pooled) if self.mode == "train" else pooled
+
         # ABMIL pooling
         if get_per_head_attention:
             return self._abmil_pooling(h, mask, return_per_head=True)
@@ -632,26 +716,23 @@ class Cobra(nn.Module):
 
         if get_attention:
             return A
-
-        # Attention-weighted aggregation.
-        # Training: MIL pooling over encoded features
-        # Inference: MIL pooling over original input features 
-        #            with pooling_target selecting which representation the attention weights aggregate.
+        
+        # Attention-weighted aggregation
         if self.mode == "train":
             pooled = torch.bmm(A, h).squeeze(1)  # [B, embed_dim]
             return self.proj(pooled)
 
         if self.pooling_target == "post_encoder":
-            return torch.bmm(A, h).squeeze(1)        # [B, embed_dim]
+            return torch.bmm(A, h).squeeze(1)  # [B, embed_dim]
         elif self.pooling_target == "raw":
             if isinstance(x, list):
                 logger.info("Multi-FM mode: using first FM embedding dimension for raw pooling")
                 raw_x = x[0]
             else:
                 raw_x = x
-            return torch.bmm(A, raw_x).squeeze(1)    # [B, raw_output_dim]
+            return torch.bmm(A, raw_x).squeeze(1)  # [B, raw_output_dim]
         else:  # post_embed
-            return torch.bmm(A, logits).squeeze(1)   # [B, embed_dim]
+            return torch.bmm(A, logits).squeeze(1)  # [B, embed_dim]
 
     def forward(
         self, 
@@ -664,6 +745,7 @@ class Cobra(nn.Module):
         use_packed: bool = False,
         slice_mask=None,
         mask_token=None,
+        physical_positions=None,
         **kwargs,
     ):
         """
@@ -682,6 +764,10 @@ class Cobra(nn.Module):
                 - Padded mode: [B, num_slices]
                 - Packed mode: [total_seq_len]
             mask_token: Learnable mask-token embedding [1, embed_dim] (for masked slice prediction).
+            physical_positions: Physical slice positions in mm for sinusoidal PE.
+                - Padded mode: [B, num_slices]
+                - Packed mode: [total_seq_len]
+                Only used when `physical_pe=True`.
             **kwargs: Mode-specific parameters:
                 Padded mode:
                     - seq_lengths: Actual sequence lengths [B] for masking padded positions.
@@ -706,6 +792,7 @@ class Cobra(nn.Module):
                 return_slice_embeddings=return_slice_embeddings,
                 slice_mask=slice_mask,
                 mask_token=mask_token,
+                physical_positions=physical_positions,
                 **kwargs,
             )
         else:
@@ -717,5 +804,6 @@ class Cobra(nn.Module):
                 return_slice_embeddings=return_slice_embeddings,
                 slice_mask=slice_mask,
                 mask_token=mask_token,
+                physical_positions=physical_positions,
                 **kwargs,
             )

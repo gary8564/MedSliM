@@ -76,7 +76,6 @@ def get_dicom_dir(dataset_root: Path, dicom_filepath: str) -> Path:
         p = (dataset_root / p).resolve()
     return p.parent
 
-
 def normalize_descriptive_path(path_str: str) -> str:
     # Normalize known discrepancies between path in mapping table and actual filesystem
     s = str(path_str)

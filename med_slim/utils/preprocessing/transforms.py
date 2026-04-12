@@ -4,6 +4,7 @@ from typing import Tuple, Optional
 from med_slim.utils.preprocessing import (
     CropOrPad2D,
     CropOrPad3D,
+    CropEmptySlices,
     ZNormalization, 
     ImageOrSubjectToTensor, 
     ResizeInPlane,
@@ -14,12 +15,14 @@ from med_slim.utils.preprocessing import (
 from med_slim.utils.model_config import get_slice_encoder_config
 
 def get_transforms(model_name: str,
+                   plane: str,
                    num_slices: Optional[int] = None,
                    spatial_mode: str = 'resize', 
                    random_rotate: bool = False,
                    random_center: bool = False,
                    invert_intensity: bool = False,
                    noise: bool = False,
+                   crop_empty_slices: bool = False,
                    to_tensor: bool = False) -> Tuple[tio.Compose, tio.Compose]:
     """
     Define the transforms for data augmentation. 
@@ -35,6 +38,7 @@ def get_transforms(model_name: str,
         random_rotate: Whether to random rotate the image
         random_center: Whether to random center the crop
         invert_intensity: Whether to invert the intensity of 
+        crop_empty_slices: Whether to trim near-empty edge slices before spatial transforms
         to_tensor: Whether to convert the torchioimage to a tensor
     Returns:
         Tuple of (train_transform, val_transform)
@@ -50,28 +54,30 @@ def get_transforms(model_name: str,
     
     # Build spatial transform based on mode
     if spatial_mode == 'resize':
-        # ResizeInPlane handles W, H dimensions
-        # If num_slices specified, crop or pad the depth dimension D as well
         if D is not None:
             spatial_transforms = [
-                ResizeInPlane((W_crop, H_crop)),
+                ResizeInPlane((W_crop, H_crop), plane=plane),
                 tio.CropOrPad((W_crop, H_crop, D), padding_mode='minimum'),
             ]
         else:
-            spatial_transforms = [ResizeInPlane((W_crop, H_crop))]
+            spatial_transforms = [ResizeInPlane((W_crop, H_crop), plane=plane)]
     elif spatial_mode == 'resample':
-        spatial_transforms = [ResampleInPlane((W_crop, H_crop), num_slices=D, image_interpolation="bspline")]
+        spatial_transforms = [ResampleInPlane((W_crop, H_crop), num_slices=D, image_interpolation="bspline", plane=plane)]
     elif spatial_mode == 'crop':
         if D is not None:
-            spatial_transforms = [CropOrPad3D((W_crop, H_crop, D), random_center=random_center, padding_mode='minimum')]
+            spatial_transforms = [CropOrPad3D((W_crop, H_crop, D), random_center=random_center, padding_mode='minimum', plane=plane)]
         else:
-            spatial_transforms = [CropOrPad2D((W_crop, H_crop), random_center=random_center, padding_mode='minimum')]
+            spatial_transforms = [CropOrPad2D((W_crop, H_crop), random_center=random_center, padding_mode='minimum', plane=plane)]
     else:
         raise ValueError(f"Unknown spatial_mode: {spatial_mode}")
 
+    # Optional: trim near-empty edge slices before spatial transforms
+    pre_spatial = [CropEmptySlices()] if crop_empty_slices else []
+
     train_transform = tio.Compose([
-                tio.ToCanonical(),      # Ensures consistent RAS+ orientation
-                EnsureSliceAxisLast(),  # Ensures slice dimension is always at the last axis
+                tio.ToCanonical(),
+                EnsureSliceAxisLast(plane=plane),
+                *pre_spatial,           # Trim near-empty edge slices before spatial transforms
                 *spatial_transforms,    # Unpack spatial transforms
                 ZNormalization(per_channel=True, channelwise_precomputed_means=means, channelwise_precomputed_stds=stds, masking_method=lambda x: (x > x.min()) & (x < x.max())),
                 tio.OneOf({
@@ -86,7 +92,8 @@ def get_transforms(model_name: str,
 
     val_transform = tio.Compose([
                 tio.ToCanonical(),
-                EnsureSliceAxisLast(),
+                EnsureSliceAxisLast(plane=plane),
+                *pre_spatial,
                 *spatial_transforms,
                 ZNormalization(per_channel=True, channelwise_precomputed_means=means, channelwise_precomputed_stds=stds, masking_method=lambda x: (x > x.min()) & (x < x.max())),
                 ImageOrSubjectToTensor() if to_tensor else tio.Lambda(lambda x: x),
@@ -96,7 +103,9 @@ def get_transforms(model_name: str,
 
 def get_adaptive_transform( 
     model_name: str,
+    plane: str,
     num_slices: Optional[int] = None,
+    crop_empty_slices: bool = False,
     to_tensor: bool = True,
 ) -> tio.Compose:
     """
@@ -109,11 +118,16 @@ def get_adaptive_transform(
     
     transforms_list = [
         tio.ToCanonical(),
-        EnsureSliceAxisLast(),
+        EnsureSliceAxisLast(plane=plane),
+    ]
+    if crop_empty_slices:
+        transforms_list.append(CropEmptySlices())
+    transforms_list.extend([
         AdaptivePreprocessing(
             target_size=(W_target, H_target),
             num_slices=num_slices,
             padding_mode='minimum',
+            plane=plane,
         ),
         ZNormalization(
             per_channel=True,
@@ -121,7 +135,7 @@ def get_adaptive_transform(
             channelwise_precomputed_stds=stds,
             masking_method=lambda x: (x > x.min()) & (x < x.max())
         ),
-    ]
+    ])
     
     if to_tensor:
         transforms_list.append(ImageOrSubjectToTensor())
