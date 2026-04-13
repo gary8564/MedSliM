@@ -1,1 +1,0 @@
-gdown --id 1HXMjSV99v3BB6yJJoqsFhKvWe0LAKvt- --folder --output /hpcwork/rwth1833/datasets/Covid19_20/
