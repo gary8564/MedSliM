@@ -138,7 +138,7 @@ Run frozen 2D foundation models on every slice. This only needs to run once per 
 **HuggingFace models** (downloaded automatically):
 
 ```bash
-python med_slim/utils/preprocessing/precompute_slice_feature.py \
+python scripts/precompute_slice_feature.py \
     --data-dir /path/to/datasets/preprocessed/MRNet \
     --save-dir /path/to/feat_caches/MRNet \
     --model-name dinov2 \
@@ -149,7 +149,7 @@ python med_slim/utils/preprocessing/precompute_slice_feature.py \
 **Models requiring a local checkpoint** (`ark`, `mri-core`, `medimageinsight`):
 
 ```bash
-python med_slim/utils/preprocessing/precompute_slice_feature.py \
+python scripts/precompute_slice_feature.py \
     --data-dir /path/to/datasets/preprocessed/MRNet \
     --save-dir /path/to/feat_caches/MRNet \
     --model-name ark --checkpoint /path/to/models/ark/Ark6_swinLarge768_ep50.pth.tar \
@@ -161,7 +161,7 @@ python med_slim/utils/preprocessing/precompute_slice_feature.py \
 
 ```bash
 for SHARD_ID in 0 1 2 3; do
-    python med_slim/utils/preprocessing/precompute_slice_feature.py \
+    python scripts/precompute_slice_feature.py \
         --data-dir /path/to/datasets/preprocessed/fastMRI \
         --save-dir /path/to/feat_caches/fastMRI \
         --model-name medsiglip \
@@ -367,11 +367,10 @@ MedSliM/
 │   │   └── slice_encoder/              # 2D foundation model wrappers
 │   ├── train/train.py                  # Pretraining entry point
 │   └── utils/
-│       └── preprocessing/
-│           └── precompute_slice_feature.py  # Feature extraction CLI
+│       └── preprocessing/              # Transforms, augmentation
 ├── scripts/
-│   ├── precompute_slice_feature        # Precompute slice feature 
-│   ├── preprocess_dataset              # Data preprocessing
+│   ├── precompute_slice_feature.py     # Feature extraction CLI
+│   └── preprocess_dataset/             # Dataset-specific NIfTI conversion
 ├── tests/                              # Unit and integration tests
 ├── docs/data.md                        # Dataset documentation
 └── pyproject.toml

@@ -6,7 +6,7 @@
 __pycache__
 *.pyc
 .pytest_cache
-.ipynb_checkpoints/
+.ipynb_checkpoints
 
 # macOS
 .DS_Store
@@ -16,5 +16,10 @@ logs/
 stdout_*.txt
 wandb/
 figures/
-scripts/
-notebook/
+scripts/plot_data_scaling.py
+scripts/debug/
+scripts/download_dataset/
+scripts/pretrain/
+scripts/eval/
+scripts/precompute_slice_feature/*.sh
+scripts/preprocess_dataset/*.sh

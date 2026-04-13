@@ -68,16 +68,16 @@ def main():
         epilog="""
                 Examples:
                 # Precompute with resize
-                python precompute_slice_feature.py --spatial-mode resize
+                python scripts/precompute_slice_feature.py --spatial-mode resize
                 
                 # Precompute with resample
-                python precompute_slice_feature.py --spatial-mode resample
+                python scripts/precompute_slice_feature.py --spatial-mode resample
                 
                 # Precompute with crop
-                python precompute_slice_feature.py --spatial-mode crop
+                python scripts/precompute_slice_feature.py --spatial-mode crop
                 
                 # Precompute with adaptive selection based on source/target resolution ratio
-                python precompute_slice_feature.py --spatial-mode adaptive
+                python scripts/precompute_slice_feature.py --spatial-mode adaptive
                 """
     )
     parser.add_argument("--data-dir", type=str, required=True, help="Root folder of the preprocessed dataset (contains {split}/{plane}/*.nii.gz).")
