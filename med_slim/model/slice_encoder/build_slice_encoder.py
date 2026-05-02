@@ -25,7 +25,7 @@ def build_slice_encoder(
     Returns:
         nn.Module: feature extractor model.
     """
-    valid_names = ["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core", "medimageinsight"]
+    valid_names = ["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core", "medimageinsight", "curia"]
     assert name in valid_names, f"Slice encoder '{name}' not supported. Choose from {valid_names}."
     config = get_slice_encoder_config(name)
 
@@ -78,6 +78,14 @@ def build_slice_encoder(
                 "and pass checkpoint=<cloned_dir> to build_slice_encoder."
             )
         model = MedImageInsightFeatureExtractor(model_dir=model_dir)
+
+    elif config["name"] == "curia":
+        from .curia import CuriaFeatureExtractor
+        repo = model_repo or config.get("repo", CuriaFeatureExtractor.DEFAULT_REPO)
+        model = CuriaFeatureExtractor(
+            model_repo=repo,
+            local_cache_dir=local_cache_dir,
+        )
 
     else:
         raise ValueError(f"Unknown slice encoder name: {name}")

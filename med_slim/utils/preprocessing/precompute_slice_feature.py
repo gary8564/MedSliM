@@ -8,11 +8,13 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from safetensors.torch import save_file
 from pathlib import Path
+from dotenv import load_dotenv
 
 from med_slim.model.slice_encoder import build_slice_encoder
 from med_slim.data.slice_dataset import SliceDataset, slice_collate_fn
 from med_slim.utils.preprocessing.transforms import get_transforms, get_adaptive_transform
 
+load_dotenv()
 SPATIAL_MODES = ["resize", "resample", "crop", "adaptive"]
 
 
