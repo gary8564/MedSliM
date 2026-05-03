@@ -43,7 +43,7 @@ from med_slim.data.feat_dataset import (
     linear_classifier_collate_fn,
     multiview_classifier_collate_fn,
 )
-from med_slim.eval.load_cobra import load_pretrained_cobra
+from med_slim.eval.load_cobra import _build_cobra, load_pretrained_cobra
 from med_slim.utils.callbacks.early_stopping import EarlyStopping
 from med_slim.utils.metrics.linear import get_loss_criterion, get_eval_metrics, get_num_classes, compute_class_weights_for_weighted_loss
 from med_slim.utils.viz.linear import compute_and_visualize_metrics
@@ -2333,13 +2333,22 @@ def main(args):
     else:
         output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_{view_planes[0]}_{CURR_TIME}_{JOB_ID}")
     
-    # Save pretrained COBRA model config
-    checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg["checkpoint_path"]
-    pretrain_config_path = Path(checkpoint_path).parent / "config.yaml"
+    checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg.get("checkpoint_path")
+    pretrain_config_path = (
+        args.pretrain_config_path
+        or cfg.get("pretrain_config_path")
+        or (Path(checkpoint_path).parent / "config.yaml" if checkpoint_path else None)
+    )
+    if pretrain_config_path is None:
+        raise ValueError(
+            "A pretraining config is required. Provide --pretrain-config-path "
+            "or set pretrain_config_path/checkpoint_path in the config."
+        )
     with open(pretrain_config_path, "r") as f:
         pretrain_cfg = yaml.safe_load(f)
     cobra_cfg = pretrain_cfg["model"]["cobra"]
     cfg["cobra_config"] = cobra_cfg
+    cfg["no_pretrained_cobra"] = args.no_pretrained_cobra
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
@@ -2362,21 +2371,46 @@ def main(args):
         fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
         raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
 
-    # Load pretrained COBRA model
-    if accelerator.is_main_process:
-        logger.info("Loading pretrained COBRA model...")
-        logger.info(f"Checkpoint path: {checkpoint_path}")
-    cobra_model = load_pretrained_cobra(
-        checkpoint_path=checkpoint_path,
-        accelerator=accelerator,
-        model_config=cobra_cfg,
-        encoder_type=cfg["encoder_type"],
-        fm_pooling=args.fm_pooling,
-        sequence_encoder=args.sequence_encoder,  
-        slice_pooling=args.slice_pooling,
-        pooling_target=args.pooling_target,
-        raw_output_dim=raw_output_dim,
-    )
+    if args.no_pretrained_cobra:
+        if cfg.get("freeze_cobra", True):
+            raise ValueError(
+                "--no-pretrained-cobra builds randomly initialized aggregation modules. "
+                "Use --fine-tune (or freeze_cobra: false) so they can train."
+            )
+        sequence_encoder = args.sequence_encoder or "mamba2"
+        slice_pooling = args.slice_pooling or "abmil"
+        if accelerator.is_main_process:
+            logger.info(
+                "Building randomly initialized COBRA: "
+                f"sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}"
+            )
+        cobra_model = _build_cobra(
+            model_config=cobra_cfg,
+            sequence_encoder=sequence_encoder,
+            slice_pooling=slice_pooling,
+            fm_pooling=args.fm_pooling,
+            pooling_target=args.pooling_target,
+            raw_output_dim=raw_output_dim,
+        )
+    else:
+        if checkpoint_path is None:
+            raise ValueError(
+                "checkpoint_path is required unless --no-pretrained-cobra is set."
+            )
+        if accelerator.is_main_process:
+            logger.info("Loading pretrained COBRA model...")
+            logger.info(f"Checkpoint path: {checkpoint_path}")
+        cobra_model = load_pretrained_cobra(
+            checkpoint_path=checkpoint_path,
+            accelerator=accelerator,
+            model_config=cobra_cfg,
+            encoder_type=cfg["encoder_type"],
+            fm_pooling=args.fm_pooling,
+            sequence_encoder=args.sequence_encoder,  
+            slice_pooling=args.slice_pooling,
+            pooling_target=args.pooling_target,
+            raw_output_dim=raw_output_dim,
+        )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
 
@@ -2563,6 +2597,20 @@ if __name__ == "__main__":
         help="Path to pretrained COBRA checkpoint. Overrides config file if provided."
     )
     parser.add_argument(
+        "--pretrain-config-path",
+        type=str,
+        default=None,
+        help="Path to the MedSliM pretraining config. Required when using "
+             "--no-pretrained-cobra without a checkpoint_path."
+    )
+    parser.add_argument(
+        "--no-pretrained-cobra",
+        action="store_true",
+        help="Build COBRA/aggregation modules from random initialization instead "
+             "of loading a contrastively pretrained checkpoint. Use with "
+             "--fine-tune so the aggregation modules are trainable."
+    )
+    parser.add_argument(
         "--fm-model-names",
         type=str,
         default=None,
@@ -2576,7 +2624,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sequence-encoder",
         type=str,
-        choices=["mamba2", "transformer"],
+        choices=["mamba2", "transformer", "identity"],
         default=None,
     )
     parser.add_argument(
@@ -2596,7 +2644,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--slice-pooling",
         type=str,
-        choices=["abmil", "cls"],
+        choices=["abmil", "cross_attention", "cls"],
         default=None,
     )
     parser.add_argument(

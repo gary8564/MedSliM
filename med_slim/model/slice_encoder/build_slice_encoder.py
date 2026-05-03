@@ -11,6 +11,8 @@ def build_slice_encoder(
     checkpoint: Optional[str] = None,
     local_cache_dir: Optional[str] = None,
     freeze: bool = True,
+    curia_token_mode: str = "cls",
+    curia_spatial_pool_kernel_size: Optional[int] = None,
 ) -> nn.Module:
     """
     Factory to construct a pretrained 2D slice feature extractor.
@@ -21,6 +23,8 @@ def build_slice_encoder(
         checkpoint: Path to model checkpoint. Required for name='ark' and name='mri-core'.
         local_cache_dir: Local cache directory to store the model. If None, the default Hugging Face cache directory "~/.cache/huggingface/hub" will be used.
         freeze: If True, parameters are set to requires_grad=False.
+        curia_token_mode: Curia-only token extraction mode: "cls", "patch", or "cls_patch".
+        curia_spatial_pool_kernel_size: Curia-only average-pooling kernel over patch tokens.
 
     Returns:
         nn.Module: feature extractor model.
@@ -85,6 +89,8 @@ def build_slice_encoder(
         model = CuriaFeatureExtractor(
             model_repo=repo,
             local_cache_dir=local_cache_dir,
+            token_mode=curia_token_mode,
+            spatial_pool_kernel_size=curia_spatial_pool_kernel_size,
         )
 
     else:

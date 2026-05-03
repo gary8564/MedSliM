@@ -205,6 +205,44 @@ def test_cobra_cls_pooling_requires_transformer():
         )
 
 
+def test_cobra_identity_cross_attention_pooling():
+    """Test skipping the sequence encoder and using cross-attention gives a Curia-style aggregation-only baseline."""
+    batch_size = 2
+    max_slices = 8
+    input_dim = 768
+
+    model = Cobra(
+        embed_dim=input_dim,
+        contrast_dim=128,
+        input_dims=[input_dim],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        sequence_encoder="identity",
+        slice_pooling="cross_attention",
+    ).to(DEVICE).eval()
+
+    seq_lengths = torch.tensor([3, 6], dtype=torch.long, device=DEVICE)
+    x = [torch.randn(batch_size, max_slices, input_dim, device=DEVICE)]
+    x_alt = [x[0].clone()]
+    x_alt[0][0, 3:, :] = torch.randn_like(x_alt[0][0, 3:, :]) * 50.0 + 100.0
+    x_alt[0][1, 6:, :] = torch.randn_like(x_alt[0][1, 6:, :]) * 50.0 + 100.0
+
+    with torch.no_grad():
+        y1 = model(x, seq_lengths=seq_lengths)
+        y2 = model(x_alt, seq_lengths=seq_lengths)
+        attn = model(x, seq_lengths=seq_lengths, get_attention=True)
+
+    assert model.output_dim == input_dim
+    assert y1.shape == (batch_size, input_dim)
+    assert torch.isfinite(y1).all() and torch.isfinite(y2).all()
+    assert torch.allclose(y1, y2, atol=1e-5, rtol=1e-5)
+    assert attn.shape == (batch_size, 1, max_slices)
+    assert torch.allclose(attn[0, 0, 3:], torch.zeros_like(attn[0, 0, 3:]), atol=1e-6, rtol=0.0)
+    assert torch.allclose(attn[1, 0, 6:], torch.zeros_like(attn[1, 0, 6:]), atol=1e-6, rtol=0.0)
+
+
 def count_parameters(model):
     """Count total number of learnable parameters in a model"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

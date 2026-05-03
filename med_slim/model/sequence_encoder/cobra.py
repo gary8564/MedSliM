@@ -111,7 +111,7 @@ class Cobra(nn.Module):
             num_layers: Number of encoder layers.
             dropout: Dropout rate.
             mode: 'train' or 'inference'.
-            sequence_encoder: 'mamba2' or 'transformer'.
+            sequence_encoder: 'mamba2', 'transformer', or 'identity'.
             fm_pooling: 'avg_pool' or 'attention' in inference mode.
                 - 'avg_pool': Average pool embeddings across foundation models.
                 - 'attention': Learn attention weights to pool FM embeddings per slice (requires fine-tuning).
@@ -141,7 +141,7 @@ class Cobra(nn.Module):
             input_dims = [512, 768, 1024, 1152, 1376, 1536]
 
         assert mode in ["train", "inference"]
-        assert sequence_encoder in ["mamba2", "transformer"]
+        assert sequence_encoder in ["mamba2", "transformer", "identity"]
         if mode == "inference":
             assert fm_pooling in ["avg_pool", "attention"], f"Invalid fm_pooling '{fm_pooling}'. Must be one of 'avg_pool', 'attention'."
         assert slice_pooling in ["abmil", "cross_attention", "cls"], (
@@ -182,7 +182,7 @@ class Cobra(nn.Module):
                 dropout=dropout,
                 d_state=kwargs.get('d_state', 128),
             )
-        else:
+        elif self.sequence_encoder == "transformer":
             # Standard TransformerEncoder for zero-padding
             enc_layer = TransformerEncoderLayer(
                 d_model=embed_dim,
@@ -210,6 +210,8 @@ class Cobra(nn.Module):
                 norm_first=kwargs.get('norm_first', True),
                 rotary_positional_encoding=kwargs.get('rotary_positional_encoding', None),
             )
+        else:
+            self.seq_enc = nn.Identity()
 
         # Optional CLS token
         self.cls_token = None
@@ -290,7 +292,7 @@ class Cobra(nn.Module):
     @property
     def output_dim(self) -> int:
         """Dimension of the volume-level output embedding, accounting for pooling_target."""
-        if self.pooling_target == "raw":
+        if self.slice_pooling == "abmil" and self.pooling_target == "raw":
             return self._raw_output_dim
         return self.embed_dim
 
@@ -580,7 +582,9 @@ class Cobra(nn.Module):
             )
         
         # Sequence encoder
-        if self.sequence_encoder == "transformer" and hasattr(self, 'varlen_seq_enc'):
+        if self.sequence_encoder == "identity":
+            h = logits
+        elif self.sequence_encoder == "transformer" and hasattr(self, 'varlen_seq_enc'):
             # Transformer with FlashAttention varlen
             # Processes all sequences in one pass without padding
             h = self.varlen_seq_enc(logits, cu_seqlens, max_seqlen)
@@ -680,7 +684,9 @@ class Cobra(nn.Module):
                 src_key_padding_mask = ~mask
 
         # Sequence encoder
-        if self.sequence_encoder == "mamba2":
+        if self.sequence_encoder == "identity":
+            h = logits
+        elif self.sequence_encoder == "mamba2":
             h = self.seq_enc(logits)
         else:
             h = self.seq_enc(logits, src_key_padding_mask=src_key_padding_mask)

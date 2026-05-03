@@ -113,6 +113,15 @@ def main():
                         help="Total number of shards for parallel processing")
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for faster inference")
+    parser.add_argument("--curia-token-mode", type=str, default="cls",
+                        choices=["cls", "patch", "cls_patch"],
+                        help="Curia only: token type to cache. "
+                             "'cls' stores one embedding per slice; "
+                             "'patch' stores flattened spatial patch tokens; "
+                             "'cls_patch' stores both.")
+    parser.add_argument("--curia-spatial-pool-kernel-size", type=int, default=None,
+                        help="Curia only: optional average-pooling kernel over the "
+                             "2D patch grid before flattening patch tokens.")
     args = parser.parse_args()
     device = torch.device("cuda")
 
@@ -125,6 +134,8 @@ def main():
         name=args.model_name, model_repo=args.model_repo,
         checkpoint=args.checkpoint, local_cache_dir=args.local_cache_dir,
         freeze=True,
+        curia_token_mode=args.curia_token_mode,
+        curia_spatial_pool_kernel_size=args.curia_spatial_pool_kernel_size,
     ).to(device).eval()
 
     if args.compile:
@@ -158,6 +169,9 @@ def main():
     print(f"  plane: {args.plane}")
     print(f"  split: {args.split}")
     print(f"  model_name: {args.model_name}")
+    if args.model_name == "curia":
+        print(f"  curia_token_mode: {args.curia_token_mode}")
+        print(f"  curia_spatial_pool_kernel_size: {args.curia_spatial_pool_kernel_size}")
 
     out_dir = (Path(args.save_dir) / f"slices_{num_slices_for_logging}"
                / spatial_mode / args.model_name / args.split / args.plane)
@@ -231,6 +245,11 @@ def main():
                     "num_slices": num_slices_for_logging,
                     "spatial_mode": spatial_mode,
                 }
+                if args.model_name == "curia":
+                    metadata["curia_token_mode"] = str(args.curia_token_mode)
+                    metadata["curia_spatial_pool_kernel_size"] = str(
+                        args.curia_spatial_pool_kernel_size
+                    )
                 # Extract inter-slice spacing from the NIfTI header
                 nifti_path = os.path.join(
                     args.data_dir, args.split, args.plane, f"{uid}.nii.gz"

@@ -80,7 +80,7 @@ model:
       repo: "/hpcwork/rwth1833/models/MedImageInsights"
     - name: curia
       img_size: [512, 512]
-      image_mean: [0.0, 0.0, 0.0]  # Curia uses per-slice min-max normalization internally
+      image_mean: [0.0, 0.0, 0.0]  # Curia applies per-slice z-score normalization internally
       image_std: [1.0, 1.0, 1.0]
       embed_dim: 768
       repo: "raidium/curia"

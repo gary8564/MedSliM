@@ -11,6 +11,8 @@
 # ------------------------------------------------------------------------------
 # Path to pretrained MedSliM checkpoint
 checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-02-16-11:36/medslim-epoch2000.pth.tar"
+# Optional when running --no-pretrained-cobra; otherwise inferred from checkpoint_path parent.
+# pretrain_config_path: "/path/to/pretrain/config.yaml"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
 

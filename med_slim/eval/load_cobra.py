@@ -27,7 +27,7 @@ def _build_cobra(
 
     if sequence_encoder == "mamba2":
         encoder_kwargs["d_state"] = model_config.get("mamba_d_state", 128)
-    else:
+    elif sequence_encoder == "transformer":
         encoder_kwargs["rotary_positional_encoding"] = model_config["transformer_rotary_positional_encoding"]
         encoder_kwargs["norm_first"] = model_config["transformer_norm_first"]
         encoder_kwargs["dim_feedforward"] = model_config.get(
@@ -94,7 +94,6 @@ def load_pretrained_cobra(
     
     state_dict = torch.load(checkpoint_path, map_location=accelerator.device, weights_only=False)
     if sequence_encoder is None:
-        sequence_encoder = state_dict.get("sequence_encoder", "mamba2")  # Default for older checkpoints
         sequence_encoder = state_dict.get("sequence_encoder", "mamba2")  # Default for older checkpoints
     if slice_pooling is None:
         slice_pooling = state_dict.get("pooling", "abmil")  # Default for older checkpoints
