@@ -1,0 +1,52 @@
+# ==============================================================================
+# End-to-end Curia Classifier Configuration
+# ==============================================================================
+# Evaluates the Curia backbone with trainable cross-attention pooling and MLP
+# classifier operating directly on NIfTI volumes (no precomputed features).
+#
+# Usage:
+#   python -m med_slim.eval.curia_classifier --config med_slim/configs/curia_classifier.yml
+
+# Dataset
+dataset_name: "kneeMRI"
+data_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+plane: "sagittal"
+num_slices: null  # null = keep all slices (no cropping/padding in depth)
+spatial_mode: "resize"  # resize | resample | crop
+
+# Model
+model:
+  model_repo: "raidium/curia"
+  local_cache_dir: null
+  # Token mode: "cls" (1 token/slice), "patch" (all patch tokens), "cls_patch" (both)
+  token_mode: "cls"
+  # Spatial average pooling kernel for patch tokens (reduces sequence length)
+  # Only used when token_mode is "patch" or "cls_patch".
+  # E.g., for 512x512 Curia input → 32x32 patches → kernel_size=4 → 8x8=64 tokens/slice.
+  spatial_pool_kernel_size: null
+  # Add Curia-style sinusoidal slice positional embeddings before cross-attention.
+  # The same slice-index embedding is added to every token from that slice.
+  add_slice_positional_embedding: true
+  # Cross-attention pooling
+  num_heads: 8
+  num_queries: 1
+  pooling_dropout: 0.0
+  # Classifier MLP head
+  classifier_hidden_dim: 512
+  classifier_dropout: 0.5
+
+# Output
+output_dir: "/hpcwork/rwth1833/experiments/curia-classifier"
+
+# Training hyperparameters
+hyperparams:
+  batch_size: 4
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_epochs: 50
+  num_workers: 4
+  val_split_ratio: 0.1
+  patience: 10
+  weighted_loss: false

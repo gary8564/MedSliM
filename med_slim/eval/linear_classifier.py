@@ -2624,7 +2624,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sequence-encoder",
         type=str,
-        choices=["mamba2", "transformer", "identity"],
+        choices=["mamba2", "transformer"],
         default=None,
     )
     parser.add_argument(
