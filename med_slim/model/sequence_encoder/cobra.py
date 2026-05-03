@@ -182,7 +182,7 @@ class Cobra(nn.Module):
                 dropout=dropout,
                 d_state=kwargs.get('d_state', 128),
             )
-        elif self.sequence_encoder == "transformer":
+        else:
             # Standard TransformerEncoder for zero-padding
             enc_layer = TransformerEncoderLayer(
                 d_model=embed_dim,

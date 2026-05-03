@@ -128,7 +128,7 @@ class CuriaClassifier(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Curia-style sinusoidal positional embeddings over discrete slice indices."""
+        """Sinusoidal positional embeddings over discrete slice indices."""
         positions = torch.arange(num_slices, device=device, dtype=dtype).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, embed_dim, 2, device=device, dtype=dtype)
