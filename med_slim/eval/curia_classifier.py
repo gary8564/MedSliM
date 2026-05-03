@@ -33,7 +33,7 @@ from transformers import get_cosine_schedule_with_warmup
 from med_slim.model.slice_encoder.curia import CuriaFeatureExtractor
 from med_slim.model.attention_pooling.cross_attention import CrossAttentionPooling
 from med_slim.data.slice_dataset import SliceDataset
-from med_slim.utils.preprocessing.transforms import get_transforms
+from med_slim.utils.preprocessing.transforms import get_adaptive_transform, get_transforms
 from med_slim.utils.callbacks.early_stopping import EarlyStopping
 from med_slim.utils.label_metadata import (
     get_dataset_metadata,
@@ -56,9 +56,7 @@ CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 JOB_ID = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
 
 
-# ---------------------------------------------------------------------------
 # Model
-# ---------------------------------------------------------------------------
 class CuriaClassifier(nn.Module):
     """
     End-to-end model:  Curia backbone (frozen) → cross-attention pooling → MLP classifier.
@@ -90,7 +88,7 @@ class CuriaClassifier(nn.Module):
         self.token_mode = token_mode
         self.add_slice_positional_embedding = add_slice_positional_embedding
 
-        # --- Frozen backbone ---
+        # Frozen backbone
         self.backbone = CuriaFeatureExtractor(
             model_repo=model_repo,
             local_cache_dir=local_cache_dir,
@@ -102,7 +100,7 @@ class CuriaClassifier(nn.Module):
 
         embed_dim = self.backbone.embed_dim
 
-        # --- Trainable aggregation ---
+        # Trainable aggregation
         self.cross_attn_pool = CrossAttentionPooling(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -110,7 +108,7 @@ class CuriaClassifier(nn.Module):
             dropout=pooling_dropout,
         )
 
-        # --- Trainable classifier ---
+        # Trainable classifier
         self.num_classes = num_classes
         output_dim = 1 if num_classes == 2 else num_classes
         self.classifier = nn.Sequential(
@@ -196,9 +194,7 @@ class CuriaClassifier(nn.Module):
         return {"logits": logits}
 
 
-# ---------------------------------------------------------------------------
 # Dataset wrapper: adds labels to SliceDataset
-# ---------------------------------------------------------------------------
 class LabeledSliceDataset(SliceDataset):
     """SliceDataset augmented with classification labels from a CSV."""
 
@@ -251,9 +247,7 @@ def labeled_collate_fn(batch):
     return {"uid": uids, "x": x, "labels": labels}
 
 
-# ---------------------------------------------------------------------------
 # Training / evaluation helpers
-# ---------------------------------------------------------------------------
 def _compute_loss(logits, labels, task, criterion):
     if task == "binary":
         return criterion(logits.squeeze(-1), labels.float())
@@ -324,16 +318,14 @@ def evaluate(model, loader, task, criterion, num_classes, accelerator):
     return avg_loss, metrics, logits_cat, labels_cat, all_ids
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 def main(args):
     accelerator = Accelerator()
 
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    # --- Resolve dataset metadata ---
+    # Resolve dataset metadata
     dataset_name = cfg["dataset_name"]
     ds_meta = get_dataset_metadata(dataset_name)
     task = ds_meta["task"]
@@ -352,16 +344,27 @@ def main(args):
     data_dir = cfg["data_dir"]
     hp = cfg["hyperparams"]
 
-    # --- Transforms (Curia uses identity mean/std → spatial resize only) ---
-    _, val_transform = get_transforms(
-        model_name="curia",
-        plane=plane,
-        num_slices=cfg.get("num_slices"),
-        spatial_mode=cfg.get("spatial_mode", "resize"),
-        to_tensor=True,
-    )
+    # Transforms
+    spatial_mode = cfg.get("spatial_mode", "adaptive")
+    if spatial_mode == "adaptive":
+        val_transform = get_adaptive_transform(
+            model_name="curia",
+            plane=plane,
+            num_slices=cfg.get("num_slices"),
+            crop_empty_slices=cfg.get("crop_empty_slices", False),
+            to_tensor=True,
+        )
+    else:
+        _, val_transform = get_transforms(
+            model_name="curia",
+            plane=plane,
+            num_slices=cfg.get("num_slices"),
+            spatial_mode=spatial_mode,
+            crop_empty_slices=cfg.get("crop_empty_slices", False),
+            to_tensor=True,
+        )
 
-    # --- Datasets ---
+    # Datasets
     train_ds = LabeledSliceDataset(
         path_root=data_dir, split="train", annotations_path=train_annots,
         task=task, target_columns=target_labels, transform=val_transform, plane=plane,
@@ -400,7 +403,7 @@ def main(args):
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
                              collate_fn=labeled_collate_fn, num_workers=num_workers, pin_memory=True)
 
-    # --- Model ---
+    # Model
     model_cfg = cfg.get("model", {})
     num_classes_resolved = get_num_classes(task, target_labels, test_ds if not isinstance(test_ds, Subset) else test_ds.dataset)
     model = CuriaClassifier(
@@ -422,7 +425,7 @@ def main(args):
     if accelerator.is_main_process:
         logger.info(f"Parameters: {trainable:,} trainable / {total - trainable:,} frozen / {total:,} total")
 
-    # --- Optimiser & scheduler ---
+    # Optimiser & scheduler
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=float(hp.get("lr", 1e-4)),
@@ -433,14 +436,14 @@ def main(args):
     warmup_steps = int(total_steps * hp.get("warmup_ratio", 0.1))
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    # --- Loss ---
+    # Loss
     class_weights = (
         compute_class_weights_for_weighted_loss(train_annots, target_labels, task, accelerator.device)
         if hp.get("weighted_loss", False) else None
     )
     criterion = get_loss_criterion(task, class_weights)
 
-    # --- Output dir ---
+    # Output dir
     label_str = "_".join(target_labels)
     output_dir = os.path.join(
         cfg.get("output_dir", "experiments/curia_classifier"),
@@ -457,12 +460,12 @@ def main(args):
             dir=output_dir,
         )
 
-    # --- Prepare with accelerator ---
+    # Prepare with accelerator
     model, optimizer, train_loader, val_loader, test_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, val_loader, test_loader, scheduler,
     )
 
-    # --- Early stopping ---
+    # Early stopping
     patience = hp.get("patience", 10)
     ckpt_dir = os.path.join(output_dir, "ckpt")
     if accelerator.is_main_process:
@@ -473,7 +476,7 @@ def main(args):
         accelerator=accelerator,
     ) if patience > 0 else None
 
-    # --- Training loop ---
+    # Training loop
     best_val_auroc = -1.0
     for epoch in range(max_epochs):
         train_loss, train_metrics = train_one_epoch(
@@ -514,7 +517,7 @@ def main(args):
                 early_stopping.load_best_model(unwrapped)
                 break
 
-    # --- Test evaluation ---
+    # Test evaluation
     if accelerator.is_main_process:
         logger.info("Evaluating on test set ...")
     test_loss, test_metrics, test_logits, test_labels, test_ids = evaluate(

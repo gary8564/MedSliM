@@ -13,7 +13,8 @@ data_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
 annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
 plane: "sagittal"
 num_slices: null  # null = keep all slices (no cropping/padding in depth)
-spatial_mode: "resize"  # resize | resample | crop
+spatial_mode: "adaptive"  # adaptive | resize | resample | crop
+crop_empty_slices: false
 
 # Model
 model:
