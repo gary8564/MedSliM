@@ -166,14 +166,35 @@ class CuriaClassifier(nn.Module):
         pe = pe.repeat_interleave(tokens_per_slice, dim=0).unsqueeze(0)
         return h + pe
 
+    @staticmethod
+    def _expand_slice_mask_to_tokens(
+        slice_mask: torch.Tensor,
+        token_count: int,
+    ) -> torch.Tensor:
+        """
+        Expand a [B, D] valid-slice mask to the token sequence emitted by Curia.
+        Curia tokens are grouped by slice, so each slice mask value repeats for
+        the number of tokens produced per slice.
+        """
+        num_slices = slice_mask.shape[1]
+        if token_count % num_slices != 0:
+            raise ValueError(
+                f"Cannot expand slice mask: token count {token_count} "
+                f"is not divisible by num_slices={num_slices}."
+            )
+        tokens_per_slice = token_count // num_slices
+        return slice_mask.repeat_interleave(tokens_per_slice, dim=1)
+
     def forward(
         self,
         x: torch.Tensor,
+        slice_mask: Optional[torch.Tensor] = None,
         return_attention: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             x: Volume tensor [B, C, W, H, D], C=1.
+            slice_mask: Boolean mask [B, D], True for real slices and False for padding.
             return_attention: Also return cross-attention weights.
 
         Returns:
@@ -183,13 +204,19 @@ class CuriaClassifier(nn.Module):
             h = self.backbone(x)  # [B, T, embed_dim]
         if self.add_slice_positional_embedding:
             h = self._add_slice_positional_embedding(h, num_slices=x.shape[-1])
+        token_mask = None
+        if slice_mask is not None:
+            token_mask = self._expand_slice_mask_to_tokens(
+                slice_mask=slice_mask.to(device=h.device, dtype=torch.bool),
+                token_count=h.shape[1],
+            )
 
         if return_attention:
-            pooled, attn = self.cross_attn_pool(h, return_attention=True)
+            pooled, attn = self.cross_attn_pool(h, mask=token_mask, return_attention=True)
             logits = self.classifier(pooled)
             return {"logits": logits, "attn_weights": attn}
 
-        pooled = self.cross_attn_pool(h)  # [B, embed_dim]
+        pooled = self.cross_attn_pool(h, mask=token_mask)  # [B, embed_dim]
         logits = self.classifier(pooled)
         return {"logits": logits}
 
@@ -239,12 +266,27 @@ class LabeledSliceDataset(SliceDataset):
 
 
 def labeled_collate_fn(batch):
-    """Collate for LabeledSliceDataset: stack volumes + labels."""
+    """Collate for LabeledSliceDataset: pad variable-depth volumes and labels."""
     uids = [s["uid"] for s in batch]
     tensors = [s["source"].tensor for s in batch]  # each (C, W, H, D)
     labels = torch.stack([s["label"] for s in batch])
-    x = torch.stack(tensors, dim=0)  # (B, C, W, H, D)
-    return {"uid": uids, "x": x, "labels": labels}
+    max_slices = max(t.shape[-1] for t in tensors)
+
+    padded_tensors = []
+    slice_masks = []
+    for tensor in tensors:
+        num_slices = tensor.shape[-1]
+        padded = tensor.new_zeros(*tensor.shape[:-1], max_slices)
+        padded[..., :num_slices] = tensor
+        padded_tensors.append(padded)
+
+        mask = torch.zeros(max_slices, dtype=torch.bool)
+        mask[:num_slices] = True
+        slice_masks.append(mask)
+
+    x = torch.stack(padded_tensors, dim=0)  # (B, C, W, H, D_max)
+    slice_mask = torch.stack(slice_masks, dim=0)  # (B, D_max)
+    return {"uid": uids, "x": x, "labels": labels, "slice_mask": slice_mask}
 
 
 # Training / evaluation helpers
@@ -272,6 +314,44 @@ def _compute_metrics(logits, labels, task, num_classes, device):
     return {k: v.compute().item() for k, v in metrics.items()}
 
 
+def _build_predictions_dataframe(
+    probs: np.ndarray,
+    true_labels: np.ndarray,
+    sample_ids: List[str],
+    task: str,
+    target_labels: List[str],
+) -> pd.DataFrame:
+    """Format Curia classifier predictions like MedSliM linear evaluation output."""
+    if task == "binary":
+        probs = probs.squeeze(-1) if probs.ndim > 1 else probs
+        pred_labels = (probs >= 0.5).astype(int)
+        return pd.DataFrame({
+            "exam_id": sample_ids,
+            "true_labels": true_labels.tolist(),
+            "pred_labels": pred_labels.tolist(),
+            "pred_probs": probs.tolist(),
+        })
+
+    if task == "multilabel":
+        pred_labels = (probs >= 0.5).astype(int)
+        df_results = pd.DataFrame({"exam_id": sample_ids})
+        df_results["true_labels"] = [list(map(int, row)) for row in true_labels]
+        df_results["pred_labels"] = [
+            [target_labels[i] for i, pred in enumerate(row) if pred == 1]
+            for row in pred_labels
+        ]
+        df_results["pred_probs"] = [list(row) for row in probs]
+        return df_results
+
+    pred_labels = probs.argmax(axis=-1)
+    return pd.DataFrame({
+        "exam_id": sample_ids,
+        "true_labels": true_labels.tolist(),
+        "pred_labels": pred_labels.tolist(),
+        "pred_probs": [list(row) for row in probs],
+    })
+
+
 def train_one_epoch(model, loader, optimizer, scheduler, task, criterion, num_classes, accelerator):
     model.train()
     total_loss = 0.0
@@ -280,8 +360,9 @@ def train_one_epoch(model, loader, optimizer, scheduler, task, criterion, num_cl
         optimizer.zero_grad()
         x = batch["x"]
         labels = batch["labels"]
+        slice_mask = batch["slice_mask"]
         with accelerator.autocast():
-            out = model(x)
+            out = model(x, slice_mask=slice_mask)
             loss = _compute_loss(out["logits"], labels, task, criterion)
         accelerator.backward(loss)
         optimizer.step()
@@ -304,8 +385,9 @@ def evaluate(model, loader, task, criterion, num_classes, accelerator):
     for batch in loader:
         x = batch["x"]
         labels = batch["labels"]
+        slice_mask = batch["slice_mask"]
         with accelerator.autocast():
-            out = model(x)
+            out = model(x, slice_mask=slice_mask)
             loss = _compute_loss(out["logits"], labels, task, criterion)
         total_loss += loss.item()
         all_logits.append(out["logits"].detach())
@@ -352,7 +434,7 @@ def main(args):
             plane=plane,
             num_slices=cfg.get("num_slices"),
             crop_empty_slices=cfg.get("crop_empty_slices", False),
-            to_tensor=True,
+            to_tensor=False,
         )
     else:
         _, val_transform = get_transforms(
@@ -361,7 +443,7 @@ def main(args):
             num_slices=cfg.get("num_slices"),
             spatial_mode=spatial_mode,
             crop_empty_slices=cfg.get("crop_empty_slices", False),
-            to_tensor=True,
+            to_tensor=False,
         )
 
     # Datasets
@@ -555,6 +637,18 @@ def main(args):
         }
         with open(os.path.join(output_dir, "results.json"), "w") as f:
             json.dump(results, f, indent=2)
+
+        table_dir = os.path.join(output_dir, "table")
+        os.makedirs(table_dir, exist_ok=True)
+        predictions = _build_predictions_dataframe(
+            probs=probs,
+            true_labels=true_np,
+            sample_ids=test_ids,
+            task=task,
+            target_labels=target_labels,
+        )
+        predictions.to_csv(os.path.join(table_dir, "predictions.csv"), index=False)
+        logger.info(f"Predictions saved to {os.path.join(table_dir, 'predictions.csv')}")
 
         wandb.finish()
         logger.info(f"Results saved to {output_dir}")

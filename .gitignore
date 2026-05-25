@@ -12,3 +12,4 @@ scripts/plot_data_scaling.py
 scripts/precompute_slice_feature/parallel_launch.sh
 scripts/precompute_slice_feature/submit_all_variants.sh
 figures
+*.log
