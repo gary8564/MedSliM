@@ -77,9 +77,16 @@ def extract_cobra_features(
     for batch in tqdm(dataloader, desc="Extracting COBRA features",
                       disable=not accelerator.is_main_process):
         seq_lengths = batch["seq_lengths"].to(accelerator.device)
+        physical_positions = batch.get("physical_positions")
+        if physical_positions is not None:
+            physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
         features = [f.to(accelerator.device, dtype=model_dtype) for f in batch["features"]]
 
-        embeddings = cobra_model(features, seq_lengths=seq_lengths)  # [B, output_dim]
+        embeddings = cobra_model(
+            features,
+            seq_lengths=seq_lengths,
+            physical_positions=physical_positions,
+        )  # [B, output_dim]
         embeddings = embeddings.float()
 
         if normalize:
@@ -552,7 +559,7 @@ if __name__ == "__main__":
         "--sequence-encoder", type=str, choices=["mamba2", "transformer"], default=None,
     )
     parser.add_argument(
-        "--slice-pooling", type=str, choices=["abmil", "cls"], default=None,
+        "--slice-pooling", type=str, choices=["abmil", "cross_attention", "cls"], default=None,
     )
     parser.add_argument(
         "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"], default="raw",

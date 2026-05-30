@@ -22,18 +22,18 @@ class FeatureCache:
     In-memory cache for safetensors feature files.
 
     Preloads all given paths at construction using multi-threaded I/O,
-    then serves tensors from memory. 
+    then serves tensors and metadata from memory.
     Paths not in the cache are loaded from disk.
     """
 
     def __init__(self, paths):
-        self._cache: Dict[str, torch.Tensor] = {}
+        self._cache: Dict[str, Tuple[torch.Tensor, dict]] = {}
         self._preload(paths)
 
     @staticmethod
-    def _read_tensor(path: str) -> Tuple[str, torch.Tensor]:
+    def _read_tensor(path: str) -> Tuple[str, torch.Tensor, dict]:
         with safe_open(path, framework="pt", device="cpu") as f:
-            return path, f.get_tensor("feats").clone()
+            return path, f.get_tensor("feats").clone(), f.metadata()
 
     def _preload(self, paths) -> None:
         paths = list(paths)
@@ -41,23 +41,32 @@ class FeatureCache:
                      f"(multi-threaded I/O)...")
         total_bytes = 0
         with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 8)) as pool:
-            for path, tensor in tqdm(
+            for path, tensor, metadata in tqdm(
                 pool.map(self._read_tensor, paths),
                 total=len(paths),
                 desc="Caching features in RAM",
             ):
-                self._cache[path] = tensor
+                self._cache[path] = (tensor, metadata)
                 total_bytes += tensor.nelement() * tensor.element_size()
         logger.info(f"Feature cache ready: {len(self._cache)} tensors, "
                      f"{total_bytes / 1e9:.2f} GB in RAM")
 
-    def get(self, path: str) -> torch.Tensor:
-        """Return cached tensor, falling back to disk if not in cache."""
+    def get(self, path: str) -> Tuple[torch.Tensor, dict]:
+        """Return cached tensor and metadata, falling back to disk if not in cache."""
         cached = self._cache.get(path)
         if cached is not None:
             return cached
         with safe_open(path, framework="pt", device="cpu") as f:
-            return f.get_tensor("feats")
+            return f.get_tensor("feats"), f.metadata()
+
+
+def _slice_spacing_from_metadata(metadata: dict | None) -> float | None:
+    """Extract slice spacing metadata when available."""
+    if not metadata:
+        return None
+    spacing_str = metadata.get("slice_spacing_mm")
+    return float(spacing_str) if spacing_str is not None else None
+
 
 def ssl_packed_collate_fn(batch):
     """
@@ -111,8 +120,10 @@ def ssl_packed_collate_fn(batch):
     # Vectorized building seq_idx: repeat each batch index by its sequence length
     seq_idx = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens)
     
-    # Pack physical positions the same way as features
-    phys_pos_list = [item["physical_positions"] for item in batch]
+    phys_pos_list = [
+        item.get("physical_positions", torch.arange(item["feats1"].shape[0], dtype=torch.float32))
+        for item in batch
+    ]
     phys_pos_packed = torch.cat(phys_pos_list, dim=0)  # [total_seq_len]
     
     result = {
@@ -157,6 +168,7 @@ def linear_classifier_collate_fn(batch):
     labels = torch.stack([item["label"] for item in batch])
     sample_ids = [item["sample_id"] for item in batch]
     seq_lengths = torch.tensor([item["seq_length"] for item in batch], dtype=torch.long)
+    physical_positions = [item["physical_positions"] for item in batch]
     
     all_feats_list = [item["feature_embeds"] for item in batch]
     K = len(all_feats_list[0])  # Number of slice encoders
@@ -178,9 +190,15 @@ def linear_classifier_collate_fn(batch):
         
         features_list.append(padded)
     
+    physical_positions_padded = torch.zeros(batch_size, max_seq_len, dtype=torch.float32)
+    for i, pos in enumerate(physical_positions):
+        seq_len = pos.shape[0]
+        physical_positions_padded[i, :seq_len] = pos
+
     return {
         "features": features_list, 
         "seq_lengths": seq_lengths,
+        "physical_positions": physical_positions_padded,
         "labels": labels,
         "sample_ids": sample_ids,
     }
@@ -201,11 +219,13 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
     
     collated_features = {}
     collated_seq_lengths = {}
+    collated_physical_positions = {}
     
     for view_plane in view_planes:
         # Get all slice encoder features for this view plane
         all_feats_list = [item["feature_embeds"][view_plane] for item in batch]
         all_seq_lengths = [item["seq_length"][view_plane] for item in batch]
+        all_physical_positions = [item["physical_positions"][view_plane] for item in batch]
         
         K = len(all_feats_list[0])  # Number of slice encoders
         max_seq_len = max(feat[0].shape[0] for feat in all_feats_list)
@@ -226,6 +246,11 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
         
         collated_features[view_plane] = features_list
         collated_seq_lengths[view_plane] = torch.tensor(all_seq_lengths, dtype=torch.long)
+        physical_positions_padded = torch.zeros(batch_size, max_seq_len, dtype=torch.float32)
+        for i, pos in enumerate(all_physical_positions):
+            seq_len = pos.shape[0]
+            physical_positions_padded[i, :seq_len] = pos
+        collated_physical_positions[view_plane] = physical_positions_padded
     
     # Collate labels
     labels = torch.stack([item["label"] for item in batch])
@@ -234,6 +259,7 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
     return {
         "features": collated_features,
         "seq_lengths": collated_seq_lengths,
+        "physical_positions": collated_physical_positions,
         "labels": labels,
         "sample_ids": sample_ids,
     }
@@ -543,12 +569,11 @@ class PrecomputedFeatPairDataset(Dataset):
         pos_tensor[: len(positions)] = torch.from_numpy(positions)
         return pos_tensor
 
-    def _get_feats(self, feat_path: str) -> torch.Tensor:
-        """Return features from cache if available, otherwise load from disk."""
+    def _get_feats(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
+        """Return features and metadata from cache if available, otherwise load from disk."""
         if self._feat_cache is not None:
             return self._feat_cache.get(feat_path)
-        feats, _ = self._load_feats(feat_path)
-        return feats
+        return self._load_feats(feat_path)
         
     @staticmethod
     def _compute_subsample_indices(num_slices: int, num_target: int) -> np.ndarray:
@@ -625,8 +650,8 @@ class PrecomputedFeatPairDataset(Dataset):
         fm1, fm2 = random.sample(self.slice_encoder_models, 2)
         feat_path1 = self._get_feat_path(study_id, fm1, selected_view_plane, selected_uid)
         feat_path2 = self._get_feat_path(study_id, fm2, selected_view_plane, selected_uid)
-        feats1 = self._get_feats(feat_path1)
-        feats2 = self._get_feats(feat_path2)
+        feats1, metadata1 = self._get_feats(feat_path1)
+        feats2, metadata2 = self._get_feats(feat_path2)
         
         num_slices = feats1.shape[0]
         assert num_slices == feats2.shape[0], (
@@ -635,18 +660,7 @@ class PrecomputedFeatPairDataset(Dataset):
             f"plane {selected_view_plane}."
         )
 
-        # Read slice spacing from safetensors metadata (if available).
-        # Only need to read from one FM — both share the same geometry.
-        slice_spacing_mm = None
-        try:
-            with safe_open(feat_path1, framework="pt", device="cpu") as f:
-                meta = f.metadata()
-            spacing_str = meta.get("slice_spacing_mm")
-            if spacing_str is not None:
-                slice_spacing_mm = float(spacing_str)
-        except Exception:
-            logger.warning(f"Failed to read slice spacing from {feat_path1}. "
-                           f"Fallback to normalized positions.")
+        slice_spacing_mm = _slice_spacing_from_metadata(metadata1)
         
         if self.use_packed:
             seq_len = num_slices
@@ -786,12 +800,11 @@ class FeatClassificationDataset(Dataset):
                     unique_paths.add(os.path.join(self.feat_paths[model_name], filename))
             self._feat_cache = FeatureCache(unique_paths)
 
-    def _get_feat(self, feat_path: str) -> torch.Tensor:
-        """Return features from cache if available, otherwise load from disk."""
+    def _get_feat(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
+        """Return feature tensor and metadata from cache if available, otherwise load from disk."""
         if self._feat_cache is not None:
             return self._feat_cache.get(feat_path)
-        feat, _ = self._load_feat(feat_path)
-        return feat
+        return self._load_feat(feat_path)
 
     def __len__(self):
         return len(self.sample_ids)
@@ -818,10 +831,14 @@ class FeatClassificationDataset(Dataset):
         
         feat_embeds = []
         seq_lengths = []
+        metadata = None
         
         for encoder in self.slice_encoder_models:
             feat_file = os.path.join(self.feat_paths[encoder], filename)
-            feat = self._get_feat(feat_file)
+            if metadata is None:
+                feat, metadata = self._get_feat(feat_file)
+            else:
+                feat, _ = self._get_feat(feat_file)
             seq_lengths.append(feat.shape[0])
             feat_embeds.append(feat)
         
@@ -833,9 +850,15 @@ class FeatClassificationDataset(Dataset):
                 f"All encoders should have the same number of slices for the same exam."
             )
         
+        slice_spacing_mm = _slice_spacing_from_metadata(metadata)
+        physical_positions = PrecomputedFeatPairDataset._compute_physical_positions(
+            np.arange(seq_lengths[0]), seq_lengths[0], slice_spacing_mm, seq_lengths[0]
+        )
+
         return {
             "feature_embeds": feat_embeds,
             "seq_length": seq_lengths[0],
+            "physical_positions": physical_positions,
             "label": label,
             "sample_id": sample_id
         }
@@ -897,10 +920,13 @@ class UnlabeledFeatDataset(Dataset):
 
         feat_embeds = []
         seq_lengths = []
+        metadata = None
         for model_name in self.slice_encoder_models:
             feat_file = os.path.join(self.feat_paths[model_name], filename)
             with safe_open(feat_file, framework="pt", device="cpu") as f:
                 feat = f.get_tensor("feats")
+                if metadata is None:
+                    metadata = f.metadata()
             seq_lengths.append(feat.shape[0])
             feat_embeds.append(feat)
 
@@ -910,9 +936,15 @@ class UnlabeledFeatDataset(Dataset):
                 f"{dict(zip(self.slice_encoder_models, seq_lengths))}"
             )
 
+        slice_spacing_mm = _slice_spacing_from_metadata(metadata)
+        physical_positions = PrecomputedFeatPairDataset._compute_physical_positions(
+            np.arange(seq_lengths[0]), seq_lengths[0], slice_spacing_mm, seq_lengths[0]
+        )
+
         return {
             "feature_embeds": feat_embeds,
             "seq_length": seq_lengths[0],
+            "physical_positions": physical_positions,
             "label": torch.tensor(0, dtype=torch.long),
             "sample_id": sample_id,
         }
@@ -1003,12 +1035,11 @@ class MultiViewFeatClassificationDataset(Dataset):
                         unique_paths.add(os.path.join(self.feat_paths[view_plane][model_name], filename))
             self._feat_cache = FeatureCache(unique_paths)
 
-    def _get_feat(self, feat_path: str) -> torch.Tensor:
-        """Return features from cache if available, otherwise load from disk."""
+    def _get_feat(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
+        """Return feature tensor and metadata from cache if available, otherwise load from disk."""
         if self._feat_cache is not None:
             return self._feat_cache.get(feat_path)
-        feat, _ = self._load_feat(feat_path)
-        return feat
+        return self._load_feat(feat_path)
 
     def __len__(self):
         return len(self.sample_ids)
@@ -1036,14 +1067,19 @@ class MultiViewFeatClassificationDataset(Dataset):
         # Load features for all views
         features_by_view = {}  # {view_plane: [encoder_feats]}
         seq_lengths_by_view = {}
+        physical_positions_by_view = {}
         
         for view_plane in self.view_planes:
             feat_embeds = []
             seq_lengths = []
+            metadata = None
             
             for encoder in self.slice_encoder_models:
                 feat_file = os.path.join(self.feat_paths[view_plane][encoder], filename)
-                feat = self._get_feat(feat_file)
+                if metadata is None:
+                    feat, metadata = self._get_feat(feat_file)
+                else:
+                    feat, _ = self._get_feat(feat_file)
                 seq_lengths.append(feat.shape[0])
                 feat_embeds.append(feat)
             
@@ -1055,10 +1091,15 @@ class MultiViewFeatClassificationDataset(Dataset):
             
             features_by_view[view_plane] = feat_embeds
             seq_lengths_by_view[view_plane] = seq_lengths[0]
+            slice_spacing_mm = _slice_spacing_from_metadata(metadata)
+            physical_positions_by_view[view_plane] = PrecomputedFeatPairDataset._compute_physical_positions(
+                np.arange(seq_lengths[0]), seq_lengths[0], slice_spacing_mm, seq_lengths[0]
+            )
         
         return {
             "feature_embeds": features_by_view,  
             "seq_length": seq_lengths_by_view,  
+            "physical_positions": physical_positions_by_view,
             "label": label,
             "sample_id": sample_id,
         }

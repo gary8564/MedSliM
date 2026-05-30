@@ -7,10 +7,10 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem-per-cpu=8G
-#SBATCH --time=14:00:00                 
+#SBATCH --time=24:00:00                 
 #SBATCH --job-name=pretrain
 #SBATCH --output=logs/pretrain/stdout_pretrain_%j.txt    
-#SBATCH --account=rwth1833     
+#SBATCH --account=p0021834     
 
 ### Setup
 # Load Intel libraries (required by Triton for mamba_ssm kernels)
@@ -44,7 +44,7 @@ MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark"
 # Staging to $TMPDIR speeds up that initial bulk read from ~50 min to ~2 min.
 FEAT_BASE="/hpcwork/rwth1833/feat_caches"
 STAGE_TO_LOCAL=true   # set to false to skip staging and read directly from /hpcwork
-FEAT_CACHE_SUBDIR=("MRNet/slices_raw/crop" "KMAR-50K/slices_raw/adaptive" "fastMRI/slices_raw/adaptive")
+FEAT_CACHE_SUBDIR=("MRNet/slices_raw/crop") #"KMAR-50K/slices_raw/adaptive" "fastMRI/slices_raw/adaptive")
 if $STAGE_TO_LOCAL && [ -n "$TMPDIR" ] && [ -d "$TMPDIR" ]; then
     LOCAL_BASE="$TMPDIR/feat_caches"
     echo "Staging feature caches to local SSD ($LOCAL_BASE)..."
@@ -68,9 +68,9 @@ PLANES=""
 
 # Sequence encoder and pooling
 SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
-POOLING="abmil"                    # abmil (default), cross_attention, or cls (requires transformer encoder)
+POOLING="abmil"    # abmil (default), cross_attention, or cls (requires transformer encoder)
 USE_PACKED=false                   # true: packed sequences (no padding waste); false: evenly-spaced subsampling + padding
-PHYSICAL_PE=true                  # true: sinusoidal PE from physical slice positions (mm); essential for cross-domain
+PHYSICAL_PE=false                  # true: sinusoidal PE from physical slice positions (mm); essential for cross-domain
 
 # Masked Slice Prediction (MSP) — JEPA-style auxiliary objective
 # L = L_InfoNCE + lambda_mask * L_MSP + lambda_ctx * L_ctx

@@ -145,7 +145,7 @@ def main():
     parser.add_argument("--num-samples", type=int, default=None, help="Max samples to visualize (None = all)")
     parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "attention"])
     parser.add_argument("--sequence-encoder", type=str, default=None, choices=["mamba2", "transformer"])
-    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
+    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cross_attention", "cls"])
     parser.add_argument("--per-head", action="store_true",
                         help="Visualize per-head attention profiles (ABMIL multi-head only)")
     parser.add_argument("--fold", type=int, default=None,
@@ -241,9 +241,11 @@ def main():
         cobra_model = cobra_model.to(accelerator.device)
         cobra_model.eval()
 
-    # Validate: attention visualization requires ABMIL slice pooling
-    if slice_pooling and slice_pooling != "abmil":
-        raise ValueError("Attention visualization requires ABMIL slice pooling")
+    # Validate: attention visualization requires ABMIL or cross_attention slice pooling
+    if slice_pooling and slice_pooling not in ("abmil", "cross_attention"):
+        raise ValueError(
+            f"Attention visualization requires 'abmil' or 'cross_attention' slice pooling, got '{slice_pooling}'"
+        )
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -328,7 +330,7 @@ def main():
         attn_sum = float(attn.sum())
         if not np.isclose(attn_sum, 1.0, atol=1e-3):
             raise AssertionError(
-                f"ABMIL attention should sum to 1 for sample '{sample_id}', got {attn_sum:.6f}"
+                f"Slice attention should sum to 1 for sample '{sample_id}', got {attn_sum:.6f}"
             )
         seq_len = len(attn)
         roi_range = get_roi_slice_range(roi_df, str(sample_id), seq_len)

@@ -1,8 +1,6 @@
 """
 Cross-attention pooling for slice-level aggregation.
 
-Aligned with Curia's CrossAttention module
-
 Uses learnable query tokens to attend to all slice hidden states via
 multi-head cross-attention, producing a single volume-level embedding.
 The learned query tokens attend to the slice hidden states to learn which
@@ -25,10 +23,8 @@ class CrossAttentionPooling(nn.Module):
         num_heads:    Number of attention heads.
         num_queries:  Number of learnable query vectors. Each attends
                       independently; outputs are mean-pooled to [B, D].
-        use_residual: Add query residual after attention (Curia's
-                      use_skip_connection).
-        use_norm:     Apply LayerNorm after the residual (Curia's
-                      use_norm).
+        use_residual: Add query residual after attention.
+        use_norm:     Apply LayerNorm after the residual.
         dropout:      Dropout probability on attention weights.
     """
 

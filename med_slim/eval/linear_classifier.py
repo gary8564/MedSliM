@@ -147,12 +147,18 @@ class SingleViewClassifier(nn.Module):
             dropout=classifier_dropout,
         )
     
-    def forward(self, features: List[torch.Tensor], seq_lengths: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        features: List[torch.Tensor],
+        seq_lengths: torch.Tensor,
+        physical_positions: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             features: List of K tensors, each [B, max_seq_len, encoder_embed_dim]
                       COBRA inference mode ensembles across these encoders
             seq_lengths: Sequence lengths [B]
+            physical_positions: Physical slice positions [B, max_seq_len], used when Cobra has physical PE enabled.
         
         Returns:
             Dict with logits and embedding
@@ -163,7 +169,13 @@ class SingleViewClassifier(nn.Module):
         
         # Cast features to model dtype
         features = [f.to(dtype=next(self.cobra.parameters()).dtype) for f in features]
-        embedding = self.cobra(features, seq_lengths=seq_lengths)  # [B, embed_dim]
+        if physical_positions is not None:
+            physical_positions = physical_positions.to(device=features[0].device, dtype=torch.float32)
+        embedding = self.cobra(
+            features,
+            seq_lengths=seq_lengths,
+            physical_positions=physical_positions,
+        )  # [B, embed_dim]
         
         # Cast embedding back to float32 for classifier
         embedding = embedding.float()
@@ -224,11 +236,17 @@ class MultiViewClassifier(nn.Module):
             dropout=classifier_dropout,
         )
     
-    def forward(self, features: Dict[str, List[torch.Tensor]], seq_lengths: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        features: Dict[str, List[torch.Tensor]],
+        seq_lengths: Dict[str, torch.Tensor],
+        physical_positions: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             features: {view_plane: List of K tensors [B, max_seq_len, encoder_embed_dim]}
             seq_lengths: {view_plane: [B]}
+            physical_positions: {view_plane: [B, max_seq_len]}, used when Cobra has physical PE enabled.
         
         Returns:
             Dict with logits, attention_weights, and view_embeddings
@@ -244,7 +262,14 @@ class MultiViewClassifier(nn.Module):
             # Cast features to COBRA's dtype
             feats = [f.to(dtype=next(self.cobra.parameters()).dtype) for f in features[plane]]  # List of K tensors
             seq_length = seq_lengths[plane]
-            emb = self.cobra(feats, seq_lengths=seq_length)  # [B, embed_dim]
+            phys_pos = physical_positions[plane] if physical_positions is not None else None
+            if phys_pos is not None:
+                phys_pos = phys_pos.to(device=feats[0].device, dtype=torch.float32)
+            emb = self.cobra(
+                feats,
+                seq_lengths=seq_length,
+                physical_positions=phys_pos,
+            )  # [B, embed_dim]
             
             # Cast embedding back to float32 for downstream classifier
             view_embeddings[plane] = emb.float()
@@ -490,7 +515,7 @@ def train_per_epoch(model: nn.Module,
     for batch in train_loader:
         optimizer.zero_grad()
         with accelerator.autocast():
-            outputs = model(batch["features"], batch["seq_lengths"])
+            outputs = model(batch["features"], batch["seq_lengths"], batch.get("physical_positions"))
             loss = _compute_loss(outputs["logits"], batch["labels"], task, criterion)
         accelerator.backward(loss)
         optimizer.step()
@@ -522,7 +547,7 @@ def eval_per_epoch(model: nn.Module,
         
     with torch.no_grad():
         for batch in val_loader:
-            outputs = model(batch["features"], batch["seq_lengths"])
+            outputs = model(batch["features"], batch["seq_lengths"], batch.get("physical_positions"))
             loss = _compute_loss(outputs["logits"], batch["labels"], task, criterion)
             val_loss += loss.item()
             val_logits_list.append(outputs["logits"].detach())
@@ -706,7 +731,7 @@ def evaluate_single_view_classifier(
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating...", disable=not accelerator.is_main_process):
-            outputs = model(batch["features"], batch["seq_lengths"])
+            outputs = model(batch["features"], batch["seq_lengths"], batch.get("physical_positions"))
             all_logits.append(outputs["logits"].detach())
             all_labels.append(batch["labels"].detach())
             all_sample_ids.extend(batch["sample_ids"])
@@ -1202,7 +1227,7 @@ def collect_predictions_per_view_classifier(
     
     with torch.no_grad():
         for batch in val_loader:
-            outputs = best_model(batch["features"], batch["seq_lengths"])
+            outputs = best_model(batch["features"], batch["seq_lengths"], batch.get("physical_positions"))
             val_logits_list.append(outputs["logits"].detach())
             val_labels_list.append(batch["labels"].detach())
             val_sample_ids.extend(batch["sample_ids"])
@@ -1219,7 +1244,7 @@ def collect_predictions_per_view_classifier(
     
     with torch.no_grad():
         for batch in test_loader:
-            outputs = best_model(batch["features"], batch["seq_lengths"])
+            outputs = best_model(batch["features"], batch["seq_lengths"], batch.get("physical_positions"))
             test_logits_list.append(outputs["logits"].detach())
             test_labels_list.append(batch["labels"].detach())
             test_sample_ids.extend(batch["sample_ids"])
@@ -2037,7 +2062,7 @@ def evaluate_multiview_classifier(
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating...", disable=not accelerator.is_main_process):
-            outputs = model(batch["features"], batch["seq_lengths"])
+            outputs = model(batch["features"], batch["seq_lengths"], batch.get("physical_positions"))
             all_logits.append(outputs["logits"].detach())
             all_labels.append(batch["labels"].detach())
             all_sample_ids.extend(batch["sample_ids"])
@@ -2347,7 +2372,13 @@ def main(args):
     with open(pretrain_config_path, "r") as f:
         pretrain_cfg = yaml.safe_load(f)
     cobra_cfg = pretrain_cfg["model"]["cobra"]
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        pretrain_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        cobra_cfg["physical_pe"] = bool(
+            pretrain_state.get("physical_pe", cobra_cfg.get("physical_pe", False))
+        )
     cfg["cobra_config"] = cobra_cfg
+    cfg["physical_pe"] = cobra_cfg.get("physical_pe", False)
     cfg["no_pretrained_cobra"] = args.no_pretrained_cobra
 
     if accelerator.is_main_process:

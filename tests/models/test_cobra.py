@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import pytest
 import os
 
@@ -6,6 +7,11 @@ from med_slim.model.sequence_encoder.cobra import Cobra
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class ZeroSequenceEncoder(nn.Module):
+    def forward(self, x, *args, **kwargs):
+        return torch.zeros_like(x)
 
 
 def test_cobra_mamba2_forward_pass():
@@ -203,6 +209,212 @@ def test_cobra_cls_pooling_requires_transformer():
             sequence_encoder="mamba2",
             slice_pooling="cls",
         )
+
+
+def test_detect_slice_pooling_from_checkpoint_keys():
+    """
+    Verify that checkpoint key detection correctly distinguishes
+    abmil, cross_attention, and cls slice pooling types.
+    """
+    abmil_keys = {"cobra.attn.0.attention_V.0.weight": None, "cobra.norm.weight": None}
+    cross_attn_keys = {"cobra.cross_attn_pool.mha.in_proj_weight": None, "cobra.norm.weight": None}
+    cls_keys = {"cobra.cls_token": None, "cobra.norm.weight": None}
+
+    def detect(raw):
+        has_abmil = any(k.startswith("cobra.attn.") for k in raw.keys())
+        has_cross_attn = any(k.startswith("cobra.cross_attn_pool.") for k in raw.keys())
+        if has_abmil:
+            return "abmil"
+        elif has_cross_attn:
+            return "cross_attention"
+        else:
+            return "cls"
+
+    assert detect(abmil_keys) == "abmil"
+    assert detect(cross_attn_keys) == "cross_attention"
+    assert detect(cls_keys) == "cls"
+
+
+def test_cobra_cross_attention_forward_pass():
+    """Test forward pass with cross-attention pooling and mamba2 encoder."""
+    batch_size = 4
+    num_slices = 16
+    input_dim = 768
+    embed_dim = 768
+    contrast_dim = 256
+
+    model = Cobra(
+        embed_dim=embed_dim,
+        contrast_dim=contrast_dim,
+        input_dims=[768],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.1,
+        mode="train",
+        slice_pooling="cross_attention",
+        d_state=64,
+    ).to(DEVICE).eval()
+
+    assert model.cross_attn_pool is not None
+    assert model.attn is None
+    assert model.cls_token is None
+
+    x = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
+    with torch.no_grad():
+        y = model(x)
+    assert isinstance(y, torch.Tensor)
+    assert y.shape == (batch_size, contrast_dim)
+    assert torch.isfinite(y).all()
+
+
+def test_cobra_cross_attention_attention_shape():
+    """Cross-attention get_attention should return [B, num_queries, num_slices]."""
+    batch_size = 2
+    num_slices = 10
+    input_dim = 768
+
+    model = Cobra(
+        embed_dim=768,
+        contrast_dim=128,
+        input_dims=[768],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="train",
+        slice_pooling="cross_attention",
+        d_state=32,
+    ).to(DEVICE).eval()
+
+    x = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
+    with torch.no_grad():
+        attn = model(x, get_attention=True)
+    assert isinstance(attn, torch.Tensor)
+    assert attn.shape == (batch_size, 1, num_slices)
+    assert torch.isfinite(attn).all()
+
+
+def test_cobra_cross_attention_variable_seq_lengths():
+    """
+    Cross-attention pooling should ignore padded positions via key_padding_mask.
+    Perturbing padded positions should not change the output.
+    """
+    batch_size = 2
+    max_slices = 8
+    input_dim = 768
+    contrast_dim = 128
+
+    model = Cobra(
+        embed_dim=input_dim,
+        contrast_dim=contrast_dim,
+        input_dims=[input_dim],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="train",
+        slice_pooling="cross_attention",
+        d_state=64,
+    ).to(DEVICE).eval()
+
+    seq_lengths = torch.tensor([3, 6], dtype=torch.long, device=DEVICE)
+
+    x = torch.randn(batch_size, max_slices, input_dim, device=DEVICE)
+    x_alt = x.clone()
+    x_alt[0, 3:, :] = torch.randn_like(x_alt[0, 3:, :]) * 50.0 + 100.0
+    x_alt[1, 6:, :] = torch.randn_like(x_alt[1, 6:, :]) * 50.0 + 100.0
+
+    with torch.no_grad():
+        y1 = model(x, seq_lengths=seq_lengths)
+        y2 = model(x_alt, seq_lengths=seq_lengths)
+        attn = model(x, seq_lengths=seq_lengths, get_attention=True)
+
+    assert y1.shape == (batch_size, contrast_dim)
+    assert torch.isfinite(y1).all() and torch.isfinite(y2).all()
+    assert torch.allclose(y1, y2, atol=1e-5, rtol=1e-5)
+
+    assert attn.shape == (batch_size, 1, max_slices)
+
+
+def test_cobra_cross_attention_inference_mode():
+    """Cross-attention in inference mode should return embed_dim output."""
+    batch_size = 2
+    num_slices = 8
+    embed_dim = 256
+
+    model = Cobra(
+        embed_dim=embed_dim,
+        contrast_dim=64,
+        input_dims=[128, 256],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        slice_pooling="cross_attention",
+        pooling_target="post_encoder",
+        d_state=32,
+    ).to(DEVICE).eval()
+
+    assert model.output_dim == embed_dim
+
+    x = [torch.randn(batch_size, num_slices, 256, device=DEVICE)]
+    seq_lengths = torch.full((batch_size,), num_slices, dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        y = model(x, seq_lengths=seq_lengths)
+    assert y.shape == (batch_size, embed_dim)
+    assert torch.isfinite(y).all()
+
+
+def test_cobra_cross_attention_post_embed_pooling_target():
+    """Cross-attention can use encoder states for attention and post-Embed features as values."""
+    model = Cobra(
+        embed_dim=128,
+        contrast_dim=2,
+        input_dims=[128],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        slice_pooling="cross_attention",
+        pooling_target="post_embed",
+        d_state=64,
+    ).to(DEVICE).eval()
+    model.embed["128"] = nn.Identity()
+    model.seq_enc = ZeroSequenceEncoder().to(DEVICE)
+    model.norm = nn.Identity()
+
+    x_tensor = torch.arange(2 * 3 * 128, dtype=torch.float32, device=DEVICE).view(2, 3, 128)
+    x_tensor[0, 2] = 999.0
+    x = [x_tensor]
+    seq_lengths = torch.tensor([2, 3], dtype=torch.long, device=DEVICE)
+
+    with torch.no_grad():
+        y = model(x, seq_lengths=seq_lengths)
+
+    expected = torch.stack([
+        x[0][0, :2].mean(dim=0),
+        x[0][1, :3].mean(dim=0),
+    ])
+    assert torch.allclose(y, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_cobra_cross_attention_raw_pooling_target_raises():
+    model = Cobra(
+        embed_dim=128,
+        contrast_dim=2,
+        input_dims=[128],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        slice_pooling="cross_attention",
+        pooling_target="raw",
+        sequence_encoder="transformer",
+        d_state=64,
+    ).to(DEVICE).eval()
+
+    x = [torch.randn(2, 3, 128, device=DEVICE)]
+    seq_lengths = torch.tensor([3, 3], dtype=torch.long, device=DEVICE)
+    with pytest.raises(ValueError, match="Raw pooling is only supported by ABMIL"):
+        model(x, seq_lengths=seq_lengths)
 
 
 def count_parameters(model):

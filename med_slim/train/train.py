@@ -74,11 +74,10 @@ def main(args, cfg):
     # Validate encoder/pooling combination
     sequence_encoder = args.sequence_encoder
     pooling = args.pooling
-    physical_pe = getattr(args, "physical_pe", False)
+    cobra_cfg = cfg["model"]["cobra"]
+    physical_pe = getattr(args, "physical_pe", False) or cobra_cfg.get("physical_pe", False)
     
     # Build encoder-specific kwargs
-    cobra_cfg = cfg["model"]["cobra"]
-    
     encoder_kwargs = {}
     
     if sequence_encoder == "mamba2":
@@ -356,7 +355,7 @@ def main(args, cfg):
                 "train/epoch": e + 1,
                 "train/epoch_loss": avg_loss,
             }, step=e * iters_per_epoch + iters_per_epoch)
-            if (e + 1) % 50 == 0:
+            if (e + 1) % 200 == 0:
                 state = {
                     "epoch": e + 1,
                     "state_dict": accelerator.unwrap_model(model).state_dict(),

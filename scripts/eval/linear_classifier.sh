@@ -8,9 +8,9 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G 
 #SBATCH --time=2:00:00                 
-#SBATCH --job-name=skm-tea_dess_e2_%j
-#SBATCH --output=stdout_skm-tea_dess_e2_%j.txt    
-#SBATCH --account=rwth1833    
+#SBATCH --job-name=mrnet_linear_probing_%j
+#SBATCH --output=stdout_mrnet_linear_probing_%j.txt    
+#SBATCH --account=p0021834    
 
 ### Setup
 source .venv/bin/activate
@@ -18,13 +18,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
 CONFIG_PATH="./med_slim/configs/linear_classifier.yml"
-CHECKPOINT_PATH="/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-03-24-16:00/medslim-epoch2000.pth.tar"  # Leave empty to use config file, or set path to override
+CHECKPOINT_PATH="/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet/2026-05-27-00:40/medslim-epoch3000.pth.tar"  # Leave empty to use config file, or set path to override
 FINE_TUNE=false  # whether to fine-tune COBRA backbone
 FM_POOLING="avg_pool"  # Options: "avg_pool", "attention" (attention requires fine-tuning COBRA)
 SEQUENCE_ENCODER="mamba2"
 FM_MODEL_NAMES="mri-core" 
-POOLING_TARGET="raw"
+POOLING_TARGET="post_embed" #"raw"
 N_FOLDS=3
+SLICE_POOLING=""  # leave empty to auto-detect from checkpoint
 EXTRA_ARGS=""
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --checkpoint-path ${CHECKPOINT_PATH}"
@@ -34,11 +35,8 @@ if [[ "${FINE_TUNE}" == "true" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --fine-tune"
 fi
 
-if [[ "${SEQUENCE_ENCODER}" == "mamba2" ]]; then
-  EXTRA_ARGS="${EXTRA_ARGS} --slice-pooling abmil"
-fi
-if [[ "${SEQUENCE_ENCODER}" == "transformer" ]]; then
-  EXTRA_ARGS="${EXTRA_ARGS} --slice-pooling cls"
+if [[ -n "${SLICE_POOLING}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --slice-pooling ${SLICE_POOLING}"
 fi
 
 ### Run script

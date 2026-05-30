@@ -542,6 +542,33 @@ class Cobra(nn.Module):
             A = self.attn[0](h, mask=mask) 
             A = torch.transpose(A, 2, 1) # [B, 1, num_slices]
         return A
+
+    def _cross_attention_pooling(
+        self,
+        h: torch.Tensor,
+        mask: torch.Tensor = None,
+        values: torch.Tensor = None,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply cross-attention slice pooling.
+
+        In pretraining, keys and values both come from the post-encoder hidden states h by default.
+        In inference mode, values are set to an earlier representation (e.g., post-embed features from multiple foundation models)
+        while attention scores are still computed from the post-encoder hidden states h (contextualized encoder states).
+        """
+        if values is None:
+            return self.cross_attn_pool(
+                h,
+                mask=mask,
+                return_attention=return_attention,
+            )
+
+        _, attn = self.cross_attn_pool(h, mask=mask, return_attention=True)
+        pooled = torch.bmm(attn, values).mean(dim=1)
+        if return_attention:
+            return pooled, attn
+        return pooled
     
     def _forward_packed(
         self, 
@@ -599,9 +626,26 @@ class Cobra(nn.Module):
 
         if self.slice_pooling == "cross_attention":
             if get_attention:
-                pooled, attn = self.cross_attn_pool(h_padded, mask=mask, return_attention=True)
+                _, attn = self._cross_attention_pooling(
+                    h_padded,
+                    mask=mask,
+                    return_attention=True,
+                )
                 return [attn[i, :, :cu_seqlens[i+1]-cu_seqlens[i]] for i in range(batch_size)]
-            pooled = self.cross_attn_pool(h_padded, mask=mask)
+            if self.mode == "train" or self.pooling_target == "post_encoder":
+                pooled = self._cross_attention_pooling(h_padded, mask=mask)
+            elif self.pooling_target == "post_embed":
+                logits_padded, _ = self._packed_to_padded(logits, cu_seqlens, max_seqlen)
+                pooled = self._cross_attention_pooling(
+                    h_padded,
+                    mask=mask,
+                    values=logits_padded,
+                )
+            else:
+                raise ValueError(
+                    "slice_pooling='cross_attention' supports pooling_target "
+                    "'post_encoder' or 'post_embed'. Raw pooling is only supported by ABMIL."
+                )
             return self.proj(pooled) if self.mode == "train" else pooled
         
         # ABMIL path
@@ -702,9 +746,21 @@ class Cobra(nn.Module):
         # Cross-attention pooling
         if self.slice_pooling == "cross_attention":
             if get_attention or get_per_head_attention:
-                _, attn = self.cross_attn_pool(h, mask=mask, return_attention=True)
+                _, attn = self._cross_attention_pooling(
+                    h,
+                    mask=mask,
+                    return_attention=True,
+                )
                 return attn  # [B, 1, num_slices]
-            pooled = self.cross_attn_pool(h, mask=mask)
+            if self.mode == "train" or self.pooling_target == "post_encoder":
+                pooled = self._cross_attention_pooling(h, mask=mask)
+            elif self.pooling_target == "post_embed":
+                pooled = self._cross_attention_pooling(h, mask=mask, values=logits)
+            else:
+                raise ValueError(
+                    "slice_pooling='cross_attention' supports pooling_target "
+                    "'post_encoder' or 'post_embed'. Raw pooling is only supported by ABMIL."
+                )
             return self.proj(pooled) if self.mode == "train" else pooled
 
         # ABMIL pooling

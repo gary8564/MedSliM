@@ -1,5 +1,6 @@
 import torch
 import pytest
+from types import MethodType
 
 from med_slim.model.ssl import MoCo, MSPPredictor
 from med_slim.model.ssl.masking import (
@@ -231,6 +232,50 @@ class TestDistanceWeights:
 
 class TestMoCoMSP:
     """Integration tests for MoCo with MSP enabled."""
+
+    def test_msp_uses_physical_positions_when_enabled(self):
+        """MSP student/teacher encoders should receive the same physical PE as InfoNCE."""
+        model = _build_msp_model(physical_pe=True)
+        x1, x2, sizes, seq_lens = _dummy_padded_batch()
+        physical_positions = (
+            torch.arange(x1.shape[1], device=DEVICE, dtype=torch.float32)
+            .unsqueeze(0)
+            .expand(x1.shape[0], -1)
+        )
+
+        base_calls = []
+        momentum_calls = []
+        base_orig = model.base_encoder._apply_physical_pe
+        momentum_orig = model.momentum_encoder._apply_physical_pe
+
+        def wrap(orig, calls):
+            def wrapped(self, logits, physical_positions, seq_lengths=None):
+                calls.append(physical_positions.detach().clone())
+                return orig(logits, physical_positions, seq_lengths)
+            return wrapped
+
+        model.base_encoder._apply_physical_pe = MethodType(
+            wrap(base_orig, base_calls), model.base_encoder
+        )
+        model.momentum_encoder._apply_physical_pe = MethodType(
+            wrap(momentum_orig, momentum_calls), model.momentum_encoder
+        )
+
+        model.eval()
+        with torch.no_grad():
+            result = model(
+                x1, x2,
+                input_feature_dims_1=sizes, input_feature_dims_2=sizes,
+                seq_lengths=seq_lens, m=0.99,
+                physical_positions=physical_positions,
+            )
+
+        assert isinstance(result, dict)
+        # q1/q2 + MSP student for base, k1/k2 + MSP teacher for momentum.
+        assert len(base_calls) == 3
+        assert len(momentum_calls) == 3
+        for call in base_calls + momentum_calls:
+            assert torch.allclose(call, physical_positions)
 
     def test_msp_returns_dict(self):
         model = _build_msp_model()

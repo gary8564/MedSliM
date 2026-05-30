@@ -10,6 +10,7 @@ from med_slim.data.feat_dataset import (
     PrecomputedFeatPairDataset,
     FeatClassificationDataset,
     MultiViewFeatClassificationDataset,
+    linear_classifier_collate_fn,
     multiview_classifier_collate_fn,
 )
 from torch.utils.data import DataLoader
@@ -140,10 +141,12 @@ def test_feat_classification_dataset_single_encoder():
     
     item = ds[0]
     assert "feature_embeds" in item and "label" in item and "sample_id" in item and "seq_length" in item
+    assert "physical_positions" in item
     assert len(item["feature_embeds"]) == 1  # single encoder
     # Dataset returns raw variable-length features with shape [seq_length, embed_dim]
     seq_len = item["seq_length"]
     assert item["feature_embeds"][0].shape == (seq_len, EMBED_DIMS[0])
+    assert item["physical_positions"].shape == (seq_len,)
     assert item["label"].dtype == torch.long  # binary classification task
 
 def test_feat_classification_dataset_multi_encoder():
@@ -161,9 +164,36 @@ def test_feat_classification_dataset_multi_encoder():
     item = ds[0]
     assert len(item["feature_embeds"]) == len(SLICE_ENCODER_MODELS)
     seq_len = item["seq_length"]
+    assert item["physical_positions"].shape == (seq_len,)
     for i, feat in enumerate(item["feature_embeds"]):
         # All encoders should have same seq_len at the same exam level
         assert feat.shape == (seq_len, EMBED_DIMS[i])
+        
+
+def test_linear_classifier_collate_includes_physical_positions():
+    ds = FeatClassificationDataset(
+        feat_dir=str(FEAT_ROOT),
+        slice_encoder_models=["dinov2"],
+        view_plane="sagittal",
+        split="train",
+        annotations_path=str(ANNOTATIONS_DIR / "train.csv"),
+        task="binary",
+        target_columns=["abnormal"],
+    )
+    if len(ds) < 2:
+        pytest.skip("Need at least two samples for collate function test.")
+
+    batch = [ds[0], ds[1]]
+    collated = linear_classifier_collate_fn(batch)
+    assert "physical_positions" in collated
+    assert collated["physical_positions"].shape == collated["features"][0].shape[:2]
+    for i, item in enumerate(batch):
+        seq_len = item["seq_length"]
+        assert torch.allclose(
+            collated["physical_positions"][i, :seq_len],
+            item["physical_positions"],
+        )
+
 
 def test_feat_classification_dataset_multilabel():
     ds = FeatClassificationDataset(
@@ -223,11 +253,13 @@ def test_multiview_feat_classification_dataset():
 
     assert set(view_planes).issubset(item["feature_embeds"].keys())
     assert set(view_planes).issubset(item["seq_length"].keys())
+    assert set(view_planes).issubset(item["physical_positions"].keys())
     assert item["label"].dtype == torch.long
 
     for view in view_planes:
         seq_len = item["seq_length"][view]
         feats_for_view = item["feature_embeds"][view]
+        assert item["physical_positions"][view].shape == (seq_len,)
         assert len(feats_for_view) == len(SLICE_ENCODER_MODELS)
         # All encoders share the same sequence length for this view
         for i, feat in enumerate(feats_for_view):
@@ -255,15 +287,17 @@ def test_multiview_classifier_collate_fn():
     batch = [ds[0], ds[1]]
     collated = multiview_classifier_collate_fn(batch)
 
-    assert set(collated.keys()) == {"features", "seq_lengths", "labels", "sample_ids"}
+    assert set(collated.keys()) == {"features", "seq_lengths", "physical_positions", "labels", "sample_ids"}
 
     for view in view_planes:
         features_list = collated["features"][view]
         seq_lengths = collated["seq_lengths"][view]
+        physical_positions = collated["physical_positions"][view]
         assert len(features_list) == len(SLICE_ENCODER_MODELS)
         assert seq_lengths.shape[0] == len(batch)
 
         max_seq = seq_lengths.max().item()
+        assert physical_positions.shape == (len(batch), max_seq)
         for i, feat in enumerate(features_list):
             # Each tensor should be [B, max_seq_len, embed_dim]
             assert feat.shape == (len(batch), max_seq, EMBED_DIMS[i])

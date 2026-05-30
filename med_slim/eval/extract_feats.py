@@ -5,9 +5,9 @@ Adapted from COBRA (https://github.com/KatherLab/COBRA/blob/main/cobra/inference
 ==================================================================================================
 COBRA (Histopathology):                         MedSliM (MRI/CT):
   tiles                                         slices
-    ↓ ABMIL                                        ↓ ABMIL
+    ↓ ABMIL                                        ↓ ABMIL / cross-attention
   slide embedding                               volume embedding (per view plane / MRI sequence)
-    ↓ concat + ABMIL                               ↓ concat + ABMIL
+    ↓ concat + ABMIL                               ↓ logistic regression classifier
   patient embedding                             patient embedding (multi-view plane / MRI sequence)
 ==================================================================================================
 
@@ -55,12 +55,19 @@ def get_volume_feats(
             labels = batch["labels"]  
             sample_ids = batch["sample_ids"]
             seq_lengths = batch["seq_lengths"].to(accelerator.device)
+            physical_positions = batch.get("physical_positions")
+            if physical_positions is not None:
+                physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
             
             # Get features from all encoders and cast to model dtype
             encoder_feats = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) for f in batch["features"]]
             
             # COBRA embeds each encoder's features and averages them across encoders
-            volume_feats = cobra_model(encoder_feats, seq_lengths=seq_lengths) 
+            volume_feats = cobra_model(
+                encoder_feats,
+                seq_lengths=seq_lengths,
+                physical_positions=physical_positions,
+            )
             
             # Cast to float32 for downstream eval 
             all_volume_feats.append(volume_feats.float())
@@ -108,6 +115,7 @@ def get_patient_feats(
             sample_ids = batch["sample_ids"]
             features_by_view = batch["features"]
             seq_lengths_by_view = batch["seq_lengths"]
+            physical_positions_by_view = batch.get("physical_positions", {})
             
             view_names = list(features_by_view.keys())
             model_dtype = next(cobra_model.parameters()).dtype
@@ -117,7 +125,14 @@ def get_patient_feats(
                 encoder_feats = [f.to(accelerator.device, dtype=model_dtype) 
                                 for f in features_by_view[view_plane]]
                 seq_lengths = seq_lengths_by_view[view_plane].to(accelerator.device)
-                view_emb = cobra_model(encoder_feats, seq_lengths=seq_lengths)
+                physical_positions = physical_positions_by_view.get(view_plane)
+                if physical_positions is not None:
+                    physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
+                view_emb = cobra_model(
+                    encoder_feats,
+                    seq_lengths=seq_lengths,
+                    physical_positions=physical_positions,
+                )
                 view_embeddings.append(view_emb)
             
             stacked_views = torch.stack(view_embeddings, dim=1)
@@ -148,8 +163,10 @@ def get_volume_attention(
     """
     Extract slice-level attention weights using pretrained COBRA model.
     
+    Supports both ABMIL and cross-attention slice pooling modes.
+
     Args:
-        cobra_model: Pretrained COBRA model in inference mode (must use ABMIL slice pooling)
+        cobra_model: Pretrained COBRA model in inference mode
         dataloader: DataLoader yielding batches of slice features
         accelerator: HuggingFace Accelerator
         max_samples: Maximum number of samples to process (None = all)
@@ -171,13 +188,21 @@ def get_volume_attention(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting attention", disable=not accelerator.is_main_process):
             seq_lengths = batch["seq_lengths"].to(accelerator.device)
+            physical_positions = batch.get("physical_positions")
+            if physical_positions is not None:
+                physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
             features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) 
                        for f in batch["features"]]
             
             # Get per-head attention and aggregate with min across heads.
             # Min-attention is standard in medical imaging explainability
             # as it highlights slices that ALL heads agree are important.
-            attention = cobra_model(features, seq_lengths=seq_lengths, get_per_head_attention=True)
+            attention = cobra_model(
+                features,
+                seq_lengths=seq_lengths,
+                physical_positions=physical_positions,
+                get_per_head_attention=True,
+            )
             # attention shape: [B, num_heads, max_seq_len]
             attention = attention.min(dim=1).values  # [B, max_seq_len]
             attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -237,10 +262,18 @@ def get_volume_attention_per_head(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting per-head attention", disable=not accelerator.is_main_process):
             seq_lengths = batch["seq_lengths"].to(accelerator.device)
+            physical_positions = batch.get("physical_positions")
+            if physical_positions is not None:
+                physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
             features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype)
                        for f in batch["features"]]
 
-            attention = cobra_model(features, seq_lengths=seq_lengths, get_per_head_attention=True)
+            attention = cobra_model(
+                features,
+                seq_lengths=seq_lengths,
+                physical_positions=physical_positions,
+                get_per_head_attention=True,
+            )
             # attention shape: [B, num_heads, max_seq_len]
             attention = attention.cpu().numpy()
             num_heads = attention.shape[1]

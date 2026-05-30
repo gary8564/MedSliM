@@ -20,10 +20,13 @@ def _build_cobra(
     fm_pooling: str,
     pooling_target: str = "post_embed",
     raw_output_dim: Optional[int] = None,
+    physical_pe: Optional[bool] = None,
 ) -> Cobra:
     """Construct a COBRA model in inference mode from model configuration."""
     embed_dim = model_config["embed_dim"]
     encoder_kwargs: Dict[str, Any] = {}
+    if physical_pe is None:
+        physical_pe = model_config.get("physical_pe", False)
 
     if sequence_encoder == "mamba2":
         encoder_kwargs["d_state"] = model_config.get("mamba_d_state", 128)
@@ -53,6 +56,7 @@ def _build_cobra(
         slice_pooling=slice_pooling,
         pooling_target=pooling_target,
         raw_output_dim=raw_output_dim,
+        physical_pe=physical_pe,
         **encoder_kwargs,
     )
 
@@ -67,6 +71,7 @@ def load_pretrained_cobra(
     slice_pooling: Optional[str] = None,
     pooling_target: str = "post_embed",
     raw_output_dim: Optional[int] = None,
+    physical_pe: Optional[bool] = None,
 ) -> Cobra:
     """
     Load the COBRA model from a pretrained checkpoint.
@@ -97,9 +102,11 @@ def load_pretrained_cobra(
         sequence_encoder = state_dict.get("sequence_encoder", "mamba2")  # Default for older checkpoints
     if slice_pooling is None:
         slice_pooling = state_dict.get("pooling", "abmil")  # Default for older checkpoints
-    logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, pooling_target={pooling_target}")
+    if physical_pe is None:
+        physical_pe = state_dict.get("physical_pe", model_config.get("physical_pe", False))
+    logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, pooling_target={pooling_target}, physical_pe={physical_pe}")
     
-    model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target, raw_output_dim)
+    model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target, raw_output_dim, physical_pe)
     
     # Extract encoder weights from checkpoint
     if "state_dict" not in list(state_dict.keys()):
@@ -175,18 +182,25 @@ def load_cobra_from_experiment(
     raw = torch.load(ckpt_path, map_location=accelerator.device, weights_only=False)
 
     # Detect slice_pooling from weight keys
-    has_attn_keys = any(k.startswith("cobra.attn.") for k in raw.keys())
-    slice_pooling = "abmil" if has_attn_keys else "cls"
+    has_abmil_keys = any(k.startswith("cobra.attn.") for k in raw.keys())
+    has_cross_attn_keys = any(k.startswith("cobra.cross_attn_pool.") for k in raw.keys())
+    if has_abmil_keys:
+        slice_pooling = "abmil"
+    elif has_cross_attn_keys:
+        slice_pooling = "cross_attention"
+    else:
+        slice_pooling = "cls"
 
     # Attention pooling if cobra.fm_attn.* exists
     has_fm_attn = any(k.startswith("cobra.fm_attn.") for k in raw.keys())
     fm_pooling = "attention" if has_fm_attn else "avg_pool"
+    physical_pe = cobra_cfg.get("physical_pe", cfg.get("physical_pe", False))
 
     logger.info(
-        f"Loading COBRA from experiment: sequence_encoder={seq_enc}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}"
+        f"Loading COBRA from experiment: sequence_encoder={seq_enc}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, physical_pe={physical_pe}"
     )
 
-    model = _build_cobra(cobra_cfg, seq_enc, slice_pooling, fm_pooling)
+    model = _build_cobra(cobra_cfg, seq_enc, slice_pooling, fm_pooling, physical_pe=physical_pe)
 
     # Extract cobra.* weights from classifier state dict
     cobra_weights = {

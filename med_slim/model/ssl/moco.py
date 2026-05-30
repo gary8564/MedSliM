@@ -323,6 +323,7 @@ class MoCo(nn.Module):
         *,
         input_feature_dims_1: torch.Tensor | None = None,
         seq_lengths: torch.Tensor = None,
+        physical_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Masked Slice Prediction loss.
@@ -357,6 +358,7 @@ class MoCo(nn.Module):
             return_slice_embeddings=True,
             slice_mask=slice_mask,
             mask_token=self.mask_token,
+            physical_positions=physical_positions,
         )  # [B, num_slices, embed_dim]
 
         # Teacher: encode full FM-view to get per-slice hidden states (targets)
@@ -366,6 +368,7 @@ class MoCo(nn.Module):
                 input_feature_dims=input_feature_dims_1,
                 seq_lengths=seq_lengths,
                 return_slice_embeddings=True,
+                physical_positions=physical_positions,
             )  # [B, num_slices, embed_dim]
 
         # Build valid mask (exclude padding from loss)
@@ -412,6 +415,7 @@ class MoCo(nn.Module):
         cu_seqlens1: torch.Tensor = None,
         max_seqlen1: int = None,
         seq_idx1: torch.Tensor = None,
+        physical_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Masked Slice Prediction loss (packed mode).
@@ -439,6 +443,7 @@ class MoCo(nn.Module):
             return_slice_embeddings=True,
             slice_mask=slice_mask,
             mask_token=self.mask_token,
+            physical_positions=physical_positions,
         )  # [total_seq_len, embed_dim]
 
         # Teacher: encode full view → per-slice hidden states
@@ -451,6 +456,7 @@ class MoCo(nn.Module):
                 max_seqlen=max_seqlen1,
                 seq_idx=seq_idx1,
                 return_slice_embeddings=True,
+                physical_positions=physical_positions,
             )  # [total_seq_len, embed_dim]
 
         # MSP loss: masked slice positions only
@@ -547,6 +553,7 @@ class MoCo(nn.Module):
             x1,
             input_feature_dims_1=input_feature_dims_1,
             seq_lengths=seq_lengths,
+            physical_positions=physical_positions,
         )
 
         total_loss = (
@@ -627,6 +634,7 @@ class MoCo(nn.Module):
             cu_seqlens1=cu_seqlens1,
             max_seqlen1=max_seqlen1,
             seq_idx1=seq_idx1,
+            physical_positions=physical_positions,
         )
 
         total_loss = (

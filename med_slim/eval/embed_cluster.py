@@ -94,12 +94,20 @@ def extract_embeddings(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting embeddings", disable=not accelerator.is_main_process):
             seq_lengths = batch["seq_lengths"].to(accelerator.device)
+            physical_positions = batch.get("physical_positions")
+            if physical_positions is not None:
+                physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
             features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) for f in batch["features"]]
             batch_labels = batch["labels"]
             batch_sample_ids = batch["sample_ids"]
             
             if slice_level:
-                embeddings = cobra_model(features, seq_lengths=seq_lengths, return_slice_embeddings=True)
+                embeddings = cobra_model(
+                    features,
+                    seq_lengths=seq_lengths,
+                    physical_positions=physical_positions,
+                    return_slice_embeddings=True,
+                )
                 B = embeddings.shape[0]
                 
                 for i in range(B):
@@ -113,7 +121,11 @@ def extract_embeddings(
                     
                     all_sample_ids.extend([batch_sample_ids[i]] * num_slices)
             else:
-                embeddings = cobra_model(features, seq_lengths=seq_lengths)
+                embeddings = cobra_model(
+                    features,
+                    seq_lengths=seq_lengths,
+                    physical_positions=physical_positions,
+                )
                 all_embeddings.append(embeddings.float())
                 all_labels.append(batch_labels)
                 all_sample_ids.extend(batch_sample_ids)
@@ -138,8 +150,15 @@ def _extract_volume_embeddings(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting embeddings", disable=not accelerator.is_main_process):
             seq_lengths = batch["seq_lengths"].to(accelerator.device)
+            physical_positions = batch.get("physical_positions")
+            if physical_positions is not None:
+                physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
             features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) for f in batch["features"]]
-            embs = cobra_model(features, seq_lengths=seq_lengths)
+            embs = cobra_model(
+                features,
+                seq_lengths=seq_lengths,
+                physical_positions=physical_positions,
+            )
             all_embs.append(embs.float())
     embs = torch.cat(all_embs, dim=0)
     embs = accelerator.gather_for_metrics(embs)
@@ -573,7 +592,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "attention"])
     parser.add_argument("--sequence-encoder", type=str, default=None, choices=["mamba2", "transformer"])
-    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
+    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cross_attention", "cls"])
     parser.add_argument(
         "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"],
         default="raw",
