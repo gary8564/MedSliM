@@ -37,14 +37,14 @@ NUM_GPUS=1
 
 # Override slice encoder models from config
 # Available: dinov2, dinov3, rad-dino, medsiglip, biomedclip, ark, mri-core
-MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark"
+MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark mri-core medimageinsight"
 
 # Stage feature caches to local SSD to avoid disk I/O during training for network latency.
 # The training script caches all features in RAM after the first read.
 # Staging to $TMPDIR speeds up that initial bulk read from ~50 min to ~2 min.
 FEAT_BASE="/hpcwork/rwth1833/feat_caches"
 STAGE_TO_LOCAL=true   # set to false to skip staging and read directly from /hpcwork
-FEAT_CACHE_SUBDIR=("MRNet/slices_raw/crop") #"KMAR-50K/slices_raw/adaptive" "fastMRI/slices_raw/adaptive")
+FEAT_CACHE_SUBDIR=("MRNet/slices_raw/crop_tiled_2x2") #"KMAR-50K/slices_raw/adaptive" "fastMRI/slices_raw/adaptive")
 if $STAGE_TO_LOCAL && [ -n "$TMPDIR" ] && [ -d "$TMPDIR" ]; then
     LOCAL_BASE="$TMPDIR/feat_caches"
     echo "Staging feature caches to local SSD ($LOCAL_BASE)..."
@@ -71,6 +71,8 @@ SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
 POOLING="abmil"    # abmil (default), cross_attention, or cls (requires transformer encoder)
 USE_PACKED=false                   # true: packed sequences (no padding waste); false: evenly-spaced subsampling + padding
 PHYSICAL_PE=false                  # true: sinusoidal PE from physical slice positions (mm); essential for cross-domain
+REGIONAL_TOKENS=4                  # 0 = global CLS; 4 = tiled global + 2x2 regional CLS
+REGION_EMBEDDING=true             # true: add learned region identity embeddings
 
 # Masked Slice Prediction (MSP) — JEPA-style auxiliary objective
 # L = L_InfoNCE + lambda_mask * L_MSP + lambda_ctx * L_ctx
@@ -87,6 +89,8 @@ EXTRA_ARGS=""
 [[ -n "${PLANES}" ]]       && EXTRA_ARGS+=" --planes ${PLANES}"
 [[ "${USE_PACKED}" == true ]] && EXTRA_ARGS+=" --use-packed"
 [[ "${PHYSICAL_PE}" == true ]] && EXTRA_ARGS+=" --physical-pe"
+[[ "${REGIONAL_TOKENS}" -gt 0 ]] && EXTRA_ARGS+=" --regional-tokens ${REGIONAL_TOKENS}"
+[[ "${REGION_EMBEDDING}" == true ]] && EXTRA_ARGS+=" --region-embedding"
 [[ "${USE_MSP}" == true ]]    && EXTRA_ARGS+=" --msp"
 [[ -n "${MSP_LAMBDA_MASK}" ]] && EXTRA_ARGS+=" --msp-lambda-mask ${MSP_LAMBDA_MASK}"
 [[ -n "${MSP_LAMBDA_CTX}" ]]  && EXTRA_ARGS+=" --msp-lambda-ctx ${MSP_LAMBDA_CTX}"

@@ -13,9 +13,16 @@ import nibabel as nib
 import pandas as pd
 import torch
 import torchio as tio
+from safetensors.torch import load_file, save_file
 from pathlib import Path
 
-from med_slim.data.slice_dataset import SliceDataset, slice_collate_fn
+from med_slim.data.slice_dataset import (
+    SliceDataset,
+    TiledSliceDataset,
+    build_pre_tile_transform,
+    slice_collate_fn,
+    tiled_slice_collate_fn,
+)
 from med_slim.utils.preprocessing.transforms import get_transforms
 from med_slim.utils.model_config import get_slice_encoder_config
 from med_slim.model.slice_encoder import build_slice_encoder
@@ -176,6 +183,41 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
             self.assertEqual(H, self.H_crop)
             self.assertEqual(D, 22, "Raw mode keeps original 22 slices")
 
+    def test_tiled_slice_dataset(self):
+        """Tiled dataset should return [B, num_tiled_regions, C, W, H, num_slices]."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            _make_synthetic_dataset(data_root, num_samples=2)
+
+            grid_size = 2
+            pre_tile_tf = build_pre_tile_transform(plane="axial", crop_empty_slices=False)
+            _, view_tf = get_transforms(
+                model_name=self.model_name,
+                plane="axial",
+                num_slices=self.num_slices,
+                spatial_mode="resize",
+            )
+            ds = TiledSliceDataset(
+                path_root=str(data_root),
+                split="train",
+                pre_tile_transform=pre_tile_tf,
+                view_transform=view_tf,
+                grid_size=grid_size,
+                plane="axial",
+            )
+            dl = torch.utils.data.DataLoader(
+                ds,
+                batch_size=2,
+                shuffle=False,
+                collate_fn=tiled_slice_collate_fn,
+            )
+            batch = next(iter(dl))
+            x = batch["x"]
+            num_regions = 1 + grid_size * grid_size
+            self.assertEqual(x.shape, (2, num_regions, 1, self.W_crop, self.H_crop, self.num_slices))
+            self.assertEqual(len(batch["region_boxes"][0]), num_regions)
+            self.assertEqual(batch["region_boxes"][0][0], [0.0, 0.0, 1.0, 1.0])
+
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required for encoder test")
     def test_end_to_end_slice_encoder_forward(self):
         """Full forward pass: batch -> slice_encoder -> (B, D, embed_dim)."""
@@ -216,6 +258,83 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
                 f"Expected (2, {self.num_slices}, {embed_dim})",
             )
             self.assertTrue(torch.isfinite(feats).all())
+
+    def test_tiled_feats_permute_saves_to_safetensors(self):
+        batch_size, num_tiled_regions, num_slices, embed_dim = 2, 5, 12, 64
+        view_feats = torch.randn(batch_size * num_tiled_regions, num_slices, embed_dim)
+        feats = view_feats.reshape(
+            batch_size,
+            num_tiled_regions,
+            num_slices,
+            embed_dim,
+        ).permute(0, 2, 1, 3).contiguous().cpu().to(dtype=torch.float32)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for i in range(batch_size):
+                save_path = Path(tmp) / f"{i}.safetensors"
+                save_file({"feats": feats[i].contiguous()}, str(save_path))
+                loaded = load_file(str(save_path))
+                self.assertEqual(
+                    tuple(loaded["feats"].shape),
+                    (num_slices, num_tiled_regions, embed_dim),
+                )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required for encoder test")
+    def test_tiled_end_to_end_slice_encoder_forward_and_save(self):
+        """Tiled batch -> encoder -> permute -> safetensors save (matches precompute path)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            out_dir = Path(tmp) / "out"
+            out_dir.mkdir()
+            _make_synthetic_dataset(data_root, num_samples=1)
+
+            grid_size = 2
+            regional_tokens = grid_size * grid_size
+            num_regions = 1 + regional_tokens
+            pre_tile_tf = build_pre_tile_transform(plane="axial", crop_empty_slices=False)
+            _, view_tf = get_transforms(
+                model_name=self.model_name,
+                plane="axial",
+                num_slices=self.num_slices,
+                spatial_mode="crop",
+            )
+            ds = TiledSliceDataset(
+                path_root=str(data_root),
+                split="train",
+                pre_tile_transform=pre_tile_tf,
+                view_transform=view_tf,
+                grid_size=grid_size,
+                plane="axial",
+            )
+            batch = tiled_slice_collate_fn([ds[0]])
+            x = batch["x"].cuda().float()
+
+            encoder = build_slice_encoder(self.model_name, freeze=True).cuda().eval()
+            with torch.no_grad():
+                batch_size, num_tiled_regions, channels, width, height, num_slices = x.shape
+                x_views = x.reshape(
+                    batch_size * num_tiled_regions,
+                    channels,
+                    width,
+                    height,
+                    num_slices,
+                )
+                view_feats = encoder(x_views)
+                feats = view_feats.reshape(
+                    batch_size,
+                    num_tiled_regions,
+                    num_slices,
+                    -1,
+                ).permute(0, 2, 1, 3).contiguous().cpu().to(dtype=torch.float32)
+
+            save_path = out_dir / f"{batch['uid'][0]}.safetensors"
+            save_file({"feats": feats[0].contiguous()}, str(save_path), metadata={"regional_tokens": str(regional_tokens)})
+            loaded = load_file(str(save_path))
+            embed_dim = self.cfg["embed_dim"]
+            self.assertEqual(
+                tuple(loaded["feats"].shape),
+                (self.num_slices, num_regions, embed_dim),
+            )
 
 
 if __name__ == "__main__":

@@ -27,11 +27,15 @@ MODEL_NAME="medsiglip" # "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedcli
 SPLIT="train"
 # Local checkpoints for models that require them
 declare -A CHECKPOINTS=(
-  ["ark"]="/work/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
-  ["mri-core"]="/work/rwth1833/models/mri_core/mri_foundation.pth"
+  ["ark"]="/hpcwork/rwth1833/models/Ark6_swinLarge768_ep50.pth.tar"
+  ["mri-core"]="/hpcwork/rwth1833/models/mri_foundation.pth"
 )
 # Preprocessing modes: "resize", "resample", "crop", or "adaptive"
 SPATIAL_MODE="adaptive"
+# Tiled multi-crop CLS. 
+# e.g., 0 = original global CLS; 4 = global + 2 x 2 regional crops.
+REGIONAL_TOKENS=0
+MRI_SEQUENCES="all"  # for fastMRI; use "none" when datasets do not contain multi-sequence
 EXTRA_ARGS="--amp bf16"
 
 # Conditionally extend extra args
@@ -41,6 +45,14 @@ fi
 
 if [ "$USE_RAW_SLICE_RESOLUTION" = false ]; then
   EXTRA_ARGS="$EXTRA_ARGS --num-slices 32"
+fi
+
+if [ "$REGIONAL_TOKENS" -gt 0 ]; then
+  EXTRA_ARGS="$EXTRA_ARGS --regional-tokens $REGIONAL_TOKENS"
+fi
+
+if [ -n "${MRI_SEQUENCES:-}" ] && [ "$MRI_SEQUENCES" != "none" ]; then
+  EXTRA_ARGS="$EXTRA_ARGS --mri-sequences $MRI_SEQUENCES"
 fi
 
 # Add checkpoint for models that require local weights
@@ -55,6 +67,5 @@ python ./med_slim/utils/preprocessing/precompute_slice_feature.py \
     --plane "$PLANE" \
     --model-name "$MODEL_NAME" \
     --split "$SPLIT" \
-    --spatial-mode "$SPATIAL_MODE" \
     --spatial-mode "$SPATIAL_MODE" \
     $EXTRA_ARGS

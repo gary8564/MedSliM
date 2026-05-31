@@ -31,7 +31,7 @@ from sklearn.model_selection import train_test_split
 from accelerate import Accelerator
 from transformers import get_cosine_schedule_with_warmup
 from med_slim.model.slice_encoder.curia import CuriaFeatureExtractor
-from med_slim.model.attention_pooling.cross_attention import CrossAttentionPooling
+from med_slim.model.attention_pooling.cross_attention import InterSliceAggregator
 from med_slim.data.slice_dataset import SliceDataset
 from med_slim.utils.preprocessing.transforms import get_adaptive_transform, get_transforms
 from med_slim.utils.callbacks.early_stopping import EarlyStopping
@@ -101,7 +101,7 @@ class CuriaClassifier(nn.Module):
         embed_dim = self.backbone.embed_dim
 
         # Trainable aggregation
-        self.cross_attn_pool = CrossAttentionPooling(
+        self.cross_attn_pool = InterSliceAggregator(
             embed_dim=embed_dim,
             num_heads=num_heads,
             num_queries=num_queries,

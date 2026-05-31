@@ -24,7 +24,7 @@ from datetime import datetime
 from accelerate import Accelerator
 from typing import Dict, List, Optional, Tuple
 
-from med_slim.model.sequence_encoder.cobra import Cobra
+from med_slim.model.sequence_encoder.cobra import Cobra, _resolve_pooling_target
 from med_slim.data.feat_dataset import (
     FeatClassificationDataset,
     linear_classifier_collate_fn,
@@ -444,12 +444,30 @@ def main(args):
     with open(pretrain_config_path, "r") as f:
         pretrain_cfg = yaml.safe_load(f)
     cobra_cfg = pretrain_cfg["model"]["cobra"]
+    pretrain_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint_slice_pooling = pretrain_state.get("pooling")
+    cobra_cfg["regional_tokens"] = int(
+        pretrain_state.get("regional_tokens", cobra_cfg.get("regional_tokens", 0))
+    )
     cfg["cobra_config"] = cobra_cfg
 
-    if accelerator.is_main_process:
-        os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, "config.yml"), "w") as f:
-            yaml.dump(cfg, f)
+    resolved_pooling_target = _resolve_pooling_target(
+        mode="inference",
+        pooling_target=args.pooling_target,
+        regional_tokens=cobra_cfg.get("regional_tokens", 0),
+        slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
+    )
+
+    # Determine raw FM output dimension when pooling_target='raw'
+    raw_output_dim = None
+    if resolved_pooling_target == "raw":
+        if len(model_names) > 1:
+            logger.warning("Only single-FM inference mode is supported when pooling_target='raw'.")
+            logger.warning("Using first FM model for raw output dimension.")
+        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
+        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
+    cfg["pooling_target"] = resolved_pooling_target
+    cfg["raw_output_dim"] = raw_output_dim
 
     # Initialize wandb
     if accelerator.is_main_process:
@@ -460,14 +478,10 @@ def main(args):
             dir=output_dir,
         )
 
-    # Determine raw FM output dimension for 'raw' pooling target
-    raw_output_dim = None
-    if args.pooling_target == "raw":
-        if len(model_names) > 1:
-            logger.warning("Only singe-FM inference mode is supported when pooling_target='raw'.")
-            logger.warning("Using first FM model for raw output dimension.")
-        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
-        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
+    if accelerator.is_main_process:
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "config.yml"), "w") as f:
+            yaml.dump(cfg, f)
 
     # Load pretrained COBRA model
     if accelerator.is_main_process:
@@ -481,7 +495,7 @@ def main(args):
         fm_pooling="avg_pool",
         sequence_encoder=args.sequence_encoder,
         slice_pooling=args.slice_pooling,
-        pooling_target=args.pooling_target,
+        pooling_target=resolved_pooling_target,
         raw_output_dim=raw_output_dim,
     )
     cobra_model = cobra_model.to(accelerator.device)
@@ -562,8 +576,9 @@ if __name__ == "__main__":
         "--slice-pooling", type=str, choices=["abmil", "cross_attention", "cls"], default=None,
     )
     parser.add_argument(
-        "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"], default="raw",
-        help="Which representation level ABMIL attention weights aggregate.",
+        "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"], default=None,
+        help="Which representation level ABMIL attention weights aggregate. "
+             "If using default None, Cobra resolves to raw for global-only FM caches and post_embed for tiled multi-crop CLS caches.",
     )
     args = parser.parse_args()
     main(args)

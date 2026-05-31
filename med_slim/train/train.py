@@ -76,6 +76,12 @@ def main(args, cfg):
     pooling = args.pooling
     cobra_cfg = cfg["model"]["cobra"]
     physical_pe = getattr(args, "physical_pe", False) or cobra_cfg.get("physical_pe", False)
+
+    # Tiled multi-crop CLS (within-slice region aggregation)
+    regional_tokens = getattr(args, "regional_tokens", None)
+    if regional_tokens is None:
+        regional_tokens = cobra_cfg.get("regional_tokens", 0)
+    region_embedding = getattr(args, "region_embedding", False) or cobra_cfg.get("region_embedding", False)
     
     # Build encoder-specific kwargs
     encoder_kwargs = {}
@@ -105,6 +111,9 @@ def main(args, cfg):
     print("Creating model...")
     if physical_pe:
         print("Physical positional encoding ENABLED (sinusoidal, keyed on mm positions)")
+    if regional_tokens > 0:
+        print(f"Tiled multi-crop CLS ENABLED (regional_tokens={regional_tokens}, "
+              f"region_embedding={region_embedding})")
     model = MoCo(
         embed_dim=cobra_cfg["embed_dim"],
         contrast_dim=cobra_cfg["contrast_dim"],
@@ -117,6 +126,8 @@ def main(args, cfg):
         sequence_encoder=sequence_encoder,
         pooling=pooling,
         physical_pe=physical_pe,
+        regional_tokens=regional_tokens,
+        region_embedding=region_embedding,
         msp_enabled=msp_enabled,
         msp_lambda_mask=msp_cfg.get("lambda_mask", 1.0),
         msp_lambda_ctx=msp_cfg.get("lambda_ctx", 0.0),
@@ -213,10 +224,6 @@ def main(args, cfg):
             # Remap legacy mamba_enc -> seq_enc
             if "mamba_enc" in new_key:
                 new_key = new_key.replace("mamba_enc", "seq_enc")
-            # Skip removed varlen_seq_enc keys from old checkpoints
-            #TODO: remove this once all checkpoints are updated
-            if "varlen_seq_enc" in new_key:
-                continue
             remapped_state_dict[new_key] = value        
         if any("mamba_enc" in k for k in state_dict.keys()):
             print("Detected legacy checkpoint format, remapping keys: mamba_enc -> seq_enc")
@@ -363,6 +370,8 @@ def main(args, cfg):
                     "sequence_encoder": sequence_encoder,
                     "pooling": pooling,
                     "physical_pe": physical_pe,
+                    "regional_tokens": regional_tokens,
+                    "region_embedding": region_embedding,
                     "msp_enabled": msp_enabled,
                 }
                 ckpt_name = f"medslim-epoch{e+1}.pth.tar"
@@ -486,6 +495,25 @@ if __name__ == "__main__":
             "Packed mode concatenates variable-length sequences and uses cu_seqlens "
             "to track boundaries, avoiding padding waste. "
             "Requires Mamba2 (seq_idx) or Transformer with FlashAttention (varlen_attn)."
+        ),
+    )
+    parser.add_argument(
+        "--regional-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Tiled multi-crop CLS: number of regional crop tokens per slice (e.g. 4 for a 2x2 grid). "
+            "Requires tiled feature caches produced with the matching `--regional-tokens` flag. "
+            "Overrides config model.cobra.regional_tokens. "
+            "0 keeps the original global-only CLS pathway."
+        ),
+    )
+    parser.add_argument(
+        "--region-embedding",
+        action="store_true",
+        help=(
+            "Add a learned region embedding over (global + regional) tokens in the "
+            "within-slice aggregator so quadrant identity can be used."
         ),
     )
     # MSP (Masked Slice Prediction) arguments

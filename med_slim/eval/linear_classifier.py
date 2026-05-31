@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Tuple
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from transformers import get_cosine_schedule_with_warmup
 
-from med_slim.model.sequence_encoder.cobra import Cobra
+from med_slim.model.sequence_encoder.cobra import Cobra, _resolve_pooling_target
 from med_slim.model.attention_pooling.abmil import BatchedABMIL
 from med_slim.data.feat_dataset import (
     FeatClassificationDataset, 
@@ -155,8 +155,9 @@ class SingleViewClassifier(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            features: List of K tensors, each [B, max_seq_len, encoder_embed_dim]
-                      COBRA inference mode ensembles across these encoders
+            features: List of K tensors. 
+                      Global-only caches have shape [B, num_slices, input_embed_dim]. 
+                      Tiled multi-crop CLS caches have shape [B, num_slices, num_tiled_regions, input_embed_dim].
             seq_lengths: Sequence lengths [B]
             physical_positions: Physical slice positions [B, max_seq_len], used when Cobra has physical PE enabled.
         
@@ -244,7 +245,9 @@ class MultiViewClassifier(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            features: {view_plane: List of K tensors [B, max_seq_len, encoder_embed_dim]}
+            features: {view_plane: List of K tensors}. 
+                      Global-only caches have shape [B, num_slices, input_embed_dim].
+                      Tiled multi-crop CLS caches have shape [B, num_slices, num_tiled_regions, input_embed_dim].
             seq_lengths: {view_plane: [B]}
             physical_positions: {view_plane: [B, max_seq_len]}, used when Cobra has physical PE enabled.
         
@@ -2372,14 +2375,43 @@ def main(args):
     with open(pretrain_config_path, "r") as f:
         pretrain_cfg = yaml.safe_load(f)
     cobra_cfg = pretrain_cfg["model"]["cobra"]
+    checkpoint_slice_pooling = None
     if checkpoint_path and os.path.exists(checkpoint_path):
         pretrain_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_slice_pooling = pretrain_state.get("pooling")
         cobra_cfg["physical_pe"] = bool(
             pretrain_state.get("physical_pe", cobra_cfg.get("physical_pe", False))
         )
+        cobra_cfg["regional_tokens"] = int(
+            pretrain_state.get("regional_tokens", cobra_cfg.get("regional_tokens", 0))
+        )
+        cobra_cfg["region_embedding"] = bool(
+            pretrain_state.get("region_embedding", cobra_cfg.get("region_embedding", False))
+        )
     cfg["cobra_config"] = cobra_cfg
     cfg["physical_pe"] = cobra_cfg.get("physical_pe", False)
+    cfg["regional_tokens"] = cobra_cfg.get("regional_tokens", 0)
+    cfg["region_embedding"] = cobra_cfg.get("region_embedding", False)
+    resolved_pooling_target = _resolve_pooling_target(
+        mode="inference",
+        pooling_target=args.pooling_target,
+        regional_tokens=cobra_cfg.get("regional_tokens", 0),
+        slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
+    )
+    cfg["fm_pooling"] = args.fm_pooling
+    cfg["pooling_target"] = resolved_pooling_target
+    cfg["sequence_encoder"] = args.sequence_encoder
+    cfg["slice_pooling"] = args.slice_pooling
     cfg["no_pretrained_cobra"] = args.no_pretrained_cobra
+
+    # Determine raw FM output dimension for 'raw' pooling target.
+    # Tiled caches are [B, num_slices, num_tiled_regions, input_embed_dim], so
+    # raw ABMIL pooling over [B, num_slices, input_embed_dim] is not defined.
+    raw_output_dim = None
+    if resolved_pooling_target == "raw":
+        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
+        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
+    cfg["raw_output_dim"] = raw_output_dim
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
@@ -2396,12 +2428,6 @@ def main(args):
             dir=output_dir,
         )
     
-    # Determine raw FM output dimension for 'raw' pooling target
-    raw_output_dim = None
-    if args.pooling_target == "raw":
-        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
-        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
-
     if args.no_pretrained_cobra:
         if cfg.get("freeze_cobra", True):
             raise ValueError(
@@ -2420,7 +2446,7 @@ def main(args):
             sequence_encoder=sequence_encoder,
             slice_pooling=slice_pooling,
             fm_pooling=args.fm_pooling,
-            pooling_target=args.pooling_target,
+            pooling_target=resolved_pooling_target,
             raw_output_dim=raw_output_dim,
         )
     else:
@@ -2439,7 +2465,7 @@ def main(args):
             fm_pooling=args.fm_pooling,
             sequence_encoder=args.sequence_encoder,  
             slice_pooling=args.slice_pooling,
-            pooling_target=args.pooling_target,
+            pooling_target=resolved_pooling_target,
             raw_output_dim=raw_output_dim,
         )
     cobra_model = cobra_model.to(accelerator.device)
@@ -2682,11 +2708,12 @@ if __name__ == "__main__":
         "--pooling-target",
         type=str,
         choices=["post_encoder", "post_embed", "raw"],
-        default="raw",
+        default=None,
         help="Which representation level ABMIL attention weights aggregate: "
-             "'post_encoder': after Mamba-2 encoder, "
-             "'post_embed': after Embed MLP (default), "
-             "'raw': original FM patch embeddings proposed in COBRA paper."
+             "'post_encoder': after sequence encoder (Mamba-2/Transformer), "
+             "'post_embed': after Embed MLP for global-only CLS; after within-slice region aggregation for tiled multi-crop CLS."
+             "'raw': original global-only FM embeddings. "
+             "If omitted, Cobra resolves to 'raw' for global-only caches and 'post_embed' for tiled multi-crop CLS caches."
     )
     parser.add_argument(
         "--n-folds",

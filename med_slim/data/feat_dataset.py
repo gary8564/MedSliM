@@ -68,6 +68,58 @@ def _slice_spacing_from_metadata(metadata: dict | None) -> float | None:
     return float(spacing_str) if spacing_str is not None else None
 
 
+def _validate_feature_metadata(
+    feats: torch.Tensor,
+    metadata: dict,
+) -> None:
+    """
+    Validate safetensor tiled metadata against the model/dataset config.
+
+    Raises ``ValueError`` when global-only and tiled caches are mixed or when metadata
+    disagrees with the tensor shape.
+    """
+    meta_regional = metadata.get("regional_tokens")
+    meta_num_regions = metadata.get("num_regions")
+
+    if feats.ndim == 2:
+        if meta_regional is not None and int(meta_regional) > 0:
+            raise ValueError(
+                f"Loaded feature metadata regional_tokens={meta_regional} but "
+                f"feats are global-only with shape {tuple(feats.shape)}."
+            )
+            
+    elif feats.ndim == 3:
+        num_regions = feats.shape[1]
+        if meta_num_regions is not None and int(meta_num_regions) != num_regions:
+            raise ValueError(
+                f"num_regions metadata ({meta_num_regions}) != feats.shape[1] ({num_regions})."
+            )
+        if meta_regional is not None and num_regions != 1 + int(meta_regional):
+            raise ValueError(
+                f"regional_tokens metadata ({meta_regional}) implies "
+                f"{1 + int(meta_regional)} regions, but feats have "
+                f"{num_regions}."
+            )
+
+    else:
+        raise ValueError(
+            f"Loaded feature must have rank 2 or 3, got ndim={feats.ndim}."
+        )    
+    
+def _read_and_validate_feat(
+    feat_path: str,
+) -> Tuple[torch.Tensor, dict]:
+    """Load a safetensors feature file and validate its metadata."""
+    with safe_open(feat_path, framework="pt", device="cpu") as f:
+        feat = f.get_tensor("feats")
+        metadata = f.metadata()
+    _validate_feature_metadata(
+        feat,
+        metadata,
+    )
+    return feat, metadata
+
+
 def ssl_packed_collate_fn(batch):
     """
     Packed sequence collate function for PrecomputedFeatPairDataset.
@@ -88,10 +140,12 @@ def ssl_packed_collate_fn(batch):
     
     Returns:
         dict with keys:
-            - feats1, feats2: packed features [total_real_seq_len, max_feat_dim]
+            - feats1, feats2: packed global-only features
+              [total_slices, max_feature_dim] or tiled features
+              [total_slices, num_tiled_regions, max_feature_dim]
             - cu_seqlens1, cu_seqlens2: cumulative sequence lengths [B+1] 
             - max_seqlen1, max_seqlen2: max real sequence length in batch
-            - seq_idx1, seq_idx2: document index per token [total_real_seq_len]
+            - seq_idx1, seq_idx2: document index per token [total_slices]
             - orig_embed_dim1, orig_embed_dim2: original embedding dimensions [B]
             - label (optional): stacked labels [B, C] when annotations exist
             - has_label (optional): boolean tensor [B] when annotations exist
@@ -113,9 +167,19 @@ def ssl_packed_collate_fn(batch):
     cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
     cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
     
-    # Pack features: concatenate variable-length sequences
-    feats1_packed = torch.cat(feats1_list, dim=0)  # [total_seq_len, max_feat_dim]
-    feats2_packed = torch.cat(feats2_list, dim=0)  # [total_seq_len, max_feat_dim]
+    assert all(f.ndim == feats1_list[0].ndim for f in feats1_list + feats2_list), (
+        "Packed batches cannot mix global-only CLS features [num_slices, max_feature_dim] "
+        "with tiled multi-crop CLS features [num_slices, num_tiled_regions, max_feature_dim]."
+    )
+    if feats1_list[0].ndim == 3:
+        num_tiled_regions = feats1_list[0].shape[1]
+        assert all(f.shape[1] == num_tiled_regions for f in feats1_list + feats2_list), (
+            "All tiled packed features in a batch must have the same num_tiled_regions."
+        )
+
+    # Pack features: concatenate variable-length sequences along the slice axis.
+    feats1_packed = torch.cat(feats1_list, dim=0)  # [total_slices, (num_tiled_regions,) max_feature_dim]
+    feats2_packed = torch.cat(feats2_list, dim=0)  # [total_slices, (num_tiled_regions,) max_feature_dim]
     
     # Vectorized building seq_idx: repeat each batch index by its sequence length
     seq_idx = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens)
@@ -124,21 +188,21 @@ def ssl_packed_collate_fn(batch):
         item.get("physical_positions", torch.arange(item["feats1"].shape[0], dtype=torch.float32))
         for item in batch
     ]
-    phys_pos_packed = torch.cat(phys_pos_list, dim=0)  # [total_seq_len]
+    phys_pos_packed = torch.cat(phys_pos_list, dim=0)  # [total_slices]
     
     result = {
-        "feats1": feats1_packed,   # [total_real_seq_len, max_feat_dim]
+        "feats1": feats1_packed,   # [total_slices, (num_tiled_regions,) max_feature_dim]
         "feats2": feats2_packed,
         "cu_seqlens1": cu_seqlens,  # [B+1] — shared across both views
         "cu_seqlens2": cu_seqlens,
         "max_seqlen1": seq_lens.max().item(),
         "max_seqlen2": seq_lens.max().item(),
-        "seq_idx1": seq_idx,        # [total_real_seq_len]
+        "seq_idx1": seq_idx,        # [total_slices]
         "seq_idx2": seq_idx,
         "orig_embed_dim1": orig_embed_dims1,  # [B]
         "orig_embed_dim2": orig_embed_dims2,
         "batch_size": batch_size,
-        "physical_positions": phys_pos_packed,  # [total_real_seq_len]
+        "physical_positions": phys_pos_packed,  # [total_slices]
     }
     
     # Forward labels for semi-supervised contrastive learning
@@ -160,7 +224,7 @@ def linear_classifier_collate_fn(batch):
     
     Returns:
         dict with keys:
-            - feature_embeds: List of K tensors, each [B, max_seq_len, embed_dim]
+            - features: List of K tensors, each [B, max_seq_len, embed_dim] for global-only or [B, max_seq_len, num_tiled_regions, embed_dim] for tiled multi-crop CLS.
             - labels: [B] tensor of labels
             - sample_ids: List of sample IDs
             - seq_lengths: [B] tensor of actual sequence lengths for masking
@@ -180,13 +244,13 @@ def linear_classifier_collate_fn(batch):
     for k in range(K):
         # Gather k-th slice encoder features from all samples in the batch
         kth_feats = [sample_feats[k] for sample_feats in all_feats_list]
-        embed_dim = kth_feats[0].shape[-1]
+        trailing_dims = kth_feats[0].shape[1:] # (embed_dim,) for global-only or (num_tiled_regions, embed_dim) for tiled multi-crop CLS
         
         # Pad each to max_seq_len
-        padded = torch.zeros(batch_size, max_seq_len, embed_dim)
+        padded = torch.zeros(batch_size, max_seq_len, *trailing_dims)
         for i, feat in enumerate(kth_feats):
             seq_len = feat.shape[0]
-            padded[i, :seq_len, :] = feat
+            padded[i, :seq_len] = feat
         
         features_list.append(padded)
     
@@ -209,7 +273,7 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
     
     Returns:
         Dict with keys:
-            - feature_embeds: {view_plane: List of K tensors [B, max_seq_len, embed_dim]}
+            - features: {view_plane: List of K tensors [B, max_seq_len, embed_dim] for global-only or [B, max_seq_len, num_tiled_regions, embed_dim] for tiled multi-crop CLS}
             - seq_length: {view_plane: tensor [B]}
             - labels: tensor [B] or [B, num_labels]
             - sample_ids: list of sample IDs
@@ -230,17 +294,18 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
         K = len(all_feats_list[0])  # Number of slice encoders
         max_seq_len = max(feat[0].shape[0] for feat in all_feats_list)
         
-        # Create list of K tensors for this view, each [B, max_seq_len, encoder_embed_dim]
+        # Create list of K tensors for this view, each [B, max_seq_len, embed_dim] for global-only 
+        # or [B, max_seq_len, num_tiled_regions, embed_dim] for tiled multi-crop CLS.
         features_list = []
         for k in range(K):
             kth_feats = [sample_feats[k] for sample_feats in all_feats_list]
-            embed_dim = kth_feats[0].shape[-1]
+            trailing_dims = kth_feats[0].shape[1:]
             
             # Pad each to max_seq_len
-            padded = torch.zeros(batch_size, max_seq_len, embed_dim)
+            padded = torch.zeros(batch_size, max_seq_len, *trailing_dims)
             for i, feat in enumerate(kth_feats):
                 seq_len = feat.shape[0]
-                padded[i, :seq_len, :] = feat
+                padded[i, :seq_len] = feat
             
             features_list.append(padded)
         
@@ -534,11 +599,19 @@ class PrecomputedFeatPairDataset(Dataset):
         with safe_open(feat_path, framework="pt", device="cpu") as f:
             feats = f.get_tensor("feats").clone()
             metadata = f.metadata()
-        assert feats.ndim == 2, f"Expected number of dimensions to be 2, but got {feats.ndim=}!"
+        assert feats.ndim in (2, 3), (
+            "Expected feature tensor with 2 ([num_slices, embed_dim]) or 3 "
+            "([num_slices, num_tiled_regions, embed_dim]) dimensions, "
+            f"but got {feats.ndim=}!"
+        )
         assert metadata["plane"] in self.view_planes, f"Expected plane to be in {self.view_planes}, but got {metadata['plane']}!"
         assert metadata["model_name"] in self.slice_encoder_models, f"Expected model name to be in {self.slice_encoder_models}, but got {metadata['model_name']}!"
+        _validate_feature_metadata(
+            feats,
+            metadata,
+        )
         return feats, metadata
-
+        
     @staticmethod
     def _compute_physical_positions(
         selected_indices: np.ndarray,
@@ -599,12 +672,13 @@ class PrecomputedFeatPairDataset(Dataset):
         share the same indices so that they see identical anatomy.
 
         Args:
-            feats: Feature tensor [num_slices, embed_dim].
+            feats: Feature tensor [num_slices, embed_dim] (global-only CLS) or
+                   [num_slices, num_tiled_regions, embed_dim] (tiled multi-crop CLS).
             indices: Pre-computed subsampling indices (optional).  
                      When None, computed via `_compute_subsample_indices`.
 
         Returns:
-            Tuple of (features [num_target_slices, embed_dim],
+            Tuple of (features [num_target_slices, ...],
                       actual_num_real_slices,
                       selected_indices into original volume).
         """
@@ -616,7 +690,13 @@ class PrecomputedFeatPairDataset(Dataset):
         if num_slices <= self.num_target_slices:
             # Zero-pad to target length
             pad_size = self.num_target_slices - num_slices
-            padded = torch.nn.functional.pad(feats, (0, 0, 0, pad_size), value=0.0)
+            if feats.ndim == 2:          # [num_slices, embed_dim]
+                pad = (0, 0, 0, pad_size)
+            elif feats.ndim == 3:        # [num_slices, num_tiled_regions, embed_dim]
+                pad = (0, 0, 0, 0, 0, pad_size)
+            else:
+                raise ValueError(f"Unsupported feature tensor rank {feats.ndim}.")
+            padded = torch.nn.functional.pad(feats, pad, value=0.0)
             return padded, num_slices, indices
         else:
             return feats[indices], self.num_target_slices, indices
@@ -625,7 +705,7 @@ class PrecomputedFeatPairDataset(Dataset):
         """
         Pad the embedding dimension to the largest embedding dimension in the batch by padding with zeros if it is smaller than the target dimension.
         """
-        seq_len, embed_dim = x.shape
+        embed_dim = x.shape[-1]
         
         if embed_dim < self.max_feature_dim:
             pad_size = self.max_feature_dim - embed_dim
@@ -659,6 +739,16 @@ class PrecomputedFeatPairDataset(Dataset):
             f"but got {feats1.shape[0]} and {feats2.shape[0]} for study {study_id}, "
             f"plane {selected_view_plane}."
         )
+        # Tiled multi-crop CLS: both views must expose the same num_tiled_regions
+        assert feats1.ndim == feats2.ndim, (
+            f"Token layout mismatch in positive pair for study {study_id}: "
+            f"FM '{fm1}' has {feats1.ndim}D features but FM '{fm2}' has {feats2.ndim}D. "
+        )
+        if feats1.ndim == 3:
+            assert feats1.shape[1] == feats2.shape[1], (
+                f"num_tiled_regions mismatch in positive pair for study {study_id}: "
+                f"{feats1.shape[1]} v.s. {feats2.shape[1]}."
+            )
 
         slice_spacing_mm = _slice_spacing_from_metadata(metadata1)
         
@@ -681,12 +771,13 @@ class PrecomputedFeatPairDataset(Dataset):
         feats1, orig_embed_dim1 = self._pad_feature_dim(feats1)
         feats2, orig_embed_dim2 = self._pad_feature_dim(feats2)
         
-        assert feats1.shape[1] == feats2.shape[1], \
-            f"Expected embed_dim to be equal, but got {feats1.shape[1]} and {feats2.shape[1]}!"
+        assert feats1.shape[-1] == feats2.shape[-1], (
+            f"Expected padded feature dim to be equal, but got {feats1.shape[-1]} and {feats2.shape[-1]}!"
+        )
         
         result = {
-            "feats1": feats1,                # [seq_len, max_feature_dim]
-            "feats2": feats2,                # [seq_len, max_feature_dim]
+            "feats1": feats1,                # [seq_len, max_feature_dim] or [seq_len, num_tiled_regions, max_feature_dim]
+            "feats2": feats2,                # [seq_len, max_feature_dim] or [seq_len, num_tiled_regions, max_feature_dim]
             "orig_embed_dim1": torch.as_tensor(orig_embed_dim1, dtype=torch.long),
             "orig_embed_dim2": torch.as_tensor(orig_embed_dim2, dtype=torch.long),
             "seq_len": torch.as_tensor(seq_len, dtype=torch.long),
@@ -803,17 +894,19 @@ class FeatClassificationDataset(Dataset):
     def _get_feat(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
         """Return feature tensor and metadata from cache if available, otherwise load from disk."""
         if self._feat_cache is not None:
-            return self._feat_cache.get(feat_path)
+            feat, metadata = self._feat_cache.get(feat_path)
+            _validate_feature_metadata(
+                feat,
+                metadata,
+            )
+            return feat, metadata
         return self._load_feat(feat_path)
 
     def __len__(self):
         return len(self.sample_ids)
     
     def _load_feat(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
-        with safe_open(feat_path, framework="pt", device="cpu") as f:
-            feat = f.get_tensor("feats")
-            metadata = f.metadata()
-        return feat, metadata
+        return _read_and_validate_feat(feat_path)
     
     def _get_label(self, sample_id: str) -> torch.Tensor:
         """Get label(s) for a sample based on task type."""
@@ -849,6 +942,18 @@ class FeatClassificationDataset(Dataset):
                 f"{dict(zip(self.slice_encoder_models, seq_lengths))}. "
                 f"All encoders should have the same number of slices for the same exam."
             )
+            ranks = [feat.ndim for feat in feat_embeds]
+            assert all(rank == ranks[0] for rank in ranks), (
+                f"Feature dimensions mismatch across slice encoders for sample {sample_id}: "
+                f"{dict(zip(self.slice_encoder_models, ranks))}. "
+                "Do not mix global-only and tiled multi-crop CLS caches."
+            )
+            if ranks[0] == 3:
+                region_counts = [feat.shape[1] for feat in feat_embeds]
+                assert all(count == region_counts[0] for count in region_counts), (
+                    f"Tiled region-count mismatch across slice encoders for sample {sample_id}: "
+                    f"{dict(zip(self.slice_encoder_models, region_counts))}."
+                )
         
         slice_spacing_mm = _slice_spacing_from_metadata(metadata)
         physical_positions = PrecomputedFeatPairDataset._compute_physical_positions(
@@ -1038,17 +1143,19 @@ class MultiViewFeatClassificationDataset(Dataset):
     def _get_feat(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
         """Return feature tensor and metadata from cache if available, otherwise load from disk."""
         if self._feat_cache is not None:
-            return self._feat_cache.get(feat_path)
+            feat, metadata = self._feat_cache.get(feat_path)
+            _validate_feature_metadata(
+                feat,
+                metadata,
+            )
+            return feat, metadata
         return self._load_feat(feat_path)
 
     def __len__(self):
         return len(self.sample_ids)
     
     def _load_feat(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
-        with safe_open(feat_path, framework="pt", device="cpu") as f:
-            feat = f.get_tensor("feats")
-            metadata = f.metadata()
-        return feat, metadata
+        return _read_and_validate_feat(feat_path)
     
     def _get_label(self, sample_id: str) -> torch.Tensor:
         """Get label(s) for a sample based on task type."""
@@ -1088,6 +1195,18 @@ class MultiViewFeatClassificationDataset(Dataset):
                 assert all(seq_len == seq_lengths[0] for seq_len in seq_lengths), (
                     f"Sequence length mismatch across slice encoders for sample {sample_id}, view {view_plane}"
                 )
+                ranks = [feat.ndim for feat in feat_embeds]
+                assert all(rank == ranks[0] for rank in ranks), (
+                    f"Feature dimensions mismatch across slice encoders for sample {sample_id}, "
+                    f"view {view_plane}: {dict(zip(self.slice_encoder_models, ranks))}. "
+                    "Do not mix global-only and tiled multi-crop CLS caches."
+                )
+                if ranks[0] == 3:
+                    region_counts = [feat.shape[1] for feat in feat_embeds]
+                    assert all(count == region_counts[0] for count in region_counts), (
+                        f"Tiled region-count mismatch across slice encoders for sample {sample_id}, "
+                        f"view {view_plane}: {dict(zip(self.slice_encoder_models, region_counts))}."
+                    )
             
             features_by_view[view_plane] = feat_embeds
             seq_lengths_by_view[view_plane] = seq_lengths[0]

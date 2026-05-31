@@ -185,7 +185,7 @@ def main():
             output_dir = os.path.join(args.experiment_dir, f"fold_{args.fold}", "slice_attention")
         else:
             output_dir = os.path.join(args.experiment_dir, "slice_attention")
-        slice_pooling = args.slice_pooling  # Inferred by load_cobra_from_experiment
+        slice_pooling = args.slice_pooling or cobra_model.slice_pooling
         if not args.annotations_path:
             annotations_dir = exp_cfg.get("annotations_dir")
             if not annotations_dir:
@@ -219,7 +219,6 @@ def main():
         dataset_name = args.dataset_name
         output_dir = args.output_dir
         annotations_path = args.annotations_path
-        slice_pooling = args.slice_pooling or "abmil"
 
         # Load COBRA from pretrained checkpoint
         pretrain_config_path = Path(args.checkpoint_path).parent / "config.yaml"
@@ -236,10 +235,11 @@ def main():
             encoder_type="momentum",
             fm_pooling=args.fm_pooling or "avg_pool",
             sequence_encoder=args.sequence_encoder or "mamba2",
-            slice_pooling=slice_pooling,
+            slice_pooling=args.slice_pooling,
         )
         cobra_model = cobra_model.to(accelerator.device)
         cobra_model.eval()
+        slice_pooling = args.slice_pooling or cobra_model.slice_pooling
 
     # Validate: attention visualization requires ABMIL or cross_attention slice pooling
     if slice_pooling and slice_pooling not in ("abmil", "cross_attention"):
@@ -308,7 +308,7 @@ def main():
 
     # Extract per-head attention
     per_head_data = None
-    effective_slice_pooling = slice_pooling or "abmil"
+    effective_slice_pooling = slice_pooling
     if args.per_head and effective_slice_pooling == "abmil":
         per_head_data = get_volume_attention_per_head(
             cobra_model, dataloader, accelerator, max_samples=args.num_samples

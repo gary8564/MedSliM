@@ -36,7 +36,7 @@ def test_slice_encoder_from_hf_models(name, kwargs, input_shape, embed_dim):
     not os.path.exists(
         os.environ.get(
             "ARK_CHECKPOINT",
-            "/hpcwork/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar",
+            "/hpcwork/rwth1833/models/Ark6_swinLarge768_ep50.pth.tar",
         )
     ),
     reason="Ark checkpoint not on disk; set ARK_CHECKPOINT to run this test.",
@@ -44,7 +44,7 @@ def test_slice_encoder_from_hf_models(name, kwargs, input_shape, embed_dim):
 def test_ark_slice_encoder():
     ckpt = os.environ.get(
         "ARK_CHECKPOINT",
-        "/hpcwork/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar",
+        "/hpcwork/rwth1833/models/Ark6_swinLarge768_ep50.pth.tar",
     )
     model = build_slice_encoder("ark", checkpoint=ckpt, freeze=True)
     assert all(not p.requires_grad for p in model.parameters())

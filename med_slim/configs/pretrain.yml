@@ -65,13 +65,13 @@ model:
       image_mean: [0.485, 0.456, 0.406]
       image_std: [0.229, 0.224, 0.225]
       embed_dim: 1376
-      repo: "/hpcwork/rwth1833/models/ark/Ark+_Nature/Ark6_swinLarge768_ep50.pth.tar"
+      repo: "/hpcwork/rwth1833/models/Ark6_swinLarge768_ep50.pth.tar"
     - name: mri-core
       img_size: [224, 224]
       image_mean: [0.0, 0.0, 0.0]  # MRI-CORE uses per-slice min-max normalization internally
       image_std: [1.0, 1.0, 1.0]
       embed_dim: 768
-      repo: "/hpcwork/rwth1833/models/mri_core/mri_foundation.pth"
+      repo: "/hpcwork/rwth1833/models/mri_foundation.pth"
     - name: medimageinsight
       img_size: [480, 480]
       image_mean: [0.485, 0.456, 0.406]
@@ -103,6 +103,12 @@ model:
     # positions in mm. Essential for cross-domain pretraining where
     # slice spacings vary across anatomies and protocols.
     physical_pe: false
+    # Tiled multi-crop CLS (within-slice region aggregation). 
+    # 0 = original global-only CLS pathway.
+    # A positive perfect square (e.g. 4 for a 2x2 grid) collapses [B, D, 1+regional_tokens, E] region tokens to [B, D, E] before the
+    # sequence encoder. Requires tiled feature caches precomputed with the matching `--regional-tokens` flag.
+    regional_tokens: 0 # 0 = original global-only CLS pathway.
+    region_embedding: false  # learned region (quadrant) identity embedding
 
 train:
   momentum: 0.99

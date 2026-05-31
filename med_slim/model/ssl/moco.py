@@ -61,6 +61,8 @@ class MoCo(nn.Module):
         sequence_encoder: str = "mamba2",
         pooling: str = "abmil",
         physical_pe: bool = False,
+        regional_tokens: int = 0,
+        region_embedding: bool = False,
         msp_enabled: bool = False,
         msp_lambda_mask: float = 1.0,
         msp_lambda_ctx: float = 0.0,
@@ -128,6 +130,8 @@ class MoCo(nn.Module):
             sequence_encoder=sequence_encoder,
             slice_pooling=pooling,
             physical_pe=physical_pe,
+            regional_tokens=regional_tokens,
+            region_embedding=region_embedding,
             **kwargs,
         )
 
@@ -665,8 +669,10 @@ class MoCo(nn.Module):
         """        
         Args:
             x1: First view features
-                - Padded mode: [B, max_seq_len, feature_dim]
-                - Packed mode: [total_seq_len, feature_dim]
+                - Padded global-only mode: [B, max_seq_len, input_embed_dim]
+                - Padded tiled mode: [B, max_seq_len, num_tiled_regions, input_embed_dim]
+                - Packed global-only mode: [total_slices, input_embed_dim]
+                - Packed tiled mode: [total_slices, num_tiled_regions, input_embed_dim]
             x2: Second view features with same shape as x1.
             input_feature_dims_1: Original feature dims per-sample for x1 with shape [B].
             input_feature_dims_2: Original feature dims per-sample for x2 with shape [B].

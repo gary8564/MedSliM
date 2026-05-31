@@ -18,15 +18,21 @@ def _build_cobra(
     sequence_encoder: str,
     slice_pooling: str,
     fm_pooling: str,
-    pooling_target: str = "post_embed",
+    pooling_target: Optional[str] = None,
     raw_output_dim: Optional[int] = None,
     physical_pe: Optional[bool] = None,
+    regional_tokens: Optional[int] = None,
+    region_embedding: Optional[bool] = None,
 ) -> Cobra:
     """Construct a COBRA model in inference mode from model configuration."""
     embed_dim = model_config["embed_dim"]
     encoder_kwargs: Dict[str, Any] = {}
     if physical_pe is None:
         physical_pe = model_config.get("physical_pe", False)
+    if regional_tokens is None:
+        regional_tokens = model_config.get("regional_tokens", 0)
+    if region_embedding is None:
+        region_embedding = model_config.get("region_embedding", False)
 
     if sequence_encoder == "mamba2":
         encoder_kwargs["d_state"] = model_config.get("mamba_d_state", 128)
@@ -57,6 +63,8 @@ def _build_cobra(
         pooling_target=pooling_target,
         raw_output_dim=raw_output_dim,
         physical_pe=physical_pe,
+        regional_tokens=regional_tokens,
+        region_embedding=region_embedding,
         **encoder_kwargs,
     )
 
@@ -69,7 +77,7 @@ def load_pretrained_cobra(
     fm_pooling: str = "avg_pool",
     sequence_encoder: Optional[str] = None,
     slice_pooling: Optional[str] = None,
-    pooling_target: str = "post_embed",
+    pooling_target: Optional[str] = None,
     raw_output_dim: Optional[int] = None,
     physical_pe: Optional[bool] = None,
 ) -> Cobra:
@@ -84,7 +92,8 @@ def load_pretrained_cobra(
     - fm_pooling (str): Feature aggregation method. Default is "avg_pool".
     - sequence_encoder (str, optional): Override sequence encoder type. If None, uses checkpoint or defaults to "mamba2".
     - slice_pooling (str, optional): Override slice pooling type. If None, uses saved checkpoint.
-    - pooling_target (str): Which representation to pool at inference ('post_encoder', 'post_embed', 'raw').
+    - pooling_target (str, optional): Which representation to pool at inference ('post_encoder', 'post_embed', 'raw'). 
+     If None, Cobra resolves a safe default from mode and regional_tokens.
     - raw_output_dim (int, optional): FM embedding dimension, required when pooling_target='raw'.
 
     Returns:
@@ -104,9 +113,12 @@ def load_pretrained_cobra(
         slice_pooling = state_dict.get("pooling", "abmil")  # Default for older checkpoints
     if physical_pe is None:
         physical_pe = state_dict.get("physical_pe", model_config.get("physical_pe", False))
-    logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, pooling_target={pooling_target}, physical_pe={physical_pe}")
+    regional_tokens = state_dict.get("regional_tokens", model_config.get("regional_tokens", 0))
+    region_embedding = state_dict.get("region_embedding", model_config.get("region_embedding", False))
+    logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, pooling_target={pooling_target}, physical_pe={physical_pe}, regional_tokens={regional_tokens}")
     
-    model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target, raw_output_dim, physical_pe)
+    model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target, raw_output_dim, physical_pe, regional_tokens, region_embedding)
+    logger.info(f"Inference pooling_target={model.pooling_target}")
     
     # Extract encoder weights from checkpoint
     if "state_dict" not in list(state_dict.keys()):
@@ -127,10 +139,6 @@ def load_pretrained_cobra(
             # Remap legacy key names
             if has_legacy_mamba:
                 new_key = new_key.replace("mamba_enc", "seq_enc")
-            #TODO: remove this once all checkpoints are updated
-            # Skip removed varlen_seq_enc keys from old checkpoints
-            if "varlen_seq_enc" in new_key:
-                continue
             cobra_weights[new_key] = v
     
     if len(cobra_weights) == 0:
@@ -195,12 +203,64 @@ def load_cobra_from_experiment(
     has_fm_attn = any(k.startswith("cobra.fm_attn.") for k in raw.keys())
     fm_pooling = "attention" if has_fm_attn else "avg_pool"
     physical_pe = cobra_cfg.get("physical_pe", cfg.get("physical_pe", False))
+    pooling_target = cfg.get("pooling_target")
+    raw_output_dim = cfg.get("raw_output_dim")
+
+    # Tiled multi-crop CLS: detect within-slice aggregator from weight keys.
+    has_within_slice = any(k.startswith("cobra.within_slice_agg.") for k in raw.keys())
+    region_embed_key = "cobra.within_slice_agg.region_embed.weight"
+    has_region_embed = region_embed_key in raw
+    region_embedding = has_region_embed
+
+    regional_tokens = int(cobra_cfg.get("regional_tokens", cfg.get("regional_tokens", 0)))
+    if has_within_slice:
+        if regional_tokens == 0:
+            if has_region_embed:
+                regional_tokens = int(raw[region_embed_key].shape[0]) - 1
+                logger.warning(
+                    "regional_tokens is specified as global-only setting, " 
+                    "but the model checkpoint contains within_slice_agg weights."
+                    "Inferred regional_tokens=%s from within_slice_agg.region_embed weights",
+                    regional_tokens,
+                )
+            else:
+                raise ValueError(
+                    "classifier.pt contains within_slice_agg weights, but regional_tokens "
+                    "is missing from cobra_config. Re-run linear probing after setting "
+                    "regional_tokens in the saved experiment config."
+                )
+        elif has_region_embed:
+            inferred = int(raw[region_embed_key].shape[0]) - 1
+            if regional_tokens != inferred:
+                raise ValueError(
+                    f"regional_tokens={regional_tokens} in cobra_config conflicts with "
+                    f"region_embed weights implying regional_tokens={inferred}."
+                )
+    elif regional_tokens > 0:
+        raise ValueError(
+            f"cobra_config specifies regional_tokens={regional_tokens}, but classifier.pt "
+            "has no within_slice_agg weights."
+        )
 
     logger.info(
-        f"Loading COBRA from experiment: sequence_encoder={seq_enc}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, physical_pe={physical_pe}"
+        "Loading COBRA from experiment: "
+        f"sequence_encoder={seq_enc}, slice_pooling={slice_pooling}, "
+        f"fm_pooling={fm_pooling}, pooling_target={pooling_target}, "
+        f"physical_pe={physical_pe}, regional_tokens={regional_tokens}"
     )
 
-    model = _build_cobra(cobra_cfg, seq_enc, slice_pooling, fm_pooling, physical_pe=physical_pe)
+    model = _build_cobra(
+        cobra_cfg,
+        seq_enc,
+        slice_pooling,
+        fm_pooling,
+        pooling_target=pooling_target,
+        raw_output_dim=raw_output_dim,
+        physical_pe=physical_pe,
+        regional_tokens=regional_tokens,
+        region_embedding=region_embedding,
+    )
+    logger.info(f"Inference pooling_target={model.pooling_target}")
 
     # Extract cobra.* weights from classifier state dict
     cobra_weights = {

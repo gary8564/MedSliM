@@ -43,6 +43,7 @@ from med_slim.data.feat_dataset import (
     UnlabeledFeatDataset,
     linear_classifier_collate_fn,
 )
+from med_slim.model.sequence_encoder.cobra import _resolve_pooling_target
 from med_slim.eval.load_cobra import load_pretrained_cobra, load_cobra_from_experiment
 from med_slim.utils.viz.cluster import plot_embedding_clustering, compute_silhouette
 from med_slim.utils.label_metadata import (
@@ -202,9 +203,20 @@ def _run_multi_dataset(args, accelerator: Accelerator):
         with open(pretrain_config_path) as f:
             pretrain_cfg = yaml.safe_load(f)
         cobra_cfg = pretrain_cfg.get("model", {}).get("cobra", {})
+    pretrain_state = torch.load(args.checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint_slice_pooling = pretrain_state.get("pooling")
+    cobra_cfg["regional_tokens"] = int(
+        pretrain_state.get("regional_tokens", cobra_cfg.get("regional_tokens", 0))
+    )
 
+    resolved_pooling_target = _resolve_pooling_target(
+        mode="inference",
+        pooling_target=args.pooling_target,
+        regional_tokens=cobra_cfg.get("regional_tokens", 0),
+        slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
+    )
     raw_output_dim = None
-    if args.pooling_target == "raw":
+    if resolved_pooling_target == "raw":
         fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
         raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
 
@@ -214,9 +226,9 @@ def _run_multi_dataset(args, accelerator: Accelerator):
         model_config=cobra_cfg,
         encoder_type="momentum",
         fm_pooling=args.fm_pooling or "avg_pool",
-        sequence_encoder=args.sequence_encoder or "mamba2",
-        slice_pooling=args.slice_pooling or "abmil",
-        pooling_target=args.pooling_target,
+        sequence_encoder=args.sequence_encoder,
+        slice_pooling=args.slice_pooling,
+        pooling_target=resolved_pooling_target,
         raw_output_dim=raw_output_dim,
     )
     cobra_model = cobra_model.to(accelerator.device)
@@ -356,9 +368,20 @@ def _run_single_dataset(args, accelerator: Accelerator):
             with open(pretrain_config_path) as f:
                 pretrain_cfg = yaml.safe_load(f)
             cobra_cfg = pretrain_cfg.get("model", {}).get("cobra", {})
+        pretrain_state = torch.load(args.checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint_slice_pooling = pretrain_state.get("pooling")
+        cobra_cfg["regional_tokens"] = int(
+            pretrain_state.get("regional_tokens", cobra_cfg.get("regional_tokens", 0))
+        )
 
+        resolved_pooling_target = _resolve_pooling_target(
+            mode="inference",
+            pooling_target=args.pooling_target,
+            regional_tokens=cobra_cfg.get("regional_tokens", 0),
+            slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
+        )
         raw_output_dim = None
-        if args.pooling_target == "raw":
+        if resolved_pooling_target == "raw":
             fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
             raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
 
@@ -368,9 +391,9 @@ def _run_single_dataset(args, accelerator: Accelerator):
             model_config=cobra_cfg,
             encoder_type="momentum",
             fm_pooling=args.fm_pooling or "avg_pool",
-            sequence_encoder=args.sequence_encoder or "mamba2",
-            slice_pooling=args.slice_pooling or "abmil",
-            pooling_target=args.pooling_target,
+            sequence_encoder=args.sequence_encoder,
+            slice_pooling=args.slice_pooling,
+            pooling_target=resolved_pooling_target,
             raw_output_dim=raw_output_dim,
         )
         cobra_model = cobra_model.to(accelerator.device)
@@ -408,7 +431,6 @@ def _run_single_dataset(args, accelerator: Accelerator):
 
     vol_embeddings_list, vol_labels_list, vol_sample_ids = [], [], []
     slice_embeddings_list, slice_labels_list, slice_sample_ids = [], [], []
-
     for split in splits:
         dataset = FeatClassificationDataset(
             feat_dir=feat_dir,
@@ -595,10 +617,11 @@ def main():
     parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cross_attention", "cls"])
     parser.add_argument(
         "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"],
-        default="raw",
+        default=None,
         help="Which representation level ABMIL attention weights aggregate: "
-             "'post_encoder': encoder output, 'post_embed': after Embed MLP (default), "
-             "'raw': original FM patch embeddings."
+             "'post_encoder': encoder output, 'post_embed': after Embed MLP for global-only CLS; after within-slice aggregation for tiled multi-crop CLS. "
+             "'raw': original global-only FM embeddings. "
+             "If omitted, Cobra resolves to raw for global-only caches and post_embed for tiled caches."
     )
     parser.add_argument("--save-embeddings", action="store_true", help="Save embeddings to npz file")
     parser.add_argument("--method", type=str, default="umap", choices=["umap", "tsne"],
