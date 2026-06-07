@@ -57,9 +57,9 @@ If using mise:
 mise trust   # auto-activates .venv and loads .env
 ```
 
-> [!NOTE] Troubleshooting
->
-> **`causal-conv1d` / `mamba-ssm` / `flash-attn` build failures:** These packages compile CUDA kernels and require `nvcc`. Ensure CUDA is available and find the matching wheel for your setup at [mamba-ssm releases](https://github.com/state-spaces/mamba/releases) and [flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases/tag/v2.7.4.post1).
+>[!NOTE]
+>Troubleshooting
+>**`causal-conv1d` / `mamba-ssm` / `flash-attn` build failures:** These packages compile CUDA kernels and require `nvcc`. Ensure CUDA is available and find the matching wheel for your setup at [mamba-ssm releases](https://github.com/state-spaces/mamba/releases) and [flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases/tag/v2.7.4.post1).
 
 ## Architecture
 
