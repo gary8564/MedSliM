@@ -58,7 +58,9 @@ mise trust   # auto-activates .venv and loads .env
 ```
 
 >[!NOTE]
+>
 >Troubleshooting
+>
 >**`causal-conv1d` / `mamba-ssm` / `flash-attn` build failures:** These packages compile CUDA kernels and require `nvcc`. Ensure CUDA is available and find the matching wheel for your setup at [mamba-ssm releases](https://github.com/state-spaces/mamba/releases) and [flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases/tag/v2.7.4.post1).
 
 ## Architecture
@@ -132,12 +134,15 @@ accelerate launch --num_processes=1 --mixed_precision=bf16 \
 | `--curriculum`       | Load weights from `--resume` but reset optimizer/epoch |
 | `-c` / `--config`    | Config file path                                       |
 
-> [!NOTE]
-> Staging features to local SSD (recommended on HPC clusters):
-> Precomputed `.safetensors` feature files are read repeatedly across epochs. On HPC clusters where the parallel filesystem has high latency under concurrent load, staging these files to a local NVMe SSD before training significantly reduces I/O wait and compute waste.
+>[!NOTE]
+>
+>Staging features to local SSD (recommended on HPC clusters):
+>
+>Precomputed `.safetensors` feature files are read repeatedly across epochs. On HPC clusters where the parallel filesystem has high latency under concurrent load, staging these files to a local NVMe SSD before training significantly reduces I/O wait and compute waste.
 
-> [!NOTE]
-> Checkpoints are saved every 50 epochs to the path in `pretrain.yml`. Training is logged to [Weights & Biases](https://wandb.ai/).
+>[!NOTE]
+>
+>Checkpoints are saved every 50 epochs to the path in `pretrain.yml`. Training is logged to [Weights & Biases](https://wandb.ai/).
 
 ### Evaluation
 
