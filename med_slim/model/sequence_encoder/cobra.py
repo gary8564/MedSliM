@@ -16,11 +16,7 @@ from contextlib import contextmanager
 
 from .mamba2 import Mamba2Enc
 from .transformer import TransformerEncoderLayer, VarlenTransformerEncoder
-from med_slim.model.attention_pooling import (
-    BatchedABMIL,
-    InterSliceAggregator,
-    WithinSliceAggregator,
-)
+from med_slim.model.attention_pooling import BatchedABMIL
 from med_slim.logging.setup import init_logging
 
 init_logging()
@@ -37,10 +33,9 @@ def _resolve_pooling_target(
 ) -> Optional[str]:
     if mode not in ("train", "inference"):
         raise ValueError(f"Invalid mode '{mode}'. Must be 'train' or 'inference'.")
-    if slice_pooling not in ("abmil", "cross_attention", "cls"):
+    if slice_pooling not in ("abmil", "cls"):
         raise ValueError(
-            f"Invalid slice_pooling '{slice_pooling}'. Must be 'abmil', "
-            "'cross_attention', or 'cls'."
+            f"Invalid slice_pooling '{slice_pooling}'. Must be 'abmil' or 'cls'."
         )
     if pooling_target is not None and pooling_target not in POOLING_TARGETS:
         raise ValueError(
@@ -62,17 +57,6 @@ def _resolve_pooling_target(
     if resolved is None:
         resolved = (
             "raw" if slice_pooling == "abmil" and regional_tokens == 0 else "post_embed"
-        )
-    if regional_tokens > 0 and resolved == "raw":
-        raise ValueError(
-            "pooling_target='raw' is not supported with tiled multi-crop CLS "
-            "(regional_tokens > 0). Region tokens are collapsed to embed_dim by the "
-            "within-slice aggregator, so use pooling_target='post_encoder' or 'post_embed'."
-        )
-    if slice_pooling == "cross_attention" and resolved == "raw":
-        raise ValueError(
-            "pooling_target='raw' is only supported with slice_pooling='abmil'. "
-            f"Got slice_pooling='{slice_pooling}'."
         )
     return resolved
 
@@ -172,7 +156,7 @@ class Cobra(nn.Module):
             fm_pooling: 'avg_pool' or 'attention' in inference mode.
                 - 'avg_pool': Average pool embeddings across foundation models.
                 - 'attention': Learn attention weights to pool FM embeddings per slice (requires fine-tuning).
-            slice_pooling: 'abmil', 'cross_attention', or 'cls' (cls requires transformer).
+            slice_pooling: 'abmil' or 'cls' (cls requires transformer).
             pooling_target: Which representation level to aggregate at inference.
                 Ignored in training mode, where Cobra always pools post-encoder hidden
                 states for contrastive pretraining. When None, inference defaults are
@@ -180,10 +164,8 @@ class Cobra(nn.Module):
                 defaults). Meaning depends on ``slice_pooling``:
                 - 'abmil': attention weights come from encoder output; pooling_target
                   selects which features they aggregate ('raw', 'post_embed', or
-                  'post_encoder'). 'raw' requires global-only features (regional_tokens=0).
-                - 'cross_attention': attention is computed from encoder output; pooling_target
-                  selects value features ('post_encoder' = encoder states, 'post_embed' =
-                  pre-encoder slice features after within-slice aggregation for tiled inputs).
+                  'post_encoder'). For tiled features, 'raw' pools flattened global
+                  and regional FM tokens.
                 - 'cls': not applicable, volume embedding is always the
                   sequence-encoder CLS token. Resolved pooling_target is None
             raw_output_dim: FM embedding dimension for the 'raw' pooling target.
@@ -191,9 +173,9 @@ class Cobra(nn.Module):
             physical_pe: If True, add sinusoidal positional encoding based on physical slice positions (in mm) before the sequence encoder.
                 Requires ``physical_positions`` to be passed during forward.
             regional_tokens: Number of regional crop tokens per slice for tiled multi-crop CLS (e.g. 4 for a 2x2 grid). 0 (default) disables tiled
-                aggregation and keeps the global-only CLS pathway. When > 0, a WithinSliceAggregator collapses [B, num_slices, 1+regional_tokens, embed_dim] 
-                region tokens into [B, num_slices, embed_dim] before the sequence encoder.
-            region_embedding: If True (and regional_tokens > 0), add a small learned region embedding over the (global + regional) tokens so the aggregator can use quadrant identity.
+                mode and keeps the global-only CLS pathway. When > 0, [B, num_slices, 1+regional_tokens, embed_dim]
+                tokens are flattened to [B, num_slices*(1+regional_tokens), embed_dim] before the sequence encoder.
+            region_embedding: If True (and regional_tokens > 0), add a small learned region embedding over the (global + regional) tokens before flattening.
             **kwargs: Additional encoder-specific parameters:
                 - d_state: Mamba2 state dimension (default: 128)
                 - dim_feedforward: Transformer FFN dimension (default: 4*embed_dim)
@@ -210,8 +192,8 @@ class Cobra(nn.Module):
         assert sequence_encoder in ["mamba2", "transformer"]
         if mode == "inference":
             assert fm_pooling in ["avg_pool", "attention"], f"Invalid fm_pooling '{fm_pooling}'. Must be one of 'avg_pool', 'attention'."
-        assert slice_pooling in ["abmil", "cross_attention", "cls"], (
-            f"Invalid slice_pooling '{slice_pooling}'. Must be one of 'abmil', 'cross_attention', 'cls'."
+        assert slice_pooling in ["abmil", "cls"], (
+            f"Invalid slice_pooling '{slice_pooling}'. Must be one of 'abmil', 'cls'."
         )
         if slice_pooling == "cls" and sequence_encoder != "transformer":
                 raise ValueError(f"slice_pooling='cls' requires sequence_encoder='transformer'. Got {sequence_encoder}.")
@@ -224,7 +206,7 @@ class Cobra(nn.Module):
         if (
             mode == "inference"
             and resolved_pooling_target == "raw"
-            and slice_pooling not in ("cls", "cross_attention")
+            and slice_pooling != "cls"
             and raw_output_dim is None
         ):
             raise ValueError("raw_output_dim is required when pooling_target='raw' in inference mode.")
@@ -238,21 +220,13 @@ class Cobra(nn.Module):
         self.slice_pooling = slice_pooling
         self.physical_pe = physical_pe
 
-        # Tiled multi-crop CLS: within-slice region aggregation
+        # Tiled multi-crop CLS: keep global + regional tokens as sequence tokens.
         self.regional_tokens = regional_tokens
         self.region_embedding = region_embedding
-        self.within_slice_agg = None
-        # Cached global-to-region attention with shape [B, num_slices, 1, num_tiled_regions-1] in padded mode
-        # or [1, total_slices, 1, num_tiled_regions-1] in packed mode.
-        self.region_attention = None
+        self.region_embed = None
         if regional_tokens > 0:
             num_regions = 1 + regional_tokens  # global + regional crops
-            self.within_slice_agg = WithinSliceAggregator(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                dropout=dropout,
-                num_regions=num_regions if region_embedding else None,
-            )
+            self.region_embed = nn.Embedding(num_regions, embed_dim) if region_embedding else None
 
         self.embed = nn.ModuleDict({str(d): Embed(d, embed_dim) for d in input_dims})
         self.norm = nn.LayerNorm(embed_dim)
@@ -316,7 +290,6 @@ class Cobra(nn.Module):
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
 
         self.attn = None
-        self.cross_attn_pool = None
         if self.slice_pooling == "abmil":
             self.attn = nn.ModuleList([
                 BatchedABMIL(
@@ -328,12 +301,6 @@ class Cobra(nn.Module):
                 )
                 for _ in range(self.num_heads)
             ])
-        elif self.slice_pooling == "cross_attention":
-            self.cross_attn_pool = InterSliceAggregator(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                dropout=dropout,
-            )
         
         # FM attention pooling for inference mode
         # Learns to weight different foundation model embeddings at each slice position
@@ -578,9 +545,28 @@ class Cobra(nn.Module):
             "or [total_slices, num_tiled_regions, input_embed_dim] for tiled multi-crop CLS."
         )
 
-    def _collapse_tiled_regions(self, logits: torch.Tensor, *, packed: bool = False) -> torch.Tensor:
+    def _get_num_tiled_regions(self, x, *, packed: bool = False) -> int:
+        """Return number of tiled regions from the shape of the input tensor."""
+        if isinstance(x, list):
+            return x[0].shape[2] if x[0].dim() == 4 else 1
+        if packed:
+            return x.shape[1] if x.dim() == 3 else 1
+        return x.shape[2] if x.dim() == 4 else 1
+
+    def _add_region_embedding(self, logits: torch.Tensor) -> torch.Tensor:
+        """Add optional global/regional identity embeddings before flattening."""
+        if self.region_embed is None:
+            return logits
+        num_regions = logits.shape[-2]
+        region_ids = torch.arange(num_regions, device=logits.device)
+        view_shape = [1] * logits.dim()
+        view_shape[-2] = num_regions
+        view_shape[-1] = self.embed_dim
+        return logits + self.region_embed(region_ids).view(*view_shape)
+
+    def _flatten_tiled_regions(self, logits: torch.Tensor, *, packed: bool = False) -> torch.Tensor:
         """
-        Collapse tiled per-slice tokens to one representation per slice.
+        Flatten tiled per-slice tokens into the sequence dimension.
 
         Padded mode expects [B, num_slices, num_tiled_regions, embed_dim].
         Packed mode expects [total_slices, num_tiled_regions, embed_dim].
@@ -590,15 +576,15 @@ class Cobra(nn.Module):
         global_rank = 2 if packed else 3
 
         if logits.dim() == tiled_rank:
-            if self.within_slice_agg is None:
+            if self.regional_tokens <= 0:
                 shape_hint = (
                     "[total_slices, num_tiled_regions, embed_dim]"
                     if packed
                     else "[B, num_slices, num_tiled_regions, embed_dim]"
                 )
                 raise ValueError(
-                    f"Received tiled features {shape_hint} but the model was built without "
-                    "a within-slice aggregator. Set regional_tokens > 0 when constructing Cobra."
+                    f"Expected tiled features {shape_hint} but the model was built without "
+                    "tiled token support. Set regional_tokens > 0 when constructing Cobra."
                 )
 
             num_tiled_regions = logits.shape[1] if packed else logits.shape[2]
@@ -609,14 +595,13 @@ class Cobra(nn.Module):
                     f"(1 global + {self.regional_tokens} regional), got {num_tiled_regions}."
                 )
 
+            logits = self._add_region_embedding(logits)
             if packed:
-                collapsed, self.region_attention = self.within_slice_agg(logits.unsqueeze(0))
-                return collapsed.squeeze(0)
+                return logits.reshape(logits.shape[0] * num_tiled_regions, self.embed_dim)
 
-            logits, self.region_attention = self.within_slice_agg(logits)
-            return logits
+            return logits.reshape(logits.shape[0], logits.shape[1] * num_tiled_regions, self.embed_dim)
 
-        if self.within_slice_agg is not None and logits.dim() == global_rank:
+        if self.regional_tokens > 0 and logits.dim() == global_rank:
             raise ValueError(
                 "regional_tokens > 0 but received global-only features. Provide tiled "
                 "multi-crop CLS caches with shape "
@@ -625,6 +610,83 @@ class Cobra(nn.Module):
             )
 
         return logits
+
+    def _flatten_raw_tiled_regions(self, raw_x: torch.Tensor, *, packed: bool = False) -> torch.Tensor:
+        """Flatten raw tiled FM features to match ABMIL token attention length."""
+        if packed:
+            if raw_x.dim() == 3:
+                return raw_x.reshape(raw_x.shape[0] * raw_x.shape[1], raw_x.shape[2])
+            return raw_x
+        if raw_x.dim() == 4:
+            return raw_x.reshape(raw_x.shape[0], raw_x.shape[1] * raw_x.shape[2], raw_x.shape[3])
+        return raw_x
+
+    def _expand_seq_lengths_for_regions(
+        self,
+        seq_lengths: torch.Tensor | None,
+        num_regions: int,
+    ) -> torch.Tensor | None:
+        if seq_lengths is None or num_regions == 1:
+            return seq_lengths
+        return seq_lengths * num_regions
+
+    def _expand_positions_for_regions(
+        self,
+        physical_positions: torch.Tensor | None,
+        num_regions: int,
+        *,
+        dim: int,
+    ) -> torch.Tensor | None:
+        if physical_positions is None or num_regions == 1:
+            return physical_positions
+        return physical_positions.repeat_interleave(num_regions, dim=dim)
+
+    def _expand_mask_for_regions(
+        self,
+        mask: torch.Tensor | None,
+        num_regions: int,
+        *,
+        dim: int,
+    ) -> torch.Tensor | None:
+        if mask is None or num_regions == 1:
+            return mask
+        return mask.repeat_interleave(num_regions, dim=dim)
+
+    def _expand_packed_metadata_for_regions(
+        self,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        seq_idx: torch.Tensor | None,
+        physical_positions: torch.Tensor | None,
+        slice_mask: torch.Tensor | None,
+        num_regions: int,
+    ) -> tuple[
+        torch.Tensor,
+        int,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        if num_regions == 1:
+            return cu_seqlens, max_seqlen, seq_idx, physical_positions, slice_mask
+
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        token_lengths = lengths * num_regions
+        token_cu_seqlens = torch.zeros_like(cu_seqlens)
+        token_cu_seqlens[1:] = torch.cumsum(token_lengths, dim=0)
+
+        token_seq_idx = (
+            seq_idx.repeat_interleave(num_regions, dim=0)
+            if seq_idx is not None
+            else None
+        )
+        token_positions = self._expand_positions_for_regions(
+            physical_positions, num_regions, dim=0,
+        )
+        token_slice_mask = self._expand_mask_for_regions(
+            slice_mask, num_regions, dim=0,
+        )
+        return token_cu_seqlens, max_seqlen * num_regions, token_seq_idx, token_positions, token_slice_mask
 
     def _pool_fm_embeddings(
         self,
@@ -725,7 +787,7 @@ class Cobra(nn.Module):
         logits: torch.Tensor,
         seq_lengths: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Zero-padded slice positions before within-slice aggregation or the sequence encoder."""
+        """Zero padded slice or flattened slice-region token positions."""
         if seq_lengths is None:
             return logits
         max_len = logits.shape[1]
@@ -755,11 +817,11 @@ class Cobra(nn.Module):
         assert fm_embs.shape[0]==len(x), f"Expected length of input x {len(x)}, got {fm_embs.shape[0]}"
 
         if fm_embs.dim() == 5:
-            if self.within_slice_agg is None:
+            if self.regional_tokens <= 0:
                 raise ValueError(
                     "Received tiled inference features "
                     "[K, B, num_slices, num_tiled_regions, embed_dim] but the model "
-                    "was built without a within-slice aggregator. Set regional_tokens > 0."
+                    "was built without tiled token support. Set regional_tokens > 0."
                 )
 
             num_fms, batch_size, num_slices, num_tiled_regions, embed_dim = fm_embs.shape
@@ -774,36 +836,19 @@ class Cobra(nn.Module):
                 mask = self._build_mask(seq_lengths, num_slices)
                 fm_embs = fm_embs * mask.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
-            # Collapse regions independently for each FM, then pool the resulting
-            # per-FM slice representations. This keeps FM attention defined on
-            # comparable [B, num_slices, embed_dim] slice embeddings.
-            fm_slice_embs, per_fm_region_attention = self.within_slice_agg(
-                fm_embs.reshape(num_fms * batch_size, num_slices, num_tiled_regions, embed_dim)
-            )
-            fm_slice_embs = fm_slice_embs.reshape(num_fms, batch_size, num_slices, embed_dim)
-            per_fm_region_attention = per_fm_region_attention.reshape(
-                num_fms,
-                batch_size,
-                num_slices,
-                1,
-                num_tiled_regions - 1,
-            )
+            # Keep every global/regional token as part of the sequence, then pool
+            # across FMs at each flattened slice-region token.
+            fm_embs = self._add_region_embedding(fm_embs)
+            fm_tokens = fm_embs.reshape(num_fms, batch_size, num_slices * num_tiled_regions, embed_dim)
+            return self._pool_fm_embeddings(fm_tokens)
 
-            logits, fm_weights = self._pool_fm_embeddings(fm_slice_embs, return_weights=True)
-            self.region_attention = (
-                per_fm_region_attention.permute(1, 2, 0, 3, 4)
-                * fm_weights.unsqueeze(-1).unsqueeze(-1)
-            ).sum(dim=2)
-            return logits
-
-        if self.within_slice_agg is not None:
+        if self.regional_tokens > 0:
             raise ValueError(
                 "regional_tokens > 0 but received global-only inference features. "
                 "Provide tiled multi-crop CLS caches with shape "
                 "[B, num_slices, num_tiled_regions, input_embed_dim]."
             )
 
-        self.region_attention = None
         return self._pool_fm_embeddings(fm_embs)
 
     def _abmil_pooling(
@@ -843,40 +888,12 @@ class Cobra(nn.Module):
             A = self.attn[0](h, mask=mask) 
             A = torch.transpose(A, 2, 1) # [B, 1, num_slices]
         return A
-
-    def _cross_attention_pooling(
-        self,
-        h: torch.Tensor,
-        mask: torch.Tensor = None,
-        values: torch.Tensor = None,
-        return_attention: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply cross-attention slice pooling.
-
-        In pretraining, keys and values both come from the post-encoder hidden states h by default.
-        In inference mode, values are set to an earlier representation (e.g., post-embed features from multiple foundation models)
-        while attention scores are still computed from the post-encoder hidden states h (contextualized encoder states).
-        """
-        if values is None:
-            return self.cross_attn_pool(
-                h,
-                mask=mask,
-                return_attention=return_attention,
-            )
-
-        _, attn = self.cross_attn_pool(h, mask=mask, return_attention=True)
-        pooled = torch.bmm(attn, values).mean(dim=1)
-        if return_attention:
-            return pooled, attn
-        return pooled
     
     def _forward_packed(
         self, 
         x, 
         input_feature_dims: torch.Tensor = None,
         get_attention: bool = False,
-        get_region_attention: bool = False,
         return_slice_embeddings: bool = False,
         cu_seqlens: torch.Tensor = None,
         max_seqlen: int = None,
@@ -888,6 +905,7 @@ class Cobra(nn.Module):
     ) -> torch.Tensor:
         """Forward pass for packed/variable-length sequences."""
         batch_size = cu_seqlens.shape[0] - 1
+        num_regions = self._get_num_tiled_regions(x, packed=True)
         
         # Foundation model feature embedding
         if self.mode == "inference":
@@ -895,22 +913,18 @@ class Cobra(nn.Module):
         else:
             logits = self._embed_ssl_forward_packed(x, cu_seqlens, input_feature_dims)
 
-        logits = self._collapse_tiled_regions(logits, packed=True)
+        logits = self._flatten_tiled_regions(logits, packed=True)
+        cu_seqlens, max_seqlen, seq_idx, physical_positions, slice_mask = (
+            self._expand_packed_metadata_for_regions(
+                cu_seqlens,
+                max_seqlen,
+                seq_idx,
+                physical_positions,
+                slice_mask,
+                num_regions,
+            )
+        )
 
-        if get_region_attention:
-            if self.region_attention is None:
-                raise ValueError(
-                    "Region attention is only available for tiled multi-crop CLS models "
-                    "(regional_tokens > 0)."
-                )
-            return [
-                self.region_attention[
-                    0,
-                    int(cu_seqlens[i].item()):int(cu_seqlens[i + 1].item()),
-                ]
-                for i in range(batch_size)
-            ]
-        
         # Physical positional encoding (packed: positions is 1-D [total_seq_len])
         if self.physical_pe and physical_positions is not None:
             logits = self._apply_physical_pe(logits, physical_positions)
@@ -942,33 +956,6 @@ class Cobra(nn.Module):
         # Slice feature aggregation
         h_padded, mask = self._packed_to_padded(h, cu_seqlens, max_seqlen)
 
-        if self.slice_pooling == "cross_attention":
-            if get_attention:
-                _, attn = self._cross_attention_pooling(
-                    h_padded,
-                    mask=mask,
-                    return_attention=True,
-                )
-                return [
-                    attn[i, :, :int((cu_seqlens[i + 1] - cu_seqlens[i]).item())]
-                    for i in range(batch_size)
-                ]
-            if self.mode == "train" or self.pooling_target == "post_encoder":
-                pooled = self._cross_attention_pooling(h_padded, mask=mask)
-            elif self.pooling_target == "post_embed":
-                logits_padded, _ = self._packed_to_padded(logits, cu_seqlens, max_seqlen)
-                pooled = self._cross_attention_pooling(
-                    h_padded,
-                    mask=mask,
-                    values=logits_padded,
-                )
-            else:
-                raise ValueError(
-                    "slice_pooling='cross_attention' supports pooling_target "
-                    "'post_encoder' or 'post_embed'. Raw pooling is only supported by ABMIL."
-                )
-            return self.proj(pooled) if self.mode == "train" else pooled
-        
         # ABMIL path
         A = self._abmil_pooling(h_padded, mask)
         
@@ -989,6 +976,7 @@ class Cobra(nn.Module):
                 raw_x = x[0]
             else:
                 raw_x = x
+            raw_x = self._flatten_raw_tiled_regions(raw_x, packed=True)
             raw_padded, _ = self._packed_to_padded(raw_x, cu_seqlens, max_seqlen)
             return torch.bmm(A, raw_padded).squeeze(1)    # [B, raw_output_dim]
         else:  # post_embed
@@ -1003,7 +991,6 @@ class Cobra(nn.Module):
         get_attention=False, 
         get_per_head_attention=False,
         return_slice_embeddings=False,
-        get_region_attention=False,
         seq_lengths=None,
         slice_mask=None,
         mask_token=None,
@@ -1011,25 +998,24 @@ class Cobra(nn.Module):
         **_,
     ):
         """Forward pass main function."""
+        num_regions = self._get_num_tiled_regions(x, packed=False)
+
         # Foundation model feature embedding
         if self.mode == "inference":
             logits = self._embed_inference_forward(x, seq_lengths=seq_lengths)
         else:
             logits = self._embed_ssl_forward(x, input_feature_dims)
-
-        logits = self._zero_padded_slices(logits, seq_lengths)
+            logits = self._zero_padded_slices(logits, seq_lengths)
 
         if self.mode != "inference" or logits.dim() == 4:
-            logits = self._collapse_tiled_regions(logits, packed=False)
+            logits = self._flatten_tiled_regions(logits, packed=False)
 
-        # Region-level (within-slice) attention for quadrant interpretability.
-        if get_region_attention:
-            if self.region_attention is None:
-                raise ValueError(
-                    "Region attention is only available for tiled multi-crop CLS models "
-                    "(regional_tokens > 0)."
-                )
-            return self.region_attention  # [B, num_slices, 1, num_tiled_regions-1]
+        seq_lengths = self._expand_seq_lengths_for_regions(seq_lengths, num_regions)
+        physical_positions = self._expand_positions_for_regions(
+            physical_positions, num_regions, dim=1,
+        )
+        slice_mask = self._expand_mask_for_regions(slice_mask, num_regions, dim=1)
+        logits = self._zero_padded_slices(logits, seq_lengths)
 
         # Physical positional encoding (padded: positions is [B, num_slices])
         if self.physical_pe and physical_positions is not None:
@@ -1047,7 +1033,7 @@ class Cobra(nn.Module):
         mask = None
         if seq_lengths is not None:
             max_len = logits.shape[1]  
-            mask = self._build_mask(seq_lengths, max_len)  # [B, num_slices]
+            mask = self._build_mask(seq_lengths, max_len)  # [B, num_tokens]
 
         # Prepend CLS token for cls pooling
         if self.slice_pooling == "cls":
@@ -1070,11 +1056,11 @@ class Cobra(nn.Module):
             h = self.seq_enc(logits, src_key_padding_mask=src_key_padding_mask)
         h = self.norm(h)
 
-        # Return slice-level embeddings before aggregation
+        # Return token-level embeddings before aggregation
         if return_slice_embeddings:
             if self.slice_pooling == "cls":
                 return h[:, 1:, :]  # Remove CLS token
-            return h # [B, num_slices, embed_dim]
+            return h  # [B, num_tokens, embed_dim]
 
         # Slice feature aggregation
         # CLS token pooling
@@ -1082,26 +1068,6 @@ class Cobra(nn.Module):
             if get_attention or get_per_head_attention:
                 return self._extract_cls_attention(logits, mask, src_key_padding_mask)
             pooled = h[:, 0, :]
-            return self.proj(pooled) if self.mode == "train" else pooled
-
-        # Cross-attention pooling
-        if self.slice_pooling == "cross_attention":
-            if get_attention or get_per_head_attention:
-                _, attn = self._cross_attention_pooling(
-                    h,
-                    mask=mask,
-                    return_attention=True,
-                )
-                return attn  # [B, 1, num_slices]
-            if self.mode == "train" or self.pooling_target == "post_encoder":
-                pooled = self._cross_attention_pooling(h, mask=mask)
-            elif self.pooling_target == "post_embed":
-                pooled = self._cross_attention_pooling(h, mask=mask, values=logits)
-            else:
-                raise ValueError(
-                    "slice_pooling='cross_attention' supports pooling_target "
-                    "'post_encoder' or 'post_embed'. Raw pooling is only supported by ABMIL."
-                )
             return self.proj(pooled) if self.mode == "train" else pooled
 
         # ABMIL pooling
@@ -1126,6 +1092,7 @@ class Cobra(nn.Module):
                 raw_x = x[0]
             else:
                 raw_x = x
+            raw_x = self._flatten_raw_tiled_regions(raw_x, packed=False)
             return torch.bmm(A, raw_x).squeeze(1)  # [B, raw_output_dim]
         else:  # post_embed
             return torch.bmm(A, logits).squeeze(1)  # [B, embed_dim]
@@ -1138,7 +1105,6 @@ class Cobra(nn.Module):
         get_attention=False, 
         get_per_head_attention=False,
         return_slice_embeddings=False,
-        get_region_attention=False,
         use_packed: bool = False,
         slice_mask=None,
         mask_token=None,
@@ -1157,9 +1123,9 @@ class Cobra(nn.Module):
                 - Inference, global-only: List of K tensors, each [B, num_slices, input_embed_dim]
                 - Inference, tiled: List of K tensors, each [B, num_slices, num_tiled_regions, input_embed_dim]
             input_feature_dims: Feature dimensions per sample [B] (SSL mode).
-            get_attention: If True, return aggregated attention map [B, 1, num_slices].
-            get_per_head_attention: If True, return per-head attention [B, num_heads, num_slices] (ABMIL only).
-            return_slice_embeddings: If True, return slice-level embeddings [B, num_slices, embed_dim] before pooling.
+            get_attention: If True, return aggregated attention map [B, 1, num_tokens].
+            get_per_head_attention: If True, return per-head attention [B, num_heads, num_tokens] (ABMIL only).
+            return_slice_embeddings: If True, return token-level embeddings [B, num_tokens, embed_dim] before pooling.
             use_packed: If True, use packed sequence for variable sequence length handling.
             slice_mask: Optional boolean mask for MSP. True = masked.
                 - Padded mode: [B, num_slices]
@@ -1178,9 +1144,9 @@ class Cobra(nn.Module):
                     - seq_idx: Document index for each token [total_seq_len], int32
         
         Returns:
-            If get_attention=True: Attention map [B, 1, num_slices]
-            If get_per_head_attention=True: Per-head attention [B, num_heads, num_slices]
-            If return_slice_embeddings=True: Slice embeddings [B, num_slices, embed_dim]
+            If get_attention=True: Attention map [B, 1, num_tokens]
+            If get_per_head_attention=True: Per-head attention [B, num_heads, num_tokens]
+            If return_slice_embeddings=True: Token embeddings [B, num_tokens, embed_dim]
             Otherwise: Features [B, contrast_dim] (train) or [B, output_dim] (inference)
         """
         if use_packed:
@@ -1190,7 +1156,6 @@ class Cobra(nn.Module):
                 x,
                 input_feature_dims=input_feature_dims,
                 get_attention=get_attention,
-                get_region_attention=get_region_attention,
                 return_slice_embeddings=return_slice_embeddings,
                 slice_mask=slice_mask,
                 mask_token=mask_token,
@@ -1204,7 +1169,6 @@ class Cobra(nn.Module):
                 get_attention=get_attention,
                 get_per_head_attention=get_per_head_attention,
                 return_slice_embeddings=return_slice_embeddings,
-                get_region_attention=get_region_attention,
                 slice_mask=slice_mask,
                 mask_token=mask_token,
                 physical_positions=physical_positions,

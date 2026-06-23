@@ -5,7 +5,7 @@ Adapted from COBRA (https://github.com/KatherLab/COBRA/blob/main/cobra/inference
 ==================================================================================================
 COBRA (Histopathology):                         MedSliM (MRI/CT):
   tiles                                         slices
-    ↓ ABMIL                                        ↓ ABMIL / cross-attention
+    ↓ ABMIL                                        ↓ ABMIL
   slide embedding                               volume embedding (per view plane / MRI sequence)
     ↓ concat + ABMIL                               ↓ logistic regression classifier
   patient embedding                             patient embedding (multi-view plane / MRI sequence)
@@ -25,6 +25,28 @@ from typing import Tuple, List, Optional
 from tqdm import tqdm
 
 from med_slim.model.sequence_encoder.cobra import Cobra
+
+
+def _num_regions_from_features(features: List[torch.Tensor]) -> int:
+    """Return number of tiled regions, or 1 for global-only feature tensors."""
+    first = features[0]
+    return first.shape[2] if first.dim() == 4 else 1
+
+
+def _sum_region_attention_to_slices(
+    attention: torch.Tensor,
+    num_regions: int,
+) -> torch.Tensor:
+    """Convert ABMIL token attention [B, H, S*R] to slice attention [B, H, S]."""
+    if num_regions == 1:
+        return attention
+    batch_size, num_heads, total_tokens = attention.shape
+    if total_tokens % num_regions != 0:
+        raise ValueError(
+            f"Attention length {total_tokens} is not divisible by num_regions={num_regions}."
+        )
+    num_slices = total_tokens // num_regions
+    return attention.view(batch_size, num_heads, num_slices, num_regions).sum(dim=-1)
 
 
 def get_volume_feats(
@@ -163,8 +185,6 @@ def get_volume_attention(
     """
     Extract slice-level attention weights using pretrained COBRA model.
     
-    Supports both ABMIL and cross-attention slice pooling modes.
-
     Args:
         cobra_model: Pretrained COBRA model in inference mode
         dataloader: DataLoader yielding batches of slice features
@@ -193,6 +213,7 @@ def get_volume_attention(
                 physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
             features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype) 
                        for f in batch["features"]]
+            num_regions = _num_regions_from_features(features)
             
             # Get per-head attention and aggregate with min across heads.
             # Min-attention is standard in medical imaging explainability
@@ -204,6 +225,7 @@ def get_volume_attention(
                 get_per_head_attention=True,
             )
             # attention shape: [B, num_heads, max_seq_len]
+            attention = _sum_region_attention_to_slices(attention, num_regions)
             attention = attention.min(dim=1).values  # [B, max_seq_len]
             attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             attention = attention.cpu().numpy()
@@ -235,12 +257,11 @@ def get_volume_region_attention(
     max_samples: Optional[int] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[str], List[int]]:
     """
-    Extract within-slice region attention weights from a tiled multi-crop CLS COBRA model.
+    Extract ABMIL token attention reshaped as slice-region weights from a tiled model.
 
-    For each slice, the global CLS token attends over the regional crop tokens; the
-    resulting distribution shows which quadrant the model focused on per slice. This is
-    complementary to the slice-level attention from ``get_volume_attention`` and should
-    always be interpreted alongside it (a region can dominate a slice the volume ignores).
+    Tiled COBRA now flattens global/regional tokens into the sequence, so there is no
+    separate within-slice attention distribution. This helper reports the final ABMIL
+    attention over each slice-region token.
 
     Args:
         cobra_model: Pretrained COBRA model built with regional_tokens > 0.
@@ -250,7 +271,7 @@ def get_volume_region_attention(
         max_samples: Maximum number of samples to process (None = all).
 
     Returns:
-        region_attention: List of arrays [num_slices, num_tiled_regions-1] per sample.
+        region_attention: List of arrays [num_slices, num_tiled_regions] per sample.
         labels: List of label arrays per sample.
         sample_ids: List of sample IDs.
         seq_lengths: List of sequence lengths.
@@ -271,20 +292,31 @@ def get_volume_region_attention(
             features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype)
                         for f in batch["features"]]
 
-            region_attn = cobra_model(
+            num_regions = _num_regions_from_features(features)
+            if num_regions == 1:
+                raise ValueError("Region attention requires tiled multi-crop CLS features.")
+
+            token_attn = cobra_model(
                 features,
                 seq_lengths=seq_lengths,
                 physical_positions=physical_positions,
-                get_region_attention=True,
-            )  # [B, num_slices, 1, num_tiled_regions-1]
-            region_attn = region_attn.squeeze(2).cpu().numpy()  # [B, num_slices, num_tiled_regions-1]
+                get_per_head_attention=True,
+            )  # [B, num_heads, max_seq_len * num_tiled_regions]
+            token_attn = token_attn.min(dim=1).values
+            token_attn = token_attn / token_attn.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            batch_size, total_tokens = token_attn.shape
+            if total_tokens % num_regions != 0:
+                raise ValueError(
+                    f"Attention length {total_tokens} is not divisible by num_regions={num_regions}."
+                )
+            region_attn = token_attn.view(batch_size, total_tokens // num_regions, num_regions).cpu().numpy()
 
             batch_size = region_attn.shape[0]
             for i in range(batch_size):
                 if max_samples and sample_count >= max_samples:
                     break
                 seq_len = seq_lengths[i].item()
-                all_attention.append(region_attn[i, :seq_len])  # [seq_len, num_tiled_regions-1]
+                all_attention.append(region_attn[i, :seq_len])  # [seq_len, num_tiled_regions]
                 all_labels.append(batch["labels"][i].cpu().numpy())
                 all_sample_ids.append(batch["sample_ids"][i])
                 all_seq_lengths.append(seq_len)
@@ -335,6 +367,7 @@ def get_volume_attention_per_head(
                 physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
             features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype)
                        for f in batch["features"]]
+            num_regions = _num_regions_from_features(features)
 
             attention = cobra_model(
                 features,
@@ -343,6 +376,7 @@ def get_volume_attention_per_head(
                 get_per_head_attention=True,
             )
             # attention shape: [B, num_heads, max_seq_len]
+            attention = _sum_region_attention_to_slices(attention, num_regions)
             attention = attention.cpu().numpy()
             num_heads = attention.shape[1]
 

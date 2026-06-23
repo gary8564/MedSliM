@@ -65,64 +65,20 @@ def test_moco_transformer_forward_loss():
     assert torch.isfinite(loss).all()
 
 
-def test_moco_cross_attention_forward_loss():
-    """Test MoCo with mamba2 encoder and cross-attention pooling."""
-    batch_size = 4
-    num_slices = 12
-    input_dim = 768
-    embed_dim = 768
-    contrast_dim = 128
-
-    model = MoCo(
-        embed_dim=embed_dim,
-        contrast_dim=contrast_dim,
-        input_dims=[768],
-        num_heads=4,
-        num_layers=1,
-        T=0.2,
-        dropout=0.0,
-        pooling="cross_attention",
-        d_state=32,
-    ).to(DEVICE).eval()
-
-    x1 = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
-    x2 = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
-    with torch.no_grad():
-        loss = model(x1, x2, input_feature_dims_1=None, input_feature_dims_2=None, m=0.99)
-    assert isinstance(loss, torch.Tensor)
-    assert loss.ndim == 0
-    assert torch.isfinite(loss).all()
-
-
-def test_moco_cross_attention_backward():
-    """Test that gradients flow through cross-attention pooling in MoCo training."""
-    batch_size = 4
-    num_slices = 8
-    input_dim = 256
-
-    model = MoCo(
-        embed_dim=input_dim,
-        contrast_dim=64,
-        input_dims=[input_dim],
-        num_heads=4,
-        num_layers=1,
-        T=0.2,
-        dropout=0.0,
-        pooling="cross_attention",
-        d_state=32,
-    ).to(DEVICE)
-    model.train()
-
-    x1 = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
-    x2 = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
-
-    loss = model(x1, x2, m=0.99)
-    loss.backward()
-
-    for name, param in model.base_encoder.named_parameters():
-        if param.requires_grad:
-            assert param.grad is not None, f"No gradient for {name}"
-            break
+def test_moco_rejects_cross_attention_pooling():
+    """Cross-attention pooling was removed from the MedSliM SSL pipeline."""
+    with pytest.raises(AssertionError, match="Invalid slice_pooling"):
+        MoCo(
+            embed_dim=768,
+            contrast_dim=128,
+            input_dims=[768],
+            num_heads=4,
+            num_layers=1,
+            T=0.2,
+            dropout=0.0,
+            pooling="cross_attention",
+            d_state=32,
+        )
 
 
 # Semi-supervised contrastive learning tests

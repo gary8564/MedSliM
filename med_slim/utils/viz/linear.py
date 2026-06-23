@@ -16,11 +16,67 @@ init_logging()
 logger = logging.getLogger(__name__)
 
 
+def compute_youden_thresholds(
+    y_true: np.ndarray,
+    y_pred_prob: np.ndarray,
+    task: str,
+    default_threshold: float = 0.5,
+) -> Optional[np.ndarray | float]:
+    """
+    Compute binary decision threshold(s) from validation predictions using Youden's J.
+
+    Returns a scalar for binary tasks, one threshold per label/class for multilabel
+    and multiclass one-vs-rest diagnostics, and `None` for unsupported tasks.
+    If a validation target has only one class present, falls back to `default_threshold` because ROC thresholds are not identifiable.
+    """
+    if task == "binary":
+        y_true_bin = np.asarray(y_true).reshape(-1)
+        y_prob = np.asarray(y_pred_prob).reshape(-1)
+        if np.unique(y_true_bin).size < 2:
+            raise ValueError(
+                "Validation set must contain both classes to compute a val-derived threshold."
+            )
+        fprs, tprs, thresholds = roc_curve(y_true_bin, y_prob)
+        return float(thresholds[np.argmax(tprs - fprs)])
+
+    elif task == "multilabel":
+        y_true_arr = np.asarray(y_true)
+        y_prob_arr = np.asarray(y_pred_prob)
+        thresholds = []
+        for i in range(y_prob_arr.shape[1]):
+            y_true_label = y_true_arr[:, i]
+            if np.unique(y_true_label).size < 2:
+                raise ValueError(
+                    "Validation set must contain both classes to compute a val-derived threshold."
+                )
+            fprs, tprs, thr = roc_curve(y_true_label, y_prob_arr[:, i])
+            thresholds.append(float(thr[np.argmax(tprs - fprs)]))
+        return np.asarray(thresholds, dtype=float)
+
+    elif task == "multiclass":
+        y_true_arr = np.asarray(y_true).reshape(-1)
+        y_prob_arr = np.asarray(y_pred_prob)
+        thresholds = []
+        for i in range(y_prob_arr.shape[1]):
+            y_true_binary = (y_true_arr == i).astype(int)
+            if np.unique(y_true_binary).size < 2:
+                raise ValueError(
+                    "Validation set must contain both classes to compute a val-derived threshold."
+                )
+            fprs, tprs, thr = roc_curve(y_true_binary, y_prob_arr[:, i])
+            thresholds.append(float(thr[np.argmax(tprs - fprs)]))
+        return np.asarray(thresholds, dtype=float)
+
+    else:
+        raise ValueError(f"Unsupported task type: {task}. Must be one of ['binary', 'multiclass', 'multilabel']")
+
+
 def visualize_binary_metrics(
     y_true: np.ndarray,
     y_pred_prob: np.ndarray,
     output_dir: str,
-    label: Optional[str] = None
+    label: Optional[str] = None,
+    threshold: Optional[float] = None,
 ) -> Tuple[float, float]:
     """
     Generate ROC curve, PR curve, and confusion matrix plots for binary classification.
@@ -48,7 +104,7 @@ def visualize_binary_metrics(
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
-    # ------------------------------- AUPRC ---------------------------------
+    #  AUPRC
     precision, recall, _ = precision_recall_curve(y_true, y_pred_prob)
     auprc = auc(recall, precision)
 
@@ -81,12 +137,15 @@ def visualize_binary_metrics(
     fig.savefig(os.path.join(output_dir, f"roc{filename}.png"), dpi=300)
     plt.close(fig)
 
-    # -------------------------- Confusion Matrix -------------------------
-    # Youden’s J to pick a threshold
-    youden = tprs - fprs
-    best_idx = youden.argmax()
-    best_thr = thresholds[best_idx]
-    logger.info(f"Best threshold: {best_thr:.3f}")
+    # Confusion Matrix: use validation-derived threshold if provided
+    if threshold is None:
+        youden = tprs - fprs
+        best_idx = youden.argmax()
+        best_thr = thresholds[best_idx]
+        logger.info(f"Best threshold from current split: {best_thr:.3f}")
+    else:
+        best_thr = float(threshold)
+        logger.info(f"Using validation-derived threshold: {best_thr:.3f}")
     y_pred = (y_pred_prob >= best_thr).astype(int)
     cm = confusion_matrix(y_true, y_pred)
     acc = accuracy_score(y_true, y_pred)
@@ -121,6 +180,7 @@ def visualize_multilabel_metrics(
     y_pred_prob: np.ndarray,
     class_labels: List[str],
     output_dir: str,
+    thresholds: Optional[np.ndarray] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
     Generate plots for multilabel classification.
@@ -159,6 +219,7 @@ def visualize_multilabel_metrics(
             y_pred_prob[:, i],
             output_dir,
             label=cls,
+            threshold=None if thresholds is None else float(thresholds[i]),
         )
 
         # Store ROC curve data for combined plot
@@ -236,6 +297,7 @@ def visualize_multiclass_metrics(
     y_pred_prob: np.ndarray,
     class_labels: List[str],
     output_dir: str,
+    thresholds: Optional[np.ndarray] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
     Generate plots for multiclass classification:
@@ -298,6 +360,7 @@ def visualize_multiclass_metrics(
             y_pred_binary_prob,
             output_dir,
             label=cls,
+            threshold=None if thresholds is None else float(thresholds[i]),
         )
 
         # Store ROC curve data for combined plot
@@ -379,6 +442,7 @@ def compute_and_visualize_metrics(
     task: str,
     class_labels: List[str],
     output_dir: str,
+    thresholds: Optional[np.ndarray | float] = None,
 ) -> Dict:
     """
     Main entry point for computing and visualizing classification metrics.
@@ -402,25 +466,43 @@ def compute_and_visualize_metrics(
             y_true,
             y_pred_prob,
             output_dir,
-            label=label
+            label=label,
+            threshold=None if thresholds is None else float(thresholds),
         )
-        return {
+        metrics = {
             "AUROC": float(roc_auc),
             "AUPRC": float(auprc)
         }
+        if thresholds is not None:
+            metrics["decision_threshold"] = float(thresholds)
+        return metrics
     elif task == "multilabel":
-        return visualize_multilabel_metrics(
+        metrics = visualize_multilabel_metrics(
             y_true,
             y_pred_prob,
             class_labels,
             output_dir,
+            thresholds=None if thresholds is None else np.asarray(thresholds),
         )
+        if thresholds is not None:
+            metrics["decision_thresholds"] = {
+                class_labels[i]: float(thr)
+                for i, thr in enumerate(np.asarray(thresholds))
+            }
+        return metrics
     elif task == "multiclass":
-        return visualize_multiclass_metrics(
+        metrics = visualize_multiclass_metrics(
             y_true,
             y_pred_prob,
             class_labels,
             output_dir,
+            thresholds=None if thresholds is None else np.asarray(thresholds),
         )
+        if thresholds is not None:
+            metrics["ovr_decision_thresholds"] = {
+                class_labels[i]: float(thr)
+                for i, thr in enumerate(np.asarray(thresholds))
+            }
+        return metrics
     else:
         raise ValueError(f"Unsupported task type: {task}. Must be one of ['binary', 'multiclass', 'multilabel']")

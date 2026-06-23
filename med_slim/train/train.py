@@ -31,10 +31,78 @@ from med_slim.data.feat_dataset import ssl_packed_collate_fn
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 
 
+def _build_wandb_name(feat_dataset_cfg: dict) -> str:
+    datasets = feat_dataset_cfg.get("datasets") or []
+    names = [
+        str(ds["name"]).strip()
+        for ds in datasets
+        if isinstance(ds, dict) and ds.get("name")
+    ]
+    return "-".join(names) if names else "unknown"
+
+
+def _apply_cli_overrides(cfg: dict, args) -> None:
+    """Override CLI flags into cfg so that the saved config.yaml matches the actual run."""
+    feat_cfg = cfg.setdefault("feat_dataset", {})
+    cobra_cfg = cfg.setdefault("model", {}).setdefault("cobra", {})
+    msp_cfg = cfg.setdefault("msp", {})
+
+    if args.model_names:
+        fm_choices = {m["name"]: m["embed_dim"] for m in cfg["model"]["slice_encoder_models"]}
+        unknown = [m for m in args.model_names if m not in fm_choices]
+        if unknown:
+            raise ValueError(f"Unknown model name(s) {unknown}. Known: {list(fm_choices.keys())}")
+        feat_cfg["model_name"] = args.model_names
+        cobra_cfg["input_dims"] = sorted(set(fm_choices[m] for m in args.model_names))
+
+    if args.planes:
+        feat_cfg["plane"] = args.planes
+
+    if args.use_packed:
+        feat_cfg["use_packed"] = True
+
+    if args.msp:
+        msp_cfg["enabled"] = True
+    if args.msp_lambda_mask is not None:
+        msp_cfg["lambda_mask"] = args.msp_lambda_mask
+    if args.msp_lambda_ctx is not None:
+        msp_cfg["lambda_ctx"] = args.msp_lambda_ctx
+    if args.msp_mask_ratio is not None:
+        msp_cfg["mask_ratio"] = list(args.msp_mask_ratio)
+
+    cobra_cfg["pooling"] = args.pooling
+    cobra_cfg["sequence_encoder"] = args.sequence_encoder
+    if args.regional_tokens is not None:
+        cobra_cfg["regional_tokens"] = args.regional_tokens
+    cobra_cfg["region_embedding"] = bool(
+        args.region_embedding or cobra_cfg.get("region_embedding", False)
+    )
+    cobra_cfg["physical_pe"] = bool(
+        args.physical_pe or cobra_cfg.get("physical_pe", False)
+    )
+    
+
+def _build_pretrain_run_name(cfg: dict, timestamp: str = CURR_TIME) -> str:
+    """Compose the wandb run name from resolved config."""
+    cobra_cfg = cfg["model"]["cobra"]
+    msp_tag = "-msp" if cfg.get("msp", {}).get("enabled", False) else ""
+    datasets = cfg.get("feat_dataset", {}).get("datasets") or []
+    names = [
+        str(ds["name"]).strip()
+        for ds in datasets
+        if isinstance(ds, dict) and ds.get("name")
+    ]
+    dataset_tag = "-".join(names) if names else "unknown"
+    return (
+        f"{dataset_tag}-{cobra_cfg['sequence_encoder']}-{cobra_cfg['pooling']}"
+        f"{msp_tag}-{timestamp}"
+    )
+
+
 def validate_args(args) -> None:
     """Validate arguments parser."""
     valid_encoders = ["mamba2", "transformer"]
-    valid_poolings = ["abmil", "cross_attention", "cls"]
+    valid_poolings = ["abmil", "cls"]
     
     if args.sequence_encoder not in valid_encoders:
         raise ValueError(f"Invalid sequence_encoder '{args.sequence_encoder}'. Must be one of {valid_encoders}")
@@ -64,24 +132,17 @@ def main(args, cfg):
 
     # Initialize Weights & Biases on main process
     if accelerator.is_main_process:
-        msp_tag = "-msp" if cfg.get("msp", {}).get("enabled", False) else ""
-        run_name = f"MRNet-fastMRI-KMAR50K-{args.sequence_encoder}-{args.pooling}{msp_tag}-{CURR_TIME}"
         wandb.init(
             project="MedSliM-pretraining",
-            name=run_name,
+            name=_build_pretrain_run_name(cfg),
         )
 
-    # Validate encoder/pooling combination
-    sequence_encoder = args.sequence_encoder
-    pooling = args.pooling
     cobra_cfg = cfg["model"]["cobra"]
-    physical_pe = getattr(args, "physical_pe", False) or cobra_cfg.get("physical_pe", False)
-
-    # Tiled multi-crop CLS (within-slice region aggregation)
-    regional_tokens = getattr(args, "regional_tokens", None)
-    if regional_tokens is None:
-        regional_tokens = cobra_cfg.get("regional_tokens", 0)
-    region_embedding = getattr(args, "region_embedding", False) or cobra_cfg.get("region_embedding", False)
+    sequence_encoder = cobra_cfg["sequence_encoder"]
+    pooling = cobra_cfg["pooling"]
+    physical_pe = cobra_cfg.get("physical_pe", False)
+    regional_tokens = cobra_cfg.get("regional_tokens", 0)
+    region_embedding = cobra_cfg.get("region_embedding", False)
     
     # Build encoder-specific kwargs
     encoder_kwargs = {}
@@ -93,7 +154,7 @@ def main(args, cfg):
         encoder_kwargs["norm_first"] = cobra_cfg.get("transformer_norm_first", True)
         encoder_kwargs["dim_feedforward"] = cobra_cfg.get("transformer_dim_feedforward", 4 * cobra_cfg["embed_dim"])
     
-    if pooling in ("abmil", "cross_attention"):
+    if pooling == "abmil":
         encoder_kwargs["att_dim"] = cobra_cfg.get("attn_dim", 256)
     
     # MSP (Masked Slice Prediction) config
@@ -163,7 +224,7 @@ def main(args, cfg):
         print(f"Using local SSD feature cache: {local_base}")
     slice_encoder_models = feat_cfg["model_name"]
     view_planes = feat_cfg["plane"]
-    use_packed = getattr(args, "use_packed", False)
+    use_packed = feat_cfg.get("use_packed", False)
     num_target_slices = feat_cfg.get("num_target_slices", 32)
     if use_packed:
         print("Packed mode: using raw variable-length sequences (no subsampling / zero-padding)")
@@ -465,9 +526,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pooling",
         type=str,
-        choices=["abmil", "cross_attention", "cls"],
+        choices=["abmil", "cls"],
         default="abmil",
-        help="Pooling method: 'abmil' (default), 'cross_attention', or 'cls'. Note: 'cls' requires transformer encoder.",
+        help="Slice pooling method: 'abmil' (default) or 'cls'. Note: 'cls' requires transformer encoder.",
     )
     parser.add_argument(
         "--physical-pe",
@@ -512,8 +573,8 @@ if __name__ == "__main__":
         "--region-embedding",
         action="store_true",
         help=(
-            "Add a learned region embedding over (global + regional) tokens in the "
-            "within-slice aggregator so quadrant identity can be used."
+            "Add a learned region embedding over flattened global + regional "
+            "tokens so quadrant identity can be used."
         ),
     )
     # MSP (Masked Slice Prediction) arguments
@@ -565,34 +626,7 @@ if __name__ == "__main__":
     # Render the template with the values from the config_data
     cfg = yaml.safe_load(template.render(**cfg_data))
     
-    # CLI overrides
-    if args.model_names:
-        fm_choices = {m["name"]: m["embed_dim"] for m in cfg["model"]["slice_encoder_models"]}
-        unknown = [m for m in args.model_names if m not in fm_choices]
-        if unknown:
-            raise ValueError(f"Unknown model name(s) {unknown}. Known: {list(fm_choices.keys())}")
-        cfg["feat_dataset"]["model_name"] = args.model_names
-        cfg["model"]["cobra"]["input_dims"] = sorted(set(fm_choices[m] for m in args.model_names))
-        print(f"CLI override: model_names={args.model_names}, input_dims={cfg['model']['cobra']['input_dims']}")
-    
-    if args.planes:
-        cfg["feat_dataset"]["plane"] = args.planes
-        print(f"CLI override: planes={args.planes}")
-    
-    if "msp" not in cfg:
-        cfg["msp"] = {}
-    if args.msp:
-        cfg["msp"]["enabled"] = True
-        print("CLI override: MSP enabled")
-    if args.msp_lambda_mask is not None:
-        cfg["msp"]["lambda_mask"] = args.msp_lambda_mask
-        print(f"CLI override: msp.lambda_mask={args.msp_lambda_mask}")
-    if args.msp_lambda_ctx is not None:
-        cfg["msp"]["lambda_ctx"] = args.msp_lambda_ctx
-        print(f"CLI override: msp.lambda_ctx={args.msp_lambda_ctx}")
-    if args.msp_mask_ratio is not None:
-        cfg["msp"]["mask_ratio"] = args.msp_mask_ratio
-        print(f"CLI override: msp.mask_ratio={args.msp_mask_ratio}")
+    _apply_cli_overrides(cfg, args)
 
     # Cross-FM contrastive learning requires at least 2 foundation models
     if len(cfg["feat_dataset"]["model_name"]) < 2:

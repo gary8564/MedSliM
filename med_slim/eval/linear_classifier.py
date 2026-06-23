@@ -18,6 +18,7 @@ import yaml
 import json
 import logging
 import pickle
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -46,7 +47,7 @@ from med_slim.data.feat_dataset import (
 from med_slim.eval.load_cobra import _build_cobra, load_pretrained_cobra
 from med_slim.utils.callbacks.early_stopping import EarlyStopping
 from med_slim.utils.metrics.linear import get_loss_criterion, get_eval_metrics, get_num_classes, compute_class_weights_for_weighted_loss
-from med_slim.utils.viz.linear import compute_and_visualize_metrics
+from med_slim.utils.viz.linear import compute_and_visualize_metrics, compute_youden_thresholds
 from med_slim.utils.label_metadata import get_dataset_metadata, get_annotation_paths_by_split, build_multiclass_label_names
 from codecarbon import EmissionsTracker
 from med_slim.logging.setup import init_logging
@@ -56,6 +57,174 @@ logger = logging.getLogger(__name__)
 
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 JOB_ID = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+
+
+# =============================================================================
+# Few-shot subsampling, seeding, and subset-aware class weights
+# =============================================================================
+def set_global_seed(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs for a single repeat."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _labels_for_indices(dataset, indices, task: str) -> np.ndarray:
+    sample_ids = dataset.sample_ids
+    return np.array([
+        dataset._get_label(sample_ids[int(i)]).numpy() for i in indices
+    ])
+
+
+def _label_positive_counts(labels: np.ndarray, task: str, target_labels: List[str]) -> Dict[str, int]:
+    """Per-label positive counts for binary/multilabel, or per-class counts for multiclass."""
+    counts: Dict[str, int] = {}
+    if task == "multiclass":
+        classes, class_counts = np.unique(labels, return_counts=True)
+        for cls, cnt in zip(classes.tolist(), class_counts.tolist()):
+            counts[f"class_{int(cls)}"] = int(cnt)
+    else:
+        label_matrix = labels if task == "multilabel" else labels.reshape(-1, 1)
+        for col in range(label_matrix.shape[1]):
+            name = target_labels[col] if col < len(target_labels) else f"label_{col}"
+            counts[name] = int((label_matrix[:, col] == 1).sum())
+    return counts
+
+
+def subsample_train_indices(
+    dataset,
+    candidate_idx,
+    task: str,
+    train_fraction: float,
+    seed: int,
+) -> np.ndarray:
+    """
+    Stratified subsample of candidate training indices down to `train_fraction`.
+
+    Only training indices should be passed here; validation/test indices must
+    never be subsampled. Falls back to a deterministic random selection when
+    stratification is infeasible for the requested fraction (e.g. very small
+    fractions with sparse positives).
+    """
+    candidate_idx = np.asarray(candidate_idx)
+    if not 0.0 < train_fraction <= 1.0:
+        raise ValueError(f"train_fraction must be in (0, 1], got {train_fraction}")
+
+    n_total = len(candidate_idx)
+    n_select = max(1, int(round(train_fraction * n_total)))
+    if n_select >= n_total:
+        return candidate_idx
+
+    labels = _labels_for_indices(dataset, candidate_idx, task)
+    total_indices = np.arange(n_total)
+
+    try:
+        if task == "multilabel":
+            n_splits = max(2, min(n_total, int(round(1.0 / train_fraction))))
+            mskf = MultilabelStratifiedKFold(
+                n_splits=n_splits, shuffle=True, random_state=seed
+            )
+            # The held-out fold is ~1/n_splits of the data, i.e. ~train_fraction.
+            _, train_frac_indices = next(iter(mskf.split(total_indices, labels)))
+        else:
+            train_frac_indices, _ = train_test_split(
+                total_indices,
+                train_size=n_select,
+                stratify=labels,
+                random_state=seed,
+                shuffle=True,
+            )
+    except ValueError as exc:
+        logger.warning(
+            f"Stratified subsampling failed ({exc}); falling back to random "
+            f"selection for train_fraction={train_fraction}."
+        )
+        rng = np.random.default_rng(seed)
+        train_frac_indices = rng.choice(total_indices, size=n_select, replace=False)
+
+    return candidate_idx[np.sort(train_frac_indices)]
+
+
+def compute_class_weights_from_indices(
+    dataset,
+    indices,
+    task: str,
+    target_labels: List[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute weighted-loss class weights from the effective training subset."""
+    labels = _labels_for_indices(dataset, indices, task)
+    if task == "multiclass":
+        classes, class_counts = np.unique(labels, return_counts=True)
+        total = float(labels.shape[0])
+        order = np.argsort(classes)
+        weights = [total / float(class_counts[i]) for i in order]
+        w = torch.tensor(weights, dtype=torch.float32)
+    else:
+        label_matrix = labels if task == "multilabel" else labels.reshape(-1, 1)
+        weights = []
+        for col in range(label_matrix.shape[1]):
+            col_vals = label_matrix[:, col]
+            pos = float((col_vals == 1).sum())
+            neg = float((col_vals == 0).sum())
+            if pos == 0:
+                name = target_labels[col] if col < len(target_labels) else f"label_{col}"
+                logger.warning(
+                    f"Label '{name}' has 0 positives in the selected training subset; "
+                    f"using pos_weight=1.0."
+                )
+                weights.append(1.0)
+            else:
+                weights.append(neg / pos)
+        w = torch.tensor(weights, dtype=torch.float32)
+    return w.squeeze().to(device)
+
+
+def prepare_training_indices(
+    dataset,
+    candidate_idx,
+    cfg: Dict,
+    accelerator: Accelerator,
+    train_fraction: float,
+    subsample_seed: int,
+    context: str = "",
+) -> Tuple[np.ndarray, Optional[torch.Tensor]]:
+    """Subsample candidate training indices and derive subset-aware class weights."""
+    selected_idx = subsample_train_indices(
+        dataset, candidate_idx, cfg["task"], train_fraction, subsample_seed
+    )
+
+    class_weights = None
+    if cfg.get("weighted_loss"):
+        class_weights = compute_class_weights_from_indices(
+            dataset, selected_idx, cfg["task"], cfg["target_labels"], accelerator.device
+        )
+
+    if accelerator.is_main_process:
+        labels = _labels_for_indices(dataset, selected_idx, cfg["task"])
+        pos_counts = _label_positive_counts(labels, cfg["task"], cfg["target_labels"])
+        ctx = f" [{context}]" if context else ""
+        logger.info(
+            f"Effective training samples{ctx}: {len(selected_idx)} (train_fraction={train_fraction}, positive counts={pos_counts})"
+        )
+
+    return selected_idx, class_weights
+
+
+def aggregate_repeat_metrics(repeat_metrics: List[Dict[str, float]]) -> Dict[str, float]:
+    """Aggregate per-repeat test metrics into mean/std summaries."""
+    aurocs = [m["test_auroc"] for m in repeat_metrics if m.get("test_auroc") is not None]
+    auprcs = [m["test_auprc"] for m in repeat_metrics if m.get("test_auprc") is not None]
+    summary: Dict[str, float] = {}
+    if aurocs:
+        summary["mean_auroc"] = float(np.mean(aurocs))
+        summary["std_auroc"] = float(np.std(aurocs))
+    if auprcs:
+        summary["mean_auprc"] = float(np.mean(auprcs))
+        summary["std_auprc"] = float(np.std(auprcs))
+    return summary
 
 
 # =============================================================================
@@ -416,6 +585,7 @@ def _compute_predictions_and_metrics(
     target_labels: List[str],
     output_dir: Optional[str] = None,
     class_names: Optional[List[str]] = None,
+    thresholds: Optional[np.ndarray | float] = None,
 ) -> Dict:
     """Convert probabilities to prediction labels, compute metrics, and create results DataFrame.
     
@@ -431,9 +601,15 @@ def _compute_predictions_and_metrics(
     """
     if task == "binary":
         all_probs = all_probs.squeeze(-1) if all_probs.ndim > 1 else all_probs
-        all_preds = (all_probs >= 0.5).astype(int)
+        threshold = 0.5 if thresholds is None else float(thresholds)
+        all_preds = (all_probs >= threshold).astype(int)
     elif task == "multilabel":
-        all_preds = (all_probs >= 0.5).astype(int)
+        threshold_arr = (
+            np.full(all_probs.shape[1], 0.5)
+            if thresholds is None
+            else np.asarray(thresholds, dtype=float)
+        )
+        all_preds = (all_probs >= threshold_arr).astype(int)
     else:
         all_preds = all_probs.argmax(axis=-1)
     
@@ -460,6 +636,7 @@ def _compute_predictions_and_metrics(
             task=task,
             class_labels=viz_labels,
             output_dir=fig_dir,
+            thresholds=thresholds,
         )
         
         logger.info(f"Visualization plots saved to: {fig_dir}")
@@ -710,14 +887,46 @@ def evaluate_single_view_classifier(
     accelerator: Accelerator,
     output_dir: str,
     track_emissions: bool = True,
+    val_threshold_loader: Optional[DataLoader] = None,
 ) -> Dict:
-    """Evaluate single-view classifier on test set."""
+    """Evaluate on test set, optionally using validation data to derive thresholds."""
     task = cfg["task"]
     target_labels = cfg["target_labels"]
     
     # Prepare model and dataloader for distributed evaluation
-    model, test_loader = accelerator.prepare(model, test_loader)
+    if val_threshold_loader is not None:
+        model, test_loader, val_threshold_loader = accelerator.prepare(model, test_loader, val_threshold_loader)
+    else:
+        model, test_loader = accelerator.prepare(model, test_loader)
     model.eval()
+
+    thresholds = None
+    if val_threshold_loader is not None:
+        val_logits_list = []
+        val_labels_list = []
+        with torch.no_grad():
+            for batch in tqdm(
+                val_threshold_loader,
+                desc="Collecting validation thresholds...",
+                disable=not accelerator.is_main_process,
+            ):
+                outputs = model(batch["features"], batch["seq_lengths"], batch.get("physical_positions"))
+                val_logits_list.append(outputs["logits"].detach())
+                val_labels_list.append(batch["labels"].detach())
+        val_logits = accelerator.gather_for_metrics(torch.cat(val_logits_list, dim=0))
+        val_labels = accelerator.gather_for_metrics(torch.cat(val_labels_list, dim=0))
+        if accelerator.is_main_process:
+            if task == "binary":
+                val_probs = torch.sigmoid(val_logits.squeeze(-1)).cpu().numpy()
+            elif task == "multilabel":
+                val_probs = torch.sigmoid(val_logits).cpu().numpy()
+            else:
+                val_probs = F.softmax(val_logits, dim=-1).cpu().numpy()
+            thresholds = compute_youden_thresholds(
+                y_true=val_labels.cpu().numpy(),
+                y_pred_prob=val_probs,
+                task=task,
+            )
     
     tracker = None
     if track_emissions and accelerator.is_main_process:
@@ -767,6 +976,7 @@ def evaluate_single_view_classifier(
         target_labels=target_labels,
         output_dir=output_dir,
         class_names=cfg.get("class_names"),
+        thresholds=thresholds,
     )
     
     return eval_results
@@ -781,14 +991,17 @@ def run_single_view_evaluation(
     output_dir: str,
     class_weights: Optional[torch.Tensor] = None,
     val_dataset: Optional[FeatClassificationDataset] = None,
+    train_fraction: float = 1.0,
+    subsample_seed: int = 42,
 ) -> Dict:
     """
     Run complete single-view evaluation pipeline.
     
     1. Create train/val split (or val_dataset if the validation set is already provided by the data provider)
-    2. Initialize SingleViewClassifier (COBRA + classifier head)
-    3. Linear probe training
-    4. Evaluate on test set
+    2. Optionally subsample the training set to `train_fraction` (few-shot)
+    3. Initialize SingleViewClassifier (COBRA + classifier head)
+    4. Linear probe training
+    5. Evaluate on test set
     """
     hyperparams = cfg["hyperparams"]
     linear_hyperparams = hyperparams.get("linear", hyperparams)
@@ -799,9 +1012,12 @@ def run_single_view_evaluation(
         logger.info("Single-view evaluation")
         logger.info(f"{'='*50}")
     
-    # Create train/val split or use dedicated val set
+    # Create train/val split or use dedicated val set.
+    # `train_candidate_idx` are the positional indices eligible for training
+    # (i.e. everything except the validation split). Few-shot subsampling is
+    # applied only to these candidates, never to validation/test.
     if val_dataset is not None:
-        train_data = train_dataset
+        train_candidate_idx = np.arange(len(train_dataset))
         val_data = val_dataset
     else:
         all_labels = np.array([train_dataset._get_label(sid).numpy() for sid in train_dataset.sample_ids])
@@ -809,7 +1025,7 @@ def run_single_view_evaluation(
         
         if task == "multilabel":
             n_splits = max(2, int(1.0 / val_split_ratio))
-            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True)
+            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=subsample_seed)
             splits = list(kfold.split(X=np.arange(len(train_dataset)), y=all_labels))
             train_idx, val_idx = splits[0]
         else:
@@ -817,11 +1033,25 @@ def run_single_view_evaluation(
                 np.arange(len(train_dataset)),
                 test_size=val_split_ratio,
                 stratify=all_labels,
-                shuffle=True
+                shuffle=True,
+                random_state=subsample_seed,
             )
         
-        train_data = Subset(train_dataset, train_idx)
+        train_candidate_idx = train_idx
         val_data = Subset(train_dataset, val_idx)
+
+    # Few-shot subsampling with subset-aware class weights
+    selected_train_idx, class_weights = prepare_training_indices(
+        dataset=train_dataset,
+        candidate_idx=train_candidate_idx,
+        cfg=cfg,
+        accelerator=accelerator,
+        train_fraction=train_fraction,
+        subsample_seed=subsample_seed,
+        context="single-view",
+    )
+    train_data = Subset(train_dataset, selected_train_idx.tolist())
+
     if accelerator.is_main_process:
         logger.info(f"Training samples:  {len(train_data)}, Validation samples: {len(val_data)}")
     
@@ -881,6 +1111,7 @@ def run_single_view_evaluation(
         cfg=cfg,
         accelerator=accelerator,
         output_dir=output_dir,
+        val_threshold_loader=val_loader,
     )
     
     # Wait for all processes before saving
@@ -907,6 +1138,8 @@ def run_single_view_evaluation(
             wandb.run.summary["test_auprc"] = auprc
             
             logger.info(f"Test AUROC: {auroc:.4f}, Test AUPRC: {auprc:.4f}")
+            eval_results["test_auroc"] = auroc
+            eval_results["test_auprc"] = auprc
     
     return eval_results
 
@@ -920,6 +1153,8 @@ def run_single_view_kfold_evaluation(
     output_dir: str,
     n_folds: int = 5,
     class_weights: Optional[torch.Tensor] = None,
+    train_fraction: float = 1.0,
+    subsample_seed: int = 42,
 ) -> Dict:
     """
     Run K-fold cross-validation for single-view evaluation.
@@ -933,6 +1168,8 @@ def run_single_view_kfold_evaluation(
         output_dir: Output directory.
         n_folds: Number of cross-validation folds.
         class_weights: Optional class weights for loss.
+        train_fraction: Few-shot fraction applied to each fold's training split.
+        subsample_seed: Seed driving fold splitting and per-fold subsampling.
 
     Returns:
         Dict with per-fold results, mean/std AUROC, and best-fold predictions.
@@ -953,14 +1190,14 @@ def run_single_view_kfold_evaluation(
 
     if task == "multilabel":
         kfold = MultilabelStratifiedKFold(
-            n_splits=n_folds, shuffle=True, random_state=42
+            n_splits=n_folds, shuffle=True, random_state=subsample_seed
         )
         fold_splits = list(kfold.split(
             X=np.arange(len(train_dataset)), y=all_labels
         ))
     else:
         kfold = StratifiedKFold(
-            n_splits=n_folds, shuffle=True, random_state=42
+            n_splits=n_folds, shuffle=True, random_state=subsample_seed
         )
         fold_splits = list(kfold.split(
             X=np.arange(len(train_dataset)), y=all_labels
@@ -982,7 +1219,18 @@ def run_single_view_kfold_evaluation(
             logger.info(f"Fold {fold_idx + 1}/{n_folds}")
             logger.info(f"{'='*50}")
 
-        train_data = Subset(train_dataset, train_idx.tolist())
+        # Few-shot subsampling applies only to this fold's training indices;
+        # the fold validation split (val_idx) is left unchanged.
+        selected_train_idx, class_weights = prepare_training_indices(
+            dataset=train_dataset,
+            candidate_idx=train_idx,
+            cfg=cfg,
+            accelerator=accelerator,
+            train_fraction=train_fraction,
+            subsample_seed=subsample_seed + fold_idx,
+            context=f"fold {fold_idx + 1}",
+        )
+        train_data = Subset(train_dataset, selected_train_idx.tolist())
         val_data = Subset(train_dataset, val_idx.tolist())
 
         if accelerator.is_main_process:
@@ -1047,6 +1295,7 @@ def run_single_view_kfold_evaluation(
             accelerator=accelerator,
             output_dir=fold_output_dir,
             track_emissions=(fold_idx == 0),
+            val_threshold_loader=val_loader,
         )
 
         accelerator.wait_for_everyone()
@@ -1131,6 +1380,16 @@ def run_single_view_kfold_evaluation(
         wandb.run.summary["test_auroc"] = mean_auroc
         wandb.run.summary["test_auprc"] = mean_auprc
 
+        # Surface fold-mean scalars so repeat-level aggregation can consume them.
+        if best_fold_eval is None:
+            best_fold_eval = {}
+        best_fold_eval["test_auroc"] = mean_auroc
+        best_fold_eval["test_auprc"] = mean_auprc
+        best_fold_eval["cv_mean_auroc"] = mean_auroc
+        best_fold_eval["cv_std_auroc"] = std_auroc
+        best_fold_eval["cv_mean_auprc"] = mean_auprc
+        best_fold_eval["cv_std_auprc"] = std_auprc
+
     return best_fold_eval if best_fold_eval else {}
 
 
@@ -1186,7 +1445,7 @@ def collect_predictions_per_view_classifier(
     )
     
     # Get dimensions
-    num_classes = get_num_classes(task, cfg["target_labels"], train_subset.dataset)
+    num_classes = get_num_classes(task, cfg["target_labels"], test_dataset)
     input_dim = cobra_model.output_dim
     
     # Initialize model
@@ -1337,6 +1596,30 @@ def train_logistic_ensemble(
     return ensemble
 
 
+def predict_logistic_ensemble_proba(
+    ensemble: LogisticRegression or List[LogisticRegression],
+    X: np.ndarray,
+    task: str,
+    target_labels: List[str],
+    view_planes: List[str],
+) -> np.ndarray:
+    """Predict probabilities from a logistic ensemble for binary/multilabel/multiclass tasks."""
+    if task == "binary":
+        return ensemble.predict_proba(X)[:, 1]
+    if task == "multilabel":
+        num_labels = len(target_labels)
+        num_views = len(view_planes)
+        y_prob_list = []
+        for label_idx, ensemble_label in enumerate(ensemble):
+            X_label = np.column_stack([
+                X[:, view_idx * num_labels + label_idx]
+                for view_idx in range(num_views)
+            ])
+            y_prob_list.append(ensemble_label.predict_proba(X_label)[:, 1])
+        return np.column_stack(y_prob_list)
+    return ensemble.predict_proba(X)
+
+
 def evaluate_logistic_ensemble(
     ensemble: LogisticRegression or List[LogisticRegression],
     X: np.ndarray,
@@ -1347,6 +1630,7 @@ def evaluate_logistic_ensemble(
     view_planes: List[str],
     output_dir: Optional[str] = None,
     class_names: Optional[List[str]] = None,
+    thresholds: Optional[np.ndarray | float] = None,
 ) -> Dict:
     """
     Evaluate logistic regression ensemble and return metrics.
@@ -1365,29 +1649,13 @@ def evaluate_logistic_ensemble(
         Dict with predictions DataFrame, metrics, and ensemble weights
     """
     # Get predictions
-    if task == "binary":
-        y_prob = ensemble.predict_proba(X)[:, 1]
-    elif task == "multilabel":
-        # For multilabel, get predictions from each label's ensemble
-        num_labels = len(target_labels)
-        num_views = len(view_planes)
-        y_prob_list = []
-        
-        for label_idx, ensemble_label in enumerate(ensemble):
-            # Extract probabilities for this label from all views
-            X_label = np.column_stack([
-                X[:, view_idx * num_labels + label_idx] 
-                for view_idx in range(num_views)
-            ])
-            # Get probability of positive class for this label
-            y_prob_label = ensemble_label.predict_proba(X_label)[:, 1]
-            y_prob_list.append(y_prob_label)
-        
-        # Stack: [N, num_labels]
-        y_prob = np.column_stack(y_prob_list)
-    else:
-        # Multiclass
-        y_prob = ensemble.predict_proba(X)
+    y_prob = predict_logistic_ensemble_proba(
+        ensemble=ensemble,
+        X=X,
+        task=task,
+        target_labels=target_labels,
+        view_planes=view_planes,
+    )
     
     # Compute predictions and metrics
     eval_results = _compute_predictions_and_metrics(
@@ -1398,6 +1666,7 @@ def evaluate_logistic_ensemble(
         target_labels=target_labels,
         output_dir=output_dir,
         class_names=class_names,
+        thresholds=thresholds,
     )
     
     # Add ensemble weights for interpretability
@@ -1449,6 +1718,8 @@ def run_multiview_logistic_ensemble(
     view_planes: List[str],
     class_weights: Optional[torch.Tensor] = None,
     val_datasets: Optional[Dict[str, FeatClassificationDataset]] = None,
+    train_fraction: float = 1.0,
+    subsample_seed: int = 42,
 ) -> Dict:
     """
     Run multi-view evaluation using logistic regression ensemble.
@@ -1483,34 +1754,51 @@ def run_multiview_logistic_ensemble(
         logger.info(f"View planes: {view_planes}")
         logger.info(f"{'='*50}")
     
-    # Create consistent train/val split or use dedicated val sets
+    # Create consistent train/val split or use dedicated val sets.
+    # The split (and any few-shot subsampling) is computed once on the reference
+    # channel so that selected indices stay aligned across all views/sequences.
     use_dedicated_val = val_datasets is not None
-    
+    ref_dataset = train_datasets[view_planes[0]]
+
     if use_dedicated_val:
+        train_candidate_idx = np.arange(len(ref_dataset))
+        val_idx = None
         if accelerator.is_main_process:
-            n_train = len(train_datasets[view_planes[0]])
+            n_train = len(ref_dataset)
             n_val = len(val_datasets[view_planes[0]])
             logger.info(f"Using dedicated validation set. Training: {n_train}, Validation: {n_val}")
     else:
-        all_labels = np.array([train_datasets[view_planes[0]]._get_label(sid).numpy() for sid in train_datasets[view_planes[0]].sample_ids])
+        all_labels = np.array([ref_dataset._get_label(sid).numpy() for sid in ref_dataset.sample_ids])
         val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
         
         if task == "multilabel":
             n_splits = max(2, int(1.0 / val_split_ratio))
-            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-            splits = list(kfold.split(X=np.arange(len(train_datasets[view_planes[0]])), y=all_labels))
+            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=subsample_seed)
+            splits = list(kfold.split(X=np.arange(len(ref_dataset)), y=all_labels))
             train_idx, val_idx = splits[0]
         else:
             train_idx, val_idx = train_test_split(
-                np.arange(len(train_datasets[view_planes[0]])),
+                np.arange(len(ref_dataset)),
                 test_size=val_split_ratio,
                 stratify=all_labels,
-                random_state=42,
+                random_state=subsample_seed,
             )
-        
+        train_candidate_idx = train_idx
         if accelerator.is_main_process:
             logger.info(f"Split training set. Training: {len(train_idx)}, Validation: {len(val_idx)}")
-    
+
+    # Few-shot subsampling with subset-aware class weights
+    selected_train_idx, class_weights = prepare_training_indices(
+        dataset=ref_dataset,
+        candidate_idx=train_candidate_idx,
+        cfg=cfg,
+        accelerator=accelerator,
+        train_fraction=train_fraction,
+        subsample_seed=subsample_seed,
+        context="multiview-ensemble",
+    )
+    selected_train_idx = selected_train_idx.tolist()
+
     # Step 1: Train single-view classifiers and collect predictions for each view
     view_predictions = {}
     
@@ -1524,11 +1812,10 @@ def run_multiview_logistic_ensemble(
         test_dataset_view_plane = test_datasets[plane]
         
         # Use dedicated val set or split from training set
+        train_subset = Subset(train_dataset_view_plane, selected_train_idx)
         if use_dedicated_val:
-            train_subset = train_dataset_view_plane
             val_subset = val_datasets[plane]
         else:
-            train_subset = Subset(train_dataset_view_plane, train_idx)
             val_subset = Subset(train_dataset_view_plane, val_idx)
         
         # Train and collect predictions
@@ -1593,6 +1880,18 @@ def run_multiview_logistic_ensemble(
     
     # Step 3: Fit logistic regression ensemble on validation predictions
     ensemble = train_logistic_ensemble(X_val, y_val, task)
+    val_ensemble_probs = predict_logistic_ensemble_proba(
+        ensemble=ensemble,
+        X=X_val,
+        task=task,
+        target_labels=target_labels,
+        view_planes=view_planes,
+    )
+    thresholds = compute_youden_thresholds(
+        y_true=y_val,
+        y_pred_prob=val_ensemble_probs,
+        task=task,
+    )
     
     logger.info("\nEnsemble Weights (Logistic Regression Coefficients):")
     if task == "binary":
@@ -1630,6 +1929,7 @@ def run_multiview_logistic_ensemble(
         view_planes=view_planes,
         output_dir=output_dir,
         class_names=cfg.get("class_names"),
+        thresholds=thresholds,
     )
     
     # Save results
@@ -1652,6 +1952,8 @@ def run_multiview_logistic_ensemble(
         auprc = save_metrics["AUPRC"] if task == "binary" else save_metrics["overall"]["AUPRC"]
         wandb.run.summary["test_auroc"] = auroc
         wandb.run.summary["test_auprc"] = auprc
+        eval_results["test_auroc"] = auroc
+        eval_results["test_auprc"] = auprc
         
         logger.info(f"\nTest AUROC: {auroc:.4f}, Test AUPRC: {auprc:.4f}")
         logger.info(f"Ensemble weights: {eval_results['ensemble_weights']}")
@@ -1679,6 +1981,8 @@ def run_multiview_logistic_ensemble_kfold(
     view_planes: List[str],
     n_folds: int = 5,
     class_weights: Optional[torch.Tensor] = None,
+    train_fraction: float = 1.0,
+    subsample_seed: int = 42,
 ) -> Dict:
     """
     Run K-fold cross-validation for the multi-view logistic regression ensemble.
@@ -1722,14 +2026,14 @@ def run_multiview_logistic_ensemble_kfold(
 
     if task == "multilabel":
         kfold = MultilabelStratifiedKFold(
-            n_splits=n_folds, shuffle=True, random_state=42
+            n_splits=n_folds, shuffle=True, random_state=subsample_seed
         )
         fold_splits = list(kfold.split(
             X=np.arange(len(ref_dataset)), y=all_labels
         ))
     else:
         kfold_splitter = StratifiedKFold(
-            n_splits=n_folds, shuffle=True, random_state=42
+            n_splits=n_folds, shuffle=True, random_state=subsample_seed
         )
         fold_splits = list(kfold_splitter.split(
             X=np.arange(len(ref_dataset)), y=all_labels
@@ -1751,6 +2055,19 @@ def run_multiview_logistic_ensemble_kfold(
         if accelerator.is_main_process:
             os.makedirs(fold_output_dir, exist_ok=True)
 
+        # Few-shot subsampling applies only to this fold's training indices,
+        # shared across channels so per-view predictions remain aligned.
+        selected_train_idx, class_weights = prepare_training_indices(
+            dataset=ref_dataset,
+            candidate_idx=train_idx,
+            cfg=cfg,
+            accelerator=accelerator,
+            train_fraction=train_fraction,
+            subsample_seed=subsample_seed + fold_idx,
+            context=f"fold {fold_idx + 1}",
+        )
+        selected_train_idx = selected_train_idx.tolist()
+
         # Train per-view classifiers and collect predictions for this fold
         view_predictions = {}
 
@@ -1758,7 +2075,7 @@ def run_multiview_logistic_ensemble_kfold(
             if accelerator.is_main_process:
                 logger.info(f"\nTraining classifier for: {plane}")
 
-            train_subset = Subset(train_datasets[plane], train_idx.tolist())
+            train_subset = Subset(train_datasets[plane], selected_train_idx)
             val_subset = Subset(train_datasets[plane], val_idx.tolist())
 
             predictions = collect_predictions_per_view_classifier(
@@ -1805,6 +2122,18 @@ def run_multiview_logistic_ensemble_kfold(
 
         # Fit logistic ensemble
         ensemble = train_logistic_ensemble(X_val, y_val, task)
+        val_ensemble_probs = predict_logistic_ensemble_proba(
+            ensemble=ensemble,
+            X=X_val,
+            task=task,
+            target_labels=target_labels,
+            view_planes=view_planes,
+        )
+        thresholds = compute_youden_thresholds(
+            y_true=y_val,
+            y_pred_prob=val_ensemble_probs,
+            task=task,
+        )
 
         eval_results = evaluate_logistic_ensemble(
             ensemble=ensemble,
@@ -1816,6 +2145,7 @@ def run_multiview_logistic_ensemble_kfold(
             view_planes=view_planes,
             output_dir=fold_output_dir,
             class_names=cfg.get("class_names"),
+            thresholds=thresholds,
         )
 
         if eval_results["metrics"]:
@@ -1895,6 +2225,16 @@ def run_multiview_logistic_ensemble_kfold(
         wandb.run.summary["cv_std_auprc"] = std_auprc
         wandb.run.summary["test_auroc"] = mean_auroc
         wandb.run.summary["test_auprc"] = mean_auprc
+
+        # Surface fold-mean scalars so repeat-level aggregation can consume them.
+        if best_fold_eval is None:
+            best_fold_eval = {}
+        best_fold_eval["test_auroc"] = mean_auroc
+        best_fold_eval["test_auprc"] = mean_auprc
+        best_fold_eval["cv_mean_auroc"] = mean_auroc
+        best_fold_eval["cv_std_auroc"] = std_auroc
+        best_fold_eval["cv_mean_auprc"] = mean_auprc
+        best_fold_eval["cv_std_auprc"] = std_auprc
 
     return best_fold_eval if best_fold_eval else {}
 
@@ -2036,9 +2376,13 @@ def evaluate_multiview_classifier(
     accelerator: Accelerator,
     output_dir: str,
     track_emissions: bool = True,
+    val_threshold_loader: Optional[DataLoader] = None,
 ) -> Dict:
     """
     Evaluate multi-view classifier on test set.
+
+    If ``val_threshold_loader`` is provided, validation predictions are used to
+    choose decision thresholds for threshold-based test metrics/plots.
     
     Returns predictions, metrics, and attention weights for interpretability.
     """
@@ -2046,8 +2390,39 @@ def evaluate_multiview_classifier(
     target_labels = cfg["target_labels"]
     
     # Prepare model and dataloader for distributed evaluation
-    model, test_loader = accelerator.prepare(model, test_loader)
+    if val_threshold_loader is not None:
+        model, test_loader, val_threshold_loader = accelerator.prepare(model, test_loader, val_threshold_loader)
+    else:
+        model, test_loader = accelerator.prepare(model, test_loader)
     model.eval()
+
+    thresholds = None
+    if val_threshold_loader is not None:
+        val_logits_list = []
+        val_labels_list = []
+        with torch.no_grad():
+            for batch in tqdm(
+                val_threshold_loader,
+                desc="Collecting validation thresholds...",
+                disable=not accelerator.is_main_process,
+            ):
+                outputs = model(batch["features"], batch["seq_lengths"], batch.get("physical_positions"))
+                val_logits_list.append(outputs["logits"].detach())
+                val_labels_list.append(batch["labels"].detach())
+        val_logits = accelerator.gather_for_metrics(torch.cat(val_logits_list, dim=0))
+        val_labels = accelerator.gather_for_metrics(torch.cat(val_labels_list, dim=0))
+        if accelerator.is_main_process:
+            if task == "binary":
+                val_probs = torch.sigmoid(val_logits.squeeze(-1)).cpu().numpy()
+            elif task == "multilabel":
+                val_probs = torch.sigmoid(val_logits).cpu().numpy()
+            else:
+                val_probs = F.softmax(val_logits, dim=-1).cpu().numpy()
+            thresholds = compute_youden_thresholds(
+                y_true=val_labels.cpu().numpy(),
+                y_pred_prob=val_probs,
+                task=task,
+            )
     
     tracker = None
     if track_emissions and accelerator.is_main_process:
@@ -2100,6 +2475,7 @@ def evaluate_multiview_classifier(
         target_labels=target_labels,
         output_dir=output_dir,
         class_names=cfg.get("class_names"),
+        thresholds=thresholds,
     )
     
     # Store attention weights for interpretability
@@ -2119,14 +2495,17 @@ def run_multiview_evaluation(
     view_planes: List[str],
     class_weights: Optional[torch.Tensor] = None,
     val_dataset: Optional[MultiViewFeatClassificationDataset] = None,
+    train_fraction: float = 1.0,
+    subsample_seed: int = 42,
 ) -> Dict:
     """
     Run complete multi-view evaluation pipeline with attention-based aggregation.
     
     1. Create train/val split (or use dedicated val_dataset if provided)
-    2. Initialize MultiViewClassifier with attention aggregation
-    3. Linear probe training
-    4. Evaluate on test set
+    2. Optionally subsample the training set to `train_fraction` (few-shot)
+    3. Initialize MultiViewClassifier with attention aggregation
+    4. Linear probe training
+    5. Evaluate on test set
     """
     hyperparams = cfg["hyperparams"]
     linear_hyperparams = hyperparams.get("linear", hyperparams)
@@ -2141,17 +2520,17 @@ def run_multiview_evaluation(
     
     # Create train/val split or use dedicated val set
     if val_dataset is not None:
-        train_data = train_dataset
+        train_candidate_idx = np.arange(len(train_dataset))
         val_data = val_dataset
         if accelerator.is_main_process:
-            logger.info(f"Using dedicated validation set. Training: {len(train_data)}, Validation: {len(val_data)}")
+            logger.info(f"Using dedicated validation set. Training: {len(train_candidate_idx)}, Validation: {len(val_data)}")
     else:
         all_labels = np.array([train_dataset._get_label(sid).numpy() for sid in train_dataset.sample_ids])
         val_split_ratio = hyperparams.get("val_split_ratio", 0.1)
         
         if task == "multilabel":
             n_splits = max(2, int(1.0 / val_split_ratio))
-            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            kfold = MultilabelStratifiedKFold(n_splits=n_splits, shuffle=True, random_state=subsample_seed)
             splits = list(kfold.split(X=np.arange(len(train_dataset)), y=all_labels))
             train_idx, val_idx = splits[0]
         else:
@@ -2159,13 +2538,25 @@ def run_multiview_evaluation(
                 np.arange(len(train_dataset)),
                 test_size=val_split_ratio,
                 stratify=all_labels,
-                random_state=42,
+                random_state=subsample_seed,
             )
         
-        train_data = Subset(train_dataset, train_idx)
+        train_candidate_idx = train_idx
         val_data = Subset(train_dataset, val_idx)
-        if accelerator.is_main_process:
-            logger.info(f"Split training set. Training: {len(train_data)}, Validation: {len(val_data)}")
+
+    # Few-shot subsampling with subset-aware class weights
+    selected_train_idx, class_weights = prepare_training_indices(
+        dataset=train_dataset,
+        candidate_idx=train_candidate_idx,
+        cfg=cfg,
+        accelerator=accelerator,
+        train_fraction=train_fraction,
+        subsample_seed=subsample_seed,
+        context="multiview-attention",
+    )
+    train_data = Subset(train_dataset, selected_train_idx.tolist())
+    if accelerator.is_main_process:
+        logger.info(f"Split training set. Training: {len(train_data)}, Validation: {len(val_data)}")
     
     # Create dataloaders
     train_loader = DataLoader(train_data, batch_size=hyperparams["batch_size"], shuffle=True,
@@ -2226,6 +2617,7 @@ def run_multiview_evaluation(
         cfg=cfg,
         accelerator=accelerator,
         output_dir=output_dir,
+        val_threshold_loader=val_loader,
     )
     
     # Wait for all processes before saving
@@ -2257,6 +2649,8 @@ def run_multiview_evaluation(
             auprc = save_metrics["AUPRC"] if task == "binary" else save_metrics["overall"]["AUPRC"]
             wandb.run.summary["test_auroc"] = auroc
             wandb.run.summary["test_auprc"] = auprc
+            eval_results["test_auroc"] = auroc
+            eval_results["test_auprc"] = auprc
             
             for plane in view_planes:
                 wandb.run.summary[f"test_attention_{plane}"] = save_metrics["attention_weights"][plane]
@@ -2304,6 +2698,7 @@ def main(args):
     annot_files = get_annotation_paths_by_split(
         annotations_dir, cfg["task"],
         splits=["train", "test"],
+        optional_splits=["val"],
     )
     cfg["train_annots"] = str(annot_files["train"])
     cfg["test_annots"] = str(annot_files["test"])
@@ -2314,8 +2709,41 @@ def main(args):
     if args.fine_tune:
         cfg["freeze_cobra"] = not args.fine_tune
 
+    # Few-shot / repeated-evaluation configuration.
+    # CLI overrides config under cfg["few_shot"], which itself overrides defaults.
+    few_shot_cfg = cfg.get("few_shot", {}) or {}
+    train_fraction = (
+        args.train_fraction
+        if args.train_fraction is not None
+        else few_shot_cfg.get("train_fraction", 1.0)
+    )
+    num_repeats = (
+        args.num_repeats
+        if args.num_repeats is not None
+        else few_shot_cfg.get("num_repeats", 1)
+    )
+    if not 0.0 < train_fraction <= 1.0:
+        raise ValueError(f"--train-fraction must be in (0, 1], got {train_fraction}")
+    if num_repeats < 1:
+        raise ValueError(f"--num-repeats must be >= 1, got {num_repeats}")
+    cfg["weighted_loss"] = args.weighted_loss
+    cfg["train_fraction"] = train_fraction
+    cfg["num_repeats"] = num_repeats
+
+    # Generate one random seed per repeat. Seeds are generated at runtime to avoid cherry-picking favorable seeds.
+    seed_sequence = (
+        np.random.SeedSequence(args.seed)
+        if args.seed is not None
+        else np.random.SeedSequence()
+    )
+    repeat_seeds = [int(s) for s in seed_sequence.generate_state(num_repeats)]
+    cfg["repeat_seeds"] = repeat_seeds
+
     # Get view plane(s) and model names from config
     planes = cfg["feat_dataset"]["plane"]
+    if args.feat_dir:
+        cfg["feat_dataset"]["feat_dir"] = args.feat_dir
+
     if args.fm_model_names:
         model_names = args.fm_model_names.split()  
     else:
@@ -2355,11 +2783,16 @@ def main(args):
 
     # Create output directory
     target_labels = "_".join(cfg["target_labels"])
+    fewshot_tag = ""
+    if train_fraction < 1.0:
+        fewshot_tag += f"_frac{train_fraction:g}"
+    if num_repeats > 1:
+        fewshot_tag += f"_repeats{num_repeats}"
     if use_multiview:
         planes_str = "_".join(view_planes)
-        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_multiview_{planes_str}_{CURR_TIME}_{JOB_ID}")
+        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_multiview_{planes_str}{fewshot_tag}_{CURR_TIME}_{JOB_ID}")
     else:
-        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_{view_planes[0]}_{CURR_TIME}_{JOB_ID}")
+        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_{view_planes[0]}{fewshot_tag}_{CURR_TIME}_{JOB_ID}")
     
     checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg.get("checkpoint_path")
     pretrain_config_path = (
@@ -2471,17 +2904,12 @@ def main(args):
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
 
-    # Compute class weights
-    class_weights = compute_class_weights_for_weighted_loss(
-        cfg["train_annots"],
-        cfg["target_labels"],
-        cfg["task"],
-        accelerator.device
-    ) if args.weighted_loss else None
-    
     # Run evaluation
     has_val_annots = "val_annots" in cfg and cfg["val_annots"]
-    
+
+    train_datasets = test_datasets = val_datasets = None
+    train_dataset = test_dataset = val_dataset = None
+
     if use_multiview:
         # Multi-view / multi-sequence logistic regression ensemble.
         # Each entry in channel_map is (channel_name, feat_dir, plane).
@@ -2529,35 +2957,6 @@ def main(args):
                     cache_in_memory=True,
                 )
         
-        use_kfold = args.n_folds > 1 and val_datasets is None
-        if use_kfold:
-            eval_results = run_multiview_logistic_ensemble_kfold(
-                cobra_model=cobra_model,
-                train_datasets=train_datasets,
-                test_datasets=test_datasets,
-                cfg=cfg,
-                accelerator=accelerator,
-                output_dir=output_dir,
-                view_planes=view_planes,
-                n_folds=args.n_folds,
-                class_weights=class_weights,
-            )
-        else:
-            if args.n_folds > 1 and val_datasets is not None and accelerator.is_main_process:
-                logger.warning(
-                    f"--n-folds={args.n_folds} ignored because a dedicated validation set is available."
-                )
-            eval_results = run_multiview_logistic_ensemble(
-                cobra_model=cobra_model,
-                train_datasets=train_datasets,
-                test_datasets=test_datasets,
-                cfg=cfg,
-                accelerator=accelerator,
-                output_dir=output_dir,
-                view_planes=view_planes,
-                class_weights=class_weights,
-                val_datasets=val_datasets,
-            )
     else:
         # Single-view channel
         channel_name, feat_dir, plane = channel_map[0]
@@ -2602,33 +3001,121 @@ def main(args):
             logger.info(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
             if val_dataset is not None:
                 logger.info(f"Val samples (dedicated): {len(val_dataset)}")
-        
-        use_kfold = args.n_folds > 1 and val_dataset is None
-        if use_kfold:
-            eval_results = run_single_view_kfold_evaluation(
-                cobra_model=cobra_model,
-                train_dataset=train_dataset,
-                test_dataset=test_dataset,
-                cfg=cfg,
-                accelerator=accelerator,
-                output_dir=output_dir,
-                n_folds=args.n_folds,
-                class_weights=class_weights,
-            )
-        else:
-            if args.n_folds > 1 and val_dataset is not None and accelerator.is_main_process:
-                logger.warning(
-                    f"--n-folds={args.n_folds} ignored because a dedicated validation set is available."
+
+    # K-fold is only applicable when there is no dedicated validation split.
+    # When a dedicated val split exists, uncertainty is estimated via repeated
+    # random runs (num_repeats), not by reinterpreting --n-folds.
+    has_dedicated_val = (val_datasets is not None) if use_multiview else (val_dataset is not None)
+    use_kfold = args.n_folds > 1 and not has_dedicated_val
+    if args.n_folds > 1 and has_dedicated_val and accelerator.is_main_process:
+        logger.warning(
+            f"--n-folds={args.n_folds} ignored because a dedicated validation set is "
+            f"available; using num_repeats={num_repeats} for uncertainty instead."
+        )
+
+    def _run_single_repeat(repeat_output_dir: str, seed: int) -> Dict:
+        """Run one full evaluation for a given output dir and seed."""
+        if use_multiview:
+            if use_kfold:
+                return run_multiview_logistic_ensemble_kfold(
+                    cobra_model=cobra_model,
+                    train_datasets=train_datasets,
+                    test_datasets=test_datasets,
+                    cfg=cfg,
+                    accelerator=accelerator,
+                    output_dir=repeat_output_dir,
+                    view_planes=view_planes,
+                    n_folds=args.n_folds,
+                    train_fraction=train_fraction,
+                    subsample_seed=seed,
                 )
-            eval_results = run_single_view_evaluation(
+            return run_multiview_logistic_ensemble(
+                cobra_model=cobra_model,
+                train_datasets=train_datasets,
+                test_datasets=test_datasets,
+                cfg=cfg,
+                accelerator=accelerator,
+                output_dir=repeat_output_dir,
+                view_planes=view_planes,
+                val_datasets=val_datasets,
+                train_fraction=train_fraction,
+                subsample_seed=seed,
+            )
+        if use_kfold:
+            return run_single_view_kfold_evaluation(
                 cobra_model=cobra_model,
                 train_dataset=train_dataset,
                 test_dataset=test_dataset,
                 cfg=cfg,
                 accelerator=accelerator,
-                output_dir=output_dir,
-                class_weights=class_weights,
-                val_dataset=val_dataset,
+                output_dir=repeat_output_dir,
+                n_folds=args.n_folds,
+                train_fraction=train_fraction,
+                subsample_seed=seed,
+            )
+        return run_single_view_evaluation(
+            cobra_model=cobra_model,
+            train_dataset=train_dataset,
+            test_dataset=test_dataset,
+            cfg=cfg,
+            accelerator=accelerator,
+            output_dir=repeat_output_dir,
+            val_dataset=val_dataset,
+            train_fraction=train_fraction,
+            subsample_seed=seed,
+        )
+
+    # Repeated random evaluation when num_repeats > 1
+    repeat_metrics: List[Dict] = []
+    for repeat_idx, seed in enumerate(repeat_seeds):
+        set_global_seed(seed)
+        repeat_output_dir = (
+            os.path.join(output_dir, f"repeat_{repeat_idx + 1}")
+            if num_repeats > 1 else output_dir
+        )
+        if accelerator.is_main_process:
+            os.makedirs(repeat_output_dir, exist_ok=True)
+            logger.info(f"\n{'#'*60}")
+            logger.info(f"Repeat {repeat_idx + 1}/{num_repeats} (seed={seed})")
+            logger.info(f"{'#'*60}")
+
+        eval_results = _run_single_repeat(repeat_output_dir, seed)
+
+        if accelerator.is_main_process:
+            repeat_metrics.append({
+                "repeat": repeat_idx + 1,
+                "seed": seed,
+                "test_auroc": eval_results.get("test_auroc") if eval_results else None,
+                "test_auprc": eval_results.get("test_auprc") if eval_results else None,
+            })
+
+    # Aggregate test metrics across repeats
+    if accelerator.is_main_process:
+        summary = aggregate_repeat_metrics(repeat_metrics)
+        repeat_summary = {
+            "num_repeats": num_repeats,
+            "train_fraction": train_fraction,
+            "n_folds": args.n_folds if use_kfold else 1,
+            "repeat_seeds": repeat_seeds,
+            "per_repeat": repeat_metrics,
+            **summary,
+        }
+        table_dir = os.path.join(output_dir, "table")
+        os.makedirs(table_dir, exist_ok=True)
+        with open(os.path.join(table_dir, "repeat_summary.json"), "w") as f:
+            json.dump(repeat_summary, f, indent=4)
+
+        wandb.run.summary["train_fraction"] = train_fraction
+        wandb.run.summary["num_repeats"] = num_repeats
+        for key, value in summary.items():
+            wandb.run.summary[key] = value
+        if "mean_auroc" in summary:
+            wandb.run.summary["test_auroc"] = summary["mean_auroc"]
+            wandb.run.summary["test_auprc"] = summary["mean_auprc"]
+            logger.info(
+                f"Repeated evaluation ({num_repeats} repeat(s), train_fraction={train_fraction}): "
+                f"AUROC {summary['mean_auroc']:.4f} +/- {summary['std_auroc']:.4f}, "
+                f"AUPRC {summary['mean_auprc']:.4f} +/- {summary['std_auprc']:.4f}"
             )
 
     if accelerator.is_main_process:
@@ -2668,6 +3155,12 @@ if __name__ == "__main__":
              "--fine-tune so the aggregation modules are trainable."
     )
     parser.add_argument(
+        "--feat-dir",
+        type=str,
+        default=None,
+        help="Override feat_dataset.feat_dir (e.g. .../crop_tiled_2x2 for tiled checkpoints).",
+    )
+    parser.add_argument(
         "--fm-model-names",
         type=str,
         default=None,
@@ -2701,7 +3194,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--slice-pooling",
         type=str,
-        choices=["abmil", "cross_attention", "cls"],
+        choices=["abmil", "cls"],
         default=None,
     )
     parser.add_argument(
@@ -2711,8 +3204,8 @@ if __name__ == "__main__":
         default=None,
         help="Which representation level ABMIL attention weights aggregate: "
              "'post_encoder': after sequence encoder (Mamba-2/Transformer), "
-             "'post_embed': after Embed MLP for global-only CLS; after within-slice region aggregation for tiled multi-crop CLS."
-             "'raw': original global-only FM embeddings. "
+             "'post_embed': after Embed MLP; tiled multi-crop CLS tokens are flattened before pooling. "
+             "'raw': original FM embeddings; tiled tokens are flattened before pooling. "
              "If omitted, Cobra resolves to 'raw' for global-only caches and 'post_embed' for tiled multi-crop CLS caches."
     )
     parser.add_argument(
@@ -2722,6 +3215,31 @@ if __name__ == "__main__":
         help="Number of cross-validation folds. "
              "When > 1, runs K-fold CV and reports mean +/- std AUROC. "
              "Ignored when a dedicated validation set is available. (default: 1)"
+    )
+    parser.add_argument(
+        "--train-fraction",
+        type=float,
+        default=None,
+        help="Few-shot label budget: fraction of the training set used to train "
+             "the classifier head, in (0, 1]. Validation/test are never subsampled. "
+             "Overrides few_shot.train_fraction in the config (default: 1.0)."
+    )
+    parser.add_argument(
+        "--num-repeats",
+        type=int,
+        default=None,
+        help="Number of repeated random runs for uncertainty estimation. Each "
+             "repeat uses a freshly generated seed and (when > 1) its own output "
+             "subdirectory; test metrics are aggregated as mean +/- std. Overrides "
+             "few_shot.num_repeats in the config (default: 1)."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional base seed for generating per-repeat seeds. Use only for "
+             "debugging or exact reruns; by default seeds are drawn from system "
+             "entropy and recorded in the run outputs."
     )
     args = parser.parse_args()
     main(args)

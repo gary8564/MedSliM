@@ -145,7 +145,7 @@ def main():
     parser.add_argument("--num-samples", type=int, default=None, help="Max samples to visualize (None = all)")
     parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "attention"])
     parser.add_argument("--sequence-encoder", type=str, default=None, choices=["mamba2", "transformer"])
-    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cross_attention", "cls"])
+    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
     parser.add_argument("--per-head", action="store_true",
                         help="Visualize per-head attention profiles (ABMIL multi-head only)")
     parser.add_argument("--fold", type=int, default=None,
@@ -241,10 +241,10 @@ def main():
         cobra_model.eval()
         slice_pooling = args.slice_pooling or cobra_model.slice_pooling
 
-    # Validate: attention visualization requires ABMIL or cross_attention slice pooling
-    if slice_pooling and slice_pooling not in ("abmil", "cross_attention"):
+    # Validate: attention visualization requires ABMIL slice pooling
+    if slice_pooling and slice_pooling != "abmil":
         raise ValueError(
-            f"Attention visualization requires 'abmil' or 'cross_attention' slice pooling, got '{slice_pooling}'"
+            f"Attention visualization requires 'abmil' slice pooling, got '{slice_pooling}'"
         )
 
     os.makedirs(output_dir, exist_ok=True)

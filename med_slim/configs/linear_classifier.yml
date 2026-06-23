@@ -10,7 +10,7 @@
 # Model checkpoint configuration
 # ------------------------------------------------------------------------------
 # Path to pretrained MedSliM checkpoint
-checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet/2026-05-26-17:29/medslim-epoch3000.pth.tar"
+checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet/2026-02-07-14:10/medslim-epoch2000.pth.tar"
 # Optional when running --no-pretrained-cobra; otherwise inferred from checkpoint_path parent.
 # pretrain_config_path: "/path/to/pretrain/config.yaml"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
@@ -39,8 +39,8 @@ freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning 
 #     model_name: ["dinov2"]
 
 feat_dataset:
-  dataset_name: "MRNet"
-  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+  dataset_name: "kneeMRI"
+  feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
   plane:
     - "sagittal"
     # - "coronal"
@@ -51,7 +51,19 @@ feat_dataset:
   model_name:
     - "mri-core"
 
-annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/MRNet"
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+
+# ------------------------------------------------------------------------------
+# Few-shot / repeated-evaluation configuration
+# ------------------------------------------------------------------------------
+# train_fraction: fraction of the TRAINING set used to fit the classifier head,
+#   in (0, 1]. Validation and test sets are never subsampled. 
+# num_repeats: number of repeated random runs for uncertainty estimation. Each
+#   repeat draws a fresh seed (recorded in the outputs) and test metrics are
+#   aggregated as mean +/- std.
+few_shot:
+  train_fraction: 1.0
+  num_repeats: 1
 
 # ------------------------------------------------------------------------------
 # Output directory configuration

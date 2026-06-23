@@ -6,7 +6,7 @@ feat_dataset:
     # Uncomment to use SupCon loss for labeled MRNet samples alongside InfoNCE.
     # Labeled samples get additional same-class positives; unlabeled samples use standard InfoNCE.
     - name: mrnet
-      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop_tiled_2x2" #"/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop_tiled_2x2"
       # annotations_path: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/train.csv"
       # target_columns: ["abnormal", "acl", "meniscus"]
     # Unlabeled (pure InfoNCE)
@@ -21,7 +21,9 @@ feat_dataset:
     - "medsiglip"
     - "biomedclip"
     - "ark"
-    # - "mri-core"
+    - "mri-core"
+    - "medimageinsight"
+    - "curia"
   plane: # "axial", "sagittal", "coronal"
     - "sagittal"
     - "coronal"
@@ -86,18 +88,18 @@ model:
       repo: "raidium/curia"
 
   cobra:
-    embed_dim: 1536 # 768, 1024, 1536
+    embed_dim: 1024 # 768, 1024, 1536
     contrast_dim: 256
     input_dims: [768, 1024, 1536, 1152, 512, 1376]
     num_heads: 8
-    num_layers: 12 # 2, 6, 12
+    num_layers: 2 # 2, 6, 12
     dropout: 0.2
     # Mamba2-specific
     mamba_d_state: 128
     # Transformer-specific
     transformer_rotary_positional_encoding: "RoPE"  # "RoPE" or "LiRE" 
     transformer_norm_first: true  # Pre-LN transformer
-    # Pooling-specific (ABMIL / cross_attention)
+    # Pooling-specific (ABMIL)
     attn_dim: 256
     # Physical positional encoding: sinusoidal encoding keyed on slice
     # positions in mm. Essential for cross-domain pretraining where
@@ -107,16 +109,16 @@ model:
     # 0 = original global-only CLS pathway.
     # A positive perfect square (e.g. 4 for a 2x2 grid) collapses [B, D, 1+regional_tokens, E] region tokens to [B, D, E] before the
     # sequence encoder. Requires tiled feature caches precomputed with the matching `--regional-tokens` flag.
-    regional_tokens: 0 # 0 = original global-only CLS pathway.
-    region_embedding: false  # learned region (quadrant) identity embedding
+    regional_tokens: 4 # 0 = original global-only CLS pathway.
+    region_embedding: true  # learned region (quadrant) identity embedding
 
 train:
   momentum: 0.99
   temperature: 0.2
-  batch_size: 512
-  num_epochs: 3000
-  learning_rate: 2e-4 #5e-4 
-  warmup_epochs: 100 #50
+  batch_size: 256
+  num_epochs: 2000
+  learning_rate: 5e-4 #2e-4 
+  warmup_epochs: 50 #100
   weight_decay: 0.1
   num_workers: 20
   early_stopping: 

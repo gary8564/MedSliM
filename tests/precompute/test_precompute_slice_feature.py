@@ -336,6 +336,26 @@ class TestPrecomputeSliceFeatureShapes(unittest.TestCase):
                 (self.num_slices, num_regions, embed_dim),
             )
 
+    def test_subset_wrapped_dataloader(self):
+        """Precompute keeps slice_ds for metadata while loader_ds is wrapped for the DataLoader."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            _make_synthetic_dataset(data_root, num_samples=3)
+
+            slice_ds = SliceDataset(
+                path_root=str(data_root),
+                split="train",
+                plane="axial",
+            )
+            loader_ds = torch.utils.data.Subset(slice_ds, [0, 2])
+            loader_ds = torch.utils.data.Subset(loader_ds, [0])
+
+            uid = loader_ds[0]["uid"]
+            self.assertEqual(
+                slice_ds.get_nifti_path(uid),
+                data_root / "train" / "axial" / f"{uid}.nii.gz",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

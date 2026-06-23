@@ -39,10 +39,28 @@ def get_dataset_metadata(dataset_name: str) -> Dict[str, Any]:
     return datasets[dataset_name]
 
 
+def _resolve_annotation_path(
+    annotations_dir: str,
+    task: str,
+    split: str,
+) -> Optional[str]:
+    """Resolve a single split name to its annotation CSV path, or None if absent."""
+    base_dir = Path(annotations_dir)
+    annot_path = base_dir / f"{split}.csv"
+    if task == "binary" and not os.path.exists(annot_path):
+        annot_path = base_dir / f"{split}_binary.csv"
+    elif task == "multiclass" and not os.path.exists(annot_path):
+        annot_path = base_dir / f"{split}_multiclass.csv"
+    if not os.path.exists(annot_path):
+        return None
+    return str(annot_path)
+
+
 def get_annotation_paths_by_split(
     annotations_dir: str,
     task: str,
     splits: List[str],
+    optional_splits: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     """
     Resolve annotation CSV paths per split from a dataset annotations directory.
@@ -52,28 +70,30 @@ def get_annotation_paths_by_split(
     Args:
         annotations_dir: Root directory containing annotation CSVs
         task: Classification task type (binary, multiclass, multilabel)
-        splits: ["train", "test"] or ["train", "test", "val"] if validation set is available in the dataset.
+        splits: Required splits, e.g. ["train", "test"]. Missing required splits raise FileNotFoundError.
+        optional_splits: Splits to include only if present on disk (e.g. ["val"]).
+                         Missing optional splits are silently skipped instead of raising FileNotFoundError if they do not exist.
 
     Returns:
         Dict mapping split name to annotated csv path.
     """
-    base_dir = Path(annotations_dir)
-    if not base_dir.exists():
+    if not Path(annotations_dir).exists():
         raise FileNotFoundError(f"Annotations directory does not exist: {annotations_dir}")
 
     annot_paths: Dict[str, str] = {}
     for split in splits:
-        annot_path = base_dir / f"{split}.csv"
-        if task == "binary" and not os.path.exists(annot_path):
-            annot_path = base_dir / f"{split}_binary.csv"
-        elif task == "multiclass" and not os.path.exists(annot_path):
-            annot_path = base_dir / f"{split}_multiclass.csv"
-        if not os.path.exists(annot_path):
+        resolved = _resolve_annotation_path(annotations_dir, task, split)
+        if resolved is None:
             raise FileNotFoundError(
                 f"Could not resolve annotations for required split '{split}' "
                 f"in {annotations_dir}."
             )
-        annot_paths[split] = str(annot_path)
+        annot_paths[split] = resolved
+
+    for split in optional_splits or []:
+        resolved = _resolve_annotation_path(annotations_dir, task, split)
+        if resolved is not None:
+            annot_paths[split] = resolved
 
     return annot_paths
 

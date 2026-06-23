@@ -1,5 +1,2 @@
 from .abmil import BatchedABMIL
-from .cross_attention import (
-    InterSliceAggregator,
-    WithinSliceAggregator,
-)
+from .cross_attention import InterSliceAggregator

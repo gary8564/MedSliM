@@ -207,191 +207,23 @@ def test_cobra_cls_pooling_requires_transformer():
 
 def test_detect_slice_pooling_from_checkpoint_keys():
     """
-    Verify that checkpoint key detection correctly distinguishes
-    abmil, cross_attention, and cls slice pooling types.
+    Verify that checkpoint key detection correctly distinguishes abmil and cls.
     """
     abmil_keys = {"cobra.attn.0.attention_V.0.weight": None, "cobra.norm.weight": None}
-    cross_attn_keys = {"cobra.cross_attn_pool.mha.in_proj_weight": None, "cobra.norm.weight": None}
     cls_keys = {"cobra.cls_token": None, "cobra.norm.weight": None}
 
     def detect(raw):
         has_abmil = any(k.startswith("cobra.attn.") for k in raw.keys())
-        has_cross_attn = any(k.startswith("cobra.cross_attn_pool.") for k in raw.keys())
         if has_abmil:
             return "abmil"
-        elif has_cross_attn:
-            return "cross_attention"
-        else:
-            return "cls"
+        return "cls"
 
     assert detect(abmil_keys) == "abmil"
-    assert detect(cross_attn_keys) == "cross_attention"
     assert detect(cls_keys) == "cls"
 
 
-def test_cobra_cross_attention_forward_pass():
-    """Test forward pass with cross-attention pooling and mamba2 encoder."""
-    batch_size = 4
-    num_slices = 16
-    input_dim = 768
-    embed_dim = 768
-    contrast_dim = 256
-
-    model = Cobra(
-        embed_dim=embed_dim,
-        contrast_dim=contrast_dim,
-        input_dims=[768],
-        num_heads=4,
-        num_layers=1,
-        dropout=0.1,
-        mode="train",
-        slice_pooling="cross_attention",
-        d_state=64,
-    ).to(DEVICE).eval()
-
-    assert model.cross_attn_pool is not None
-    assert model.attn is None
-    assert model.cls_token is None
-
-    x = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
-    with torch.no_grad():
-        y = model(x)
-    assert isinstance(y, torch.Tensor)
-    assert y.shape == (batch_size, contrast_dim)
-    assert torch.isfinite(y).all()
-
-
-def test_cobra_cross_attention_attention_shape():
-    """Cross-attention get_attention should return [B, num_queries, num_slices]."""
-    batch_size = 2
-    num_slices = 10
-    input_dim = 768
-
-    model = Cobra(
-        embed_dim=768,
-        contrast_dim=128,
-        input_dims=[768],
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        mode="train",
-        slice_pooling="cross_attention",
-        d_state=32,
-    ).to(DEVICE).eval()
-
-    x = torch.randn(batch_size, num_slices, input_dim, device=DEVICE)
-    with torch.no_grad():
-        attn = model(x, get_attention=True)
-    assert isinstance(attn, torch.Tensor)
-    assert attn.shape == (batch_size, 1, num_slices)
-    assert torch.isfinite(attn).all()
-
-
-def test_cobra_cross_attention_variable_seq_lengths():
-    """
-    Cross-attention pooling should ignore padded positions via key_padding_mask.
-    Perturbing padded positions should not change the output.
-    """
-    batch_size = 2
-    max_slices = 8
-    input_dim = 768
-    contrast_dim = 128
-
-    model = Cobra(
-        embed_dim=input_dim,
-        contrast_dim=contrast_dim,
-        input_dims=[input_dim],
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        mode="train",
-        slice_pooling="cross_attention",
-        d_state=64,
-    ).to(DEVICE).eval()
-
-    seq_lengths = torch.tensor([3, 6], dtype=torch.long, device=DEVICE)
-
-    x = torch.randn(batch_size, max_slices, input_dim, device=DEVICE)
-    x_alt = x.clone()
-    x_alt[0, 3:, :] = torch.randn_like(x_alt[0, 3:, :]) * 50.0 + 100.0
-    x_alt[1, 6:, :] = torch.randn_like(x_alt[1, 6:, :]) * 50.0 + 100.0
-
-    with torch.no_grad():
-        y1 = model(x, seq_lengths=seq_lengths)
-        y2 = model(x_alt, seq_lengths=seq_lengths)
-        attn = model(x, seq_lengths=seq_lengths, get_attention=True)
-
-    assert y1.shape == (batch_size, contrast_dim)
-    assert torch.isfinite(y1).all() and torch.isfinite(y2).all()
-    assert torch.allclose(y1, y2, atol=1e-5, rtol=1e-5)
-
-    assert attn.shape == (batch_size, 1, max_slices)
-
-
-def test_cobra_cross_attention_inference_mode():
-    """Cross-attention in inference mode should return embed_dim output."""
-    batch_size = 2
-    num_slices = 8
-    embed_dim = 256
-
-    model = Cobra(
-        embed_dim=embed_dim,
-        contrast_dim=64,
-        input_dims=[128, 256],
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        mode="inference",
-        slice_pooling="cross_attention",
-        pooling_target="post_encoder",
-        d_state=32,
-    ).to(DEVICE).eval()
-
-    assert model.output_dim == embed_dim
-
-    x = [torch.randn(batch_size, num_slices, 256, device=DEVICE)]
-    seq_lengths = torch.full((batch_size,), num_slices, dtype=torch.long, device=DEVICE)
-    with torch.no_grad():
-        y = model(x, seq_lengths=seq_lengths)
-    assert y.shape == (batch_size, embed_dim)
-    assert torch.isfinite(y).all()
-
-
-def test_cobra_cross_attention_post_embed_pooling_target():
-    """Cross-attention uses encoder states for attention and post-embed features as values."""
-    model = Cobra(
-        embed_dim=128,
-        contrast_dim=2,
-        input_dims=[128],
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        mode="inference",
-        sequence_encoder="transformer",
-        slice_pooling="cross_attention",
-        pooling_target="post_embed",
-        d_state=64,
-    ).to(DEVICE).eval()
-    model.embed["128"] = nn.Identity()
-
-    x_tensor = torch.arange(2 * 3 * 128, dtype=torch.float32, device=DEVICE).view(2, 3, 128)
-    x_tensor[0, 2] = 999.0
-    x = [x_tensor]
-    seq_lengths = torch.tensor([2, 3], dtype=torch.long, device=DEVICE)
-
-    with torch.no_grad():
-        y = model(x, seq_lengths=seq_lengths)
-        logits = model._embed_inference_forward(x)
-        mask = model._build_mask(seq_lengths, logits.shape[1])
-        h = model.seq_enc(logits, src_key_padding_mask=~mask)
-        h = model.norm(h)
-        expected = model._cross_attention_pooling(h, mask=mask, values=logits)
-
-    assert torch.allclose(y, expected, atol=1e-5, rtol=1e-5)
-
-
-def test_cobra_cross_attention_raw_pooling_target_raises():
-    with pytest.raises(ValueError, match="slice_pooling='abmil'"):
+def test_cobra_rejects_cross_attention_slice_pooling():
+    with pytest.raises(AssertionError, match="Invalid slice_pooling"):
         Cobra(
             embed_dim=128,
             contrast_dim=2,
@@ -399,10 +231,8 @@ def test_cobra_cross_attention_raw_pooling_target_raises():
             num_heads=4,
             num_layers=1,
             dropout=0.0,
-            mode="inference",
+            mode="train",
             slice_pooling="cross_attention",
-            pooling_target="raw",
-            sequence_encoder="transformer",
             d_state=64,
         )
 
@@ -579,20 +409,17 @@ def _build_tiled_cobra(mode="train", region_embedding=False, regional_tokens=4,
         att_dim=32,
     ).to(DEVICE).eval()
 
-def test_cobra_train_within_slice_aggregation():
-    """Tiled input is collapsed from per-region tokens to one embedding per slice."""
+def test_cobra_train_flattens_tiled_tokens():
     batch_size, num_slices, regions, feat_dim = 2, 6, 5, 64  # num_tiled_regions = 1 global + 2x2
     model = _build_tiled_cobra(mode="train", regional_tokens=4)
 
     x = torch.randn(batch_size, num_slices, regions, feat_dim, device=DEVICE)
     with torch.no_grad():
         y = model(x)
+        attn = model(x, get_attention=True)
     assert y.shape == (batch_size, 32)
     assert torch.isfinite(y).all()
-    # Region attention is cached after the within-slice aggregation
-    assert model.region_attention.shape == (batch_size, num_slices, 1, regions - 1)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
+    assert attn.shape == (batch_size, 1, num_slices * regions)
 
 
 def test_resolve_pooling_target_cobra_tiled_train():
@@ -685,9 +512,6 @@ def test_cobra_tiled_packed_train_forward():
 
     assert y.shape == (2, 32)
     assert torch.isfinite(y).all()
-    assert model.region_attention.shape == (1, total_slices, 1, 4)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
 
 
 def test_cobra_tiled_inference_avg_pool_multi_fm():
@@ -703,15 +527,14 @@ def test_cobra_tiled_inference_avg_pool_multi_fm():
     seq_lengths = torch.tensor([num_slices, 3], dtype=torch.long, device=DEVICE)
     with torch.no_grad():
         y = model(x, seq_lengths=seq_lengths)
+        attn = model(x, seq_lengths=seq_lengths, get_attention=True)
     assert y.shape == (batch_size, 64)  # embed_dim
     assert torch.isfinite(y).all()
-    assert model.region_attention.shape == (batch_size, num_slices, 1, regions - 1)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
+    assert attn.shape == (batch_size, 1, num_slices * regions)
 
 
 def test_cobra_tiled_inference_attention_pool_multi_fm():
-    """FM attention pooling works after per-FM within-slice aggregation."""
+    """FM attention pooling works over flattened slice-region tokens."""
     batch_size, num_slices, regions = 2, 5, 5
     model = Cobra(
         embed_dim=64,
@@ -739,13 +562,10 @@ def test_cobra_tiled_inference_attention_pool_multi_fm():
 
     assert y.shape == (batch_size, 64)
     assert torch.isfinite(y).all()
-    assert model.region_attention.shape == (batch_size, num_slices, 1, regions - 1)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
 
 
 def test_cobra_tiled_inference_post_embed_pooling():
-    """Tiled inference supports post_embed pooling after within-slice aggregation."""
+    """Tiled inference supports post_embed pooling over flattened slice-region tokens."""
     batch_size, num_slices, regions, feat_dim = 2, 5, 5, 64
     model = _build_tiled_cobra(mode="inference", regional_tokens=4, pooling_target="post_embed")
 
@@ -757,47 +577,44 @@ def test_cobra_tiled_inference_post_embed_pooling():
     assert torch.isfinite(y).all()
 
 
-def test_cobra_tiled_region_attention_query():
-    """get_region_attention returns the global->region attention distribution per slice."""
-    batch_size, num_slices, regions, feat_dim = 2, 4, 5, 64
-    model = _build_tiled_cobra(mode="inference", regional_tokens=4)
-
-    x = [torch.randn(batch_size, num_slices, regions, feat_dim, device=DEVICE)]
-    seq_lengths = torch.tensor([num_slices, num_slices], dtype=torch.long, device=DEVICE)
-    with torch.no_grad():
-        region_attn = model(x, seq_lengths=seq_lengths, get_region_attention=True)
-    assert region_attn.shape == (batch_size, num_slices, 1, regions - 1)
-    # Attention is a softmax distribution over the regional tokens
-    summed = region_attn.squeeze(2).sum(dim=-1)
-    assert torch.allclose(summed, torch.ones_like(summed), atol=1e-4)
-
-
 def test_cobra_tiled_region_embedding_adds_params():
     """Enabling region_embedding creates a learned embedding over (global + regional) tokens."""
     model = _build_tiled_cobra(mode="train", region_embedding=True, regional_tokens=4)
-    assert model.within_slice_agg.region_embed is not None
-    assert model.within_slice_agg.region_embed.weight.shape[0] == 5  # 1 global + 4 regions
+    assert model.region_embed is not None
+    assert model.region_embed.weight.shape[0] == 5  # 1 global + 4 regions
 
     model_no_embed = _build_tiled_cobra(mode="train", region_embedding=False, regional_tokens=4)
-    assert model_no_embed.within_slice_agg.region_embed is None
+    assert model_no_embed.region_embed is None
 
 
-def test_cobra_tiled_raw_pooling_target_raises():
-    """raw pooling is ill-defined for tiled features and must raise at construction."""
-    with pytest.raises(ValueError):
-        Cobra(
-            embed_dim=64,
-            contrast_dim=32,
-            input_dims=[64],
-            num_heads=4,
-            num_layers=1,
-            mode="inference",
-            sequence_encoder="transformer",
-            slice_pooling="abmil",
-            pooling_target="raw",
-            regional_tokens=4,
-            raw_output_dim=64,
-        )
+def test_cobra_tiled_raw_pooling_target_flattens_raw_tokens():
+    """Tiled raw pooling aggregates flattened global/regional FM tokens."""
+    batch_size, num_slices, regions, feat_dim = 2, 5, 5, 64
+    model = Cobra(
+        embed_dim=64,
+        contrast_dim=32,
+        input_dims=[64],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        sequence_encoder="transformer",
+        slice_pooling="abmil",
+        pooling_target="raw",
+        regional_tokens=4,
+        raw_output_dim=feat_dim,
+        att_dim=32,
+    ).to(DEVICE).eval()
+    x = [torch.randn(batch_size, num_slices, regions, feat_dim, device=DEVICE)]
+    seq_lengths = torch.tensor([num_slices, 3], dtype=torch.long, device=DEVICE)
+
+    with torch.no_grad():
+        y = model(x, seq_lengths=seq_lengths)
+        attn = model(x, seq_lengths=seq_lengths, get_attention=True)
+
+    assert y.shape == (batch_size, feat_dim)
+    assert torch.isfinite(y).all()
+    assert attn.shape == (batch_size, 1, num_slices * regions)
 
 
 def test_cobra_tiled_shape_layout_mismatch_raises():
@@ -820,7 +637,7 @@ def test_cobra_tiled_shape_layout_mismatch_raises():
 
 
 def test_cobra_zero_padded_slices_masks_batch_padding():
-    """Within-slice aggregation must ignore batch-padded slice positions."""
+    """Flattened tiled tokens must ignore batch-padded slice positions."""
     model = _build_tiled_cobra(mode="inference", regional_tokens=4)
     batch_size, max_slices, regions, feat_dim = 2, 6, 5, 64
     x = torch.randn(batch_size, max_slices, regions, feat_dim, device=DEVICE)

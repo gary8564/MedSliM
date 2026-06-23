@@ -614,13 +614,13 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "attention"])
     parser.add_argument("--sequence-encoder", type=str, default=None, choices=["mamba2", "transformer"])
-    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cross_attention", "cls"])
+    parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
     parser.add_argument(
         "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"],
         default=None,
         help="Which representation level ABMIL attention weights aggregate: "
-             "'post_encoder': encoder output, 'post_embed': after Embed MLP for global-only CLS; after within-slice aggregation for tiled multi-crop CLS. "
-             "'raw': original global-only FM embeddings. "
+             "'post_encoder': encoder output, 'post_embed': after Embed MLP for global-only CLS; after tiled tokens are flattened for tiled multi-crop CLS. "
+             "'raw': original FM embeddings; tiled tokens are flattened before pooling. "
              "If omitted, Cobra resolves to raw for global-only caches and post_embed for tiled caches."
     )
     parser.add_argument("--save-embeddings", action="store_true", help="Save embeddings to npz file")

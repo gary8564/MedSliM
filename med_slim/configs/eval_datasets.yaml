@@ -33,3 +33,8 @@ datasets:
         0: Normal
         1: Partial ACL Tear
         2: Complete ACL Tear
+      kneeMRI:
+    # task: binary
+    # target_labels: [acl]
+    # label_display_names:
+    #   acl: ACL Tear

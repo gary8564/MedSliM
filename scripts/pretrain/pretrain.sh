@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem-per-cpu=8G
-#SBATCH --time=24:00:00                 
+#SBATCH --time=4:00:00                 
 #SBATCH --job-name=pretrain
 #SBATCH --output=logs/pretrain/stdout_pretrain_%j.txt    
 #SBATCH --account=p0021834     
@@ -37,7 +37,7 @@ NUM_GPUS=1
 
 # Override slice encoder models from config
 # Available: dinov2, dinov3, rad-dino, medsiglip, biomedclip, ark, mri-core
-MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark mri-core medimageinsight"
+MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark mri-core medimageinsight curia"
 
 # Stage feature caches to local SSD to avoid disk I/O during training for network latency.
 # The training script caches all features in RAM after the first read.
@@ -68,7 +68,7 @@ PLANES=""
 
 # Sequence encoder and pooling
 SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
-POOLING="abmil"    # abmil (default), cross_attention, or cls (requires transformer encoder)
+POOLING="abmil"    # abmil (default) or cls (requires transformer encoder)
 USE_PACKED=false                   # true: packed sequences (no padding waste); false: evenly-spaced subsampling + padding
 PHYSICAL_PE=false                  # true: sinusoidal PE from physical slice positions (mm); essential for cross-domain
 REGIONAL_TOKENS=4                  # 0 = global CLS; 4 = tiled global + 2x2 regional CLS

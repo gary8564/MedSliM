@@ -85,7 +85,7 @@ class MoCo(nn.Module):
             T: Softmax temperature for contrastive loss.
             dropout: Dropout rate.
             sequence_encoder: "mamba2" (default) or "transformer".
-            pooling: Slice pooling method - "abmil" (default), "cross_attention", or "cls" (requires transformer).
+            pooling: Slice pooling method - "abmil" (default) or "cls" (requires transformer).
             physical_pe: Add sinusoidal positional encoding from physical
                 slice positions (mm) before the sequence encoder.
             msp_enabled: Enable Masked Slice Prediction auxiliary objective.

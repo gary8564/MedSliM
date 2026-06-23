@@ -191,11 +191,8 @@ def load_cobra_from_experiment(
 
     # Detect slice_pooling from weight keys
     has_abmil_keys = any(k.startswith("cobra.attn.") for k in raw.keys())
-    has_cross_attn_keys = any(k.startswith("cobra.cross_attn_pool.") for k in raw.keys())
     if has_abmil_keys:
         slice_pooling = "abmil"
-    elif has_cross_attn_keys:
-        slice_pooling = "cross_attention"
     else:
         slice_pooling = "cls"
 
@@ -206,41 +203,27 @@ def load_cobra_from_experiment(
     pooling_target = cfg.get("pooling_target")
     raw_output_dim = cfg.get("raw_output_dim")
 
-    # Tiled multi-crop CLS: detect within-slice aggregator from weight keys.
-    has_within_slice = any(k.startswith("cobra.within_slice_agg.") for k in raw.keys())
-    region_embed_key = "cobra.within_slice_agg.region_embed.weight"
+    # Tiled multi-crop CLS: region identity embeddings are optional because
+    # tiled tokens are now flattened directly into the sequence.
+    region_embed_key = "cobra.region_embed.weight"
     has_region_embed = region_embed_key in raw
     region_embedding = has_region_embed
 
     regional_tokens = int(cobra_cfg.get("regional_tokens", cfg.get("regional_tokens", 0)))
-    if has_within_slice:
+    if has_region_embed:
+        inferred = int(raw[region_embed_key].shape[0]) - 1
         if regional_tokens == 0:
-            if has_region_embed:
-                regional_tokens = int(raw[region_embed_key].shape[0]) - 1
-                logger.warning(
-                    "regional_tokens is specified as global-only setting, " 
-                    "but the model checkpoint contains within_slice_agg weights."
-                    "Inferred regional_tokens=%s from within_slice_agg.region_embed weights",
-                    regional_tokens,
-                )
-            else:
-                raise ValueError(
-                    "classifier.pt contains within_slice_agg weights, but regional_tokens "
-                    "is missing from cobra_config. Re-run linear probing after setting "
-                    "regional_tokens in the saved experiment config."
-                )
-        elif has_region_embed:
-            inferred = int(raw[region_embed_key].shape[0]) - 1
-            if regional_tokens != inferred:
-                raise ValueError(
-                    f"regional_tokens={regional_tokens} in cobra_config conflicts with "
-                    f"region_embed weights implying regional_tokens={inferred}."
-                )
-    elif regional_tokens > 0:
-        raise ValueError(
-            f"cobra_config specifies regional_tokens={regional_tokens}, but classifier.pt "
-            "has no within_slice_agg weights."
-        )
+            regional_tokens = inferred
+            logger.warning(
+                "regional_tokens is specified as global-only, but classifier.pt "
+                "contains region_embed weights. Inferred regional_tokens=%s.",
+                regional_tokens,
+            )
+        elif regional_tokens != inferred:
+            raise ValueError(
+                f"regional_tokens={regional_tokens} in cobra_config conflicts with "
+                f"region_embed weights implying regional_tokens={inferred}."
+            )
 
     logger.info(
         "Loading COBRA from experiment: "
@@ -263,11 +246,12 @@ def load_cobra_from_experiment(
     logger.info(f"Inference pooling_target={model.pooling_target}")
 
     # Extract cobra.* weights from classifier state dict
-    cobra_weights = {
-        k[len("cobra."):]: v
-        for k, v in raw.items()
-        if k.startswith("cobra.")
-    }
+    cobra_weights = {}
+    for k, v in raw.items():
+        if not k.startswith("cobra."):
+            continue
+        new_key = k[len("cobra."):]
+        cobra_weights[new_key] = v
     if not cobra_weights:
         raise ValueError("No cobra.* keys found in classifier.pt")
 

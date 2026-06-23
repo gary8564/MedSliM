@@ -46,7 +46,7 @@ from med_slim.utils.metrics.linear import (
     get_num_classes,
     compute_class_weights_for_weighted_loss,
 )
-from med_slim.utils.viz.linear import compute_and_visualize_metrics
+from med_slim.utils.viz.linear import compute_and_visualize_metrics, compute_youden_thresholds
 from med_slim.logging.setup import init_logging
 
 init_logging()
@@ -320,11 +320,13 @@ def _build_predictions_dataframe(
     sample_ids: List[str],
     task: str,
     target_labels: List[str],
+    thresholds: Optional[np.ndarray | float] = None,
 ) -> pd.DataFrame:
     """Format Curia classifier predictions like MedSliM linear evaluation output."""
     if task == "binary":
         probs = probs.squeeze(-1) if probs.ndim > 1 else probs
-        pred_labels = (probs >= 0.5).astype(int)
+        threshold = 0.5 if thresholds is None else float(thresholds)
+        pred_labels = (probs >= threshold).astype(int)
         return pd.DataFrame({
             "exam_id": sample_ids,
             "true_labels": true_labels.tolist(),
@@ -333,7 +335,12 @@ def _build_predictions_dataframe(
         })
 
     if task == "multilabel":
-        pred_labels = (probs >= 0.5).astype(int)
+        threshold_arr = (
+            np.full(probs.shape[1], 0.5)
+            if thresholds is None
+            else np.asarray(thresholds, dtype=float)
+        )
+        pred_labels = (probs >= threshold_arr).astype(int)
         df_results = pd.DataFrame({"exam_id": sample_ids})
         df_results["true_labels"] = [list(map(int, row)) for row in true_labels]
         df_results["pred_labels"] = [
@@ -417,7 +424,12 @@ def main(args):
         class_names = build_multiclass_label_names(target_labels[0], ds_meta["multiclass_label_maps"])
 
     annotations_dir = cfg["annotations_dir"]
-    annot_paths = get_annotation_paths_by_split(annotations_dir, task, splits=["train", "test"])
+    annot_paths = get_annotation_paths_by_split(
+        annotations_dir,
+        task,
+        splits=["train", "test"],
+        optional_splits=["val"],
+    )
     train_annots = annot_paths["train"]
     test_annots = annot_paths["test"]
     val_annots = annot_paths.get("val")
@@ -447,7 +459,7 @@ def main(args):
         )
 
     # Datasets
-    train_ds = LabeledSliceDataset(
+    labeled_train_ds = LabeledSliceDataset(
         path_root=data_dir, split="train", annotations_path=train_annots,
         task=task, target_columns=target_labels, transform=val_transform, plane=plane,
     )
@@ -462,16 +474,19 @@ def main(args):
             path_root=data_dir, split="val", annotations_path=val_annots,
             task=task, target_columns=target_labels, transform=val_transform, plane=plane,
         )
+        train_ds = labeled_train_ds
     else:
-        all_labels = np.array([train_ds._get_label(sid).numpy() for sid in train_ds.sample_ids])
+        all_labels = np.array([
+            labeled_train_ds._get_label(sid).numpy() for sid in labeled_train_ds.sample_ids
+        ])
         train_idx, val_idx = train_test_split(
-            np.arange(len(train_ds)),
+            np.arange(len(labeled_train_ds)),
             test_size=hp.get("val_split_ratio", 0.1),
             stratify=all_labels,
             shuffle=True,
         )
-        val_ds = Subset(train_ds, val_idx)
-        train_ds = Subset(train_ds, train_idx)
+        val_ds = Subset(labeled_train_ds, val_idx)
+        train_ds = Subset(labeled_train_ds, train_idx)
 
     if accelerator.is_main_process:
         logger.info(f"Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
@@ -487,7 +502,7 @@ def main(args):
 
     # Model
     model_cfg = cfg.get("model", {})
-    num_classes_resolved = get_num_classes(task, target_labels, test_ds if not isinstance(test_ds, Subset) else test_ds.dataset)
+    num_classes_resolved = get_num_classes(task, target_labels, test_ds)
     model = CuriaClassifier(
         model_repo=model_cfg.get("model_repo", "raidium/curia"),
         local_cache_dir=model_cfg.get("local_cache_dir"),
@@ -599,6 +614,24 @@ def main(args):
                 early_stopping.load_best_model(unwrapped)
                 break
 
+    # Validation-derived decision thresholds for threshold-based test metrics.
+    val_loss, val_metrics, val_logits, val_labels, _ = evaluate(
+        model, val_loader, task, criterion, num_classes_resolved, accelerator,
+    )
+    val_thresholds = None
+    if accelerator.is_main_process:
+        if task == "binary":
+            val_probs = torch.sigmoid(val_logits.squeeze(-1)).cpu().numpy()
+        elif task == "multilabel":
+            val_probs = torch.sigmoid(val_logits).cpu().numpy()
+        else:
+            val_probs = torch.softmax(val_logits, dim=-1).cpu().numpy()
+        val_thresholds = compute_youden_thresholds(
+            y_true=val_labels.cpu().numpy(),
+            y_pred_prob=val_probs,
+            task=task,
+        )
+
     # Test evaluation
     if accelerator.is_main_process:
         logger.info("Evaluating on test set ...")
@@ -625,7 +658,7 @@ def main(args):
         fig_dir = os.path.join(output_dir, "fig")
         viz_metrics = compute_and_visualize_metrics(
             y_true=true_np, y_pred_prob=probs, task=task,
-            class_labels=viz_labels, output_dir=fig_dir,
+            class_labels=viz_labels, output_dir=fig_dir, thresholds=val_thresholds,
         )
         logger.info(f"Plots saved to {fig_dir}")
 
@@ -646,6 +679,7 @@ def main(args):
             sample_ids=test_ids,
             task=task,
             target_labels=target_labels,
+            thresholds=val_thresholds,
         )
         predictions.to_csv(os.path.join(table_dir, "predictions.csv"), index=False)
         logger.info(f"Predictions saved to {os.path.join(table_dir, 'predictions.csv')}")

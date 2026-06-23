@@ -573,11 +573,12 @@ if __name__ == "__main__":
         "--sequence-encoder", type=str, choices=["mamba2", "transformer"], default=None,
     )
     parser.add_argument(
-        "--slice-pooling", type=str, choices=["abmil", "cross_attention", "cls"], default=None,
+        "--slice-pooling", type=str, choices=["abmil", "cls"], default=None,
     )
     parser.add_argument(
         "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"], default=None,
         help="Which representation level ABMIL attention weights aggregate. "
+             "Raw pooling uses original FM embeddings and flattens tiled tokens when present. "
              "If using default None, Cobra resolves to raw for global-only FM caches and post_embed for tiled multi-crop CLS caches.",
     )
     args = parser.parse_args()

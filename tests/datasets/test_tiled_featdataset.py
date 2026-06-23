@@ -176,9 +176,6 @@ def test_PrecomputedFeatPairDataset_packed_mode(tiled_cache):
 
     assert y.shape == (2, 16)
     assert torch.isfinite(y).all()
-    assert model.region_attention.shape == (1, total_slices, 1, NUM_REGIONS - 1)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
 
 
 def test_validate_feature_metadata_rejects_global_only_with_tiled_metadata():

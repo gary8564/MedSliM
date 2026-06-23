@@ -113,7 +113,7 @@ def main():
     parser.add_argument("--amp", type=str, default=None, choices=["fp16", "bf16"],
                         help="Use automatic mixed precision: 'fp16' or 'bf16' (recommended)")
     parser.add_argument("--model-name", type=str, default="dinov2",
-                        choices=["ark", "dinov2", "dinov3", "rad-dino", "medsiglip",
+                        choices=["ark", "curia", "dinov2", "dinov3", "rad-dino", "medsiglip",
                                  "biomedclip", "mri-core", "medimageinsight"],
                         help="Slice encoder backbone.")
     parser.add_argument("--model-repo", type=str, default=None,
@@ -265,7 +265,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if tiled_mode:
-        ds = TiledSliceDataset(
+        slice_ds = TiledSliceDataset(
             path_root=args.data_dir,
             split=args.split,
             pre_tile_transform=pre_tile_transform,
@@ -275,7 +275,7 @@ def main():
             mri_sequences=mri_sequences,
         )
     else:
-        ds = SliceDataset(
+        slice_ds = SliceDataset(
             path_root=args.data_dir,
             split=args.split,
             transform=image_transforms,
@@ -283,13 +283,17 @@ def main():
             mri_sequences=mri_sequences,
         )
 
+    # `slice_ds` keeps custom metadata helpers; `loader_ds` may be wrapped in Subset for
+    # filtering/sharding and is only passed to the DataLoader.
+    loader_ds = slice_ds
+
     # Filter out volumes with too few slices
     if args.min_slices > 0:
         valid_indices = []
         skipped = []
-        for idx in range(len(ds)):
-            uid = ds.sample_ids[idx]
-            img_path = ds.get_nifti_path(uid)
+        for idx in range(len(slice_ds)):
+            uid = slice_ds.sample_ids[idx]
+            img_path = slice_ds.get_nifti_path(uid)
             n_slices = nib.load(str(img_path)).shape[2]
             if n_slices >= args.min_slices:
                 valid_indices.append(idx)
@@ -299,17 +303,17 @@ def main():
             print(f"Skipping {len(skipped)} volumes with less than {args.min_slices} slices:")
             for uid, n in skipped:
                 print(f"  {uid}: {n} slices")
-            ds = Subset(ds, valid_indices)
+            loader_ds = Subset(slice_ds, valid_indices)
 
     # Apply sharding for parallel processing
     if args.num_shards > 1:
-        all_indices = list(range(len(ds)))
+        all_indices = list(range(len(loader_ds)))
         shard_indices = [idx for idx in all_indices if idx % args.num_shards == args.shard_id]
-        ds = Subset(ds, shard_indices)
-        print(f"Shard {args.shard_id}/{args.num_shards}: Processing {len(ds)}/{len(all_indices)} samples")
+        loader_ds = Subset(loader_ds, shard_indices)
+        print(f"Shard {args.shard_id}/{args.num_shards}: Processing {len(loader_ds)}/{len(all_indices)} samples")
 
     data_loader = DataLoader(
-        ds,
+        loader_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=args.workers,
@@ -379,7 +383,7 @@ def main():
                         args.curia_spatial_pool_kernel_size
                     )
                 # Extract inter-slice spacing from the NIfTI header
-                nifti_path = ds.get_nifti_path(uid)
+                nifti_path = slice_ds.get_nifti_path(uid)
                 if nifti_path.is_file():
                     zooms = nib.load(str(nifti_path)).header.get_zooms()
                     # Depth axis (axis 2 in (C,W,H,D) convention) gives slice spacing
