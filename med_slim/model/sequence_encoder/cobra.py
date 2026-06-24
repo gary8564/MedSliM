@@ -16,7 +16,12 @@ from contextlib import contextmanager
 
 from .mamba2 import Mamba2Enc
 from .transformer import TransformerEncoderLayer, VarlenTransformerEncoder
-from med_slim.model.attention_pooling import BatchedABMIL
+from .fm_router import FMRouter
+from .positional_encoding import sinusoidal_position_encoding
+from med_slim.model.attention_pooling import (
+    BatchedABMIL,
+    InterSliceAggregator,
+)
 from med_slim.logging.setup import init_logging
 
 init_logging()
@@ -28,7 +33,7 @@ POOLING_TARGETS = ("post_encoder", "post_embed", "raw")
 def _resolve_pooling_target(
     mode: str,
     pooling_target: Optional[str],
-    regional_tokens: int,
+    regional_tokens: int = 0,
     slice_pooling: str = "abmil",
 ) -> Optional[str]:
     if mode not in ("train", "inference"):
@@ -56,36 +61,11 @@ def _resolve_pooling_target(
     resolved = pooling_target
     if resolved is None:
         resolved = (
-            "raw" if slice_pooling == "abmil" and regional_tokens == 0 else "post_embed"
+            "raw"
+            if slice_pooling == "abmil" and regional_tokens == 0
+            else "post_embed"
         )
     return resolved
-
-
-def sinusoidal_position_encoding(
-    positions: torch.Tensor,
-    dim: int,
-    base: float = 10000.0,
-) -> torch.Tensor:
-    """
-    Compute sinusoidal positional encoding from continuous positions (e.g. mm).
-
-    PE(p, 2i)   = sin(p / base^{2i/d})
-    PE(p, 2i+1) = cos(p / base^{2i/d})
-
-    Args:
-        positions: Arbitrary-shape tensor of positions (e.g. in millimeters).
-        dim: Embedding dimensionality (must be even).
-        base: Frequency base (default 10000, following Vaswani et al.).
-
-    Returns:
-        Sinusoidal encoding with shape ``(*positions.shape, dim)``.
-    """
-    assert dim % 2 == 0, "Embedding dimension must be even for sinusoidal PE"
-    half = dim // 2
-    freq_indices = torch.arange(half, device=positions.device, dtype=positions.dtype)
-    inv_freq = 1.0 / (base ** (freq_indices / half))  
-    angles = positions.unsqueeze(-1) * inv_freq 
-    return torch.cat([angles.sin(), angles.cos()], dim=-1) 
 
 
 class Embed(nn.Module):
@@ -140,7 +120,16 @@ class Cobra(nn.Module):
         raw_output_dim: int = None,
         physical_pe: bool = False,
         regional_tokens: int = 0,
-        region_embedding: bool = False,
+        num_fms: Optional[int] = None,
+        per_fm_adapter_mode: str = "per_dim",
+        fm_input_dims: Optional[List[int]] = None,
+        router_use_fm_embedding: bool = True,
+        router_use_fm_logit_bias: bool = True,
+        router_use_fm_logit_scale: bool = False,
+        router_mode: str = "soft",
+        router_top_k: Optional[int] = None,
+        router_temperature: float = 1.0,
+        router_learnable_temperature: bool = False,
         **kwargs
     ):
         """
@@ -153,16 +142,16 @@ class Cobra(nn.Module):
             dropout: Dropout rate.
             mode: 'train' or 'inference'.
             sequence_encoder: 'mamba2' or 'transformer'.
-            fm_pooling: 'avg_pool' or 'attention' in inference mode.
-                - 'avg_pool': Average pool embeddings across foundation models.
-                - 'attention': Learn attention weights to pool FM embeddings per slice (requires fine-tuning).
+            fm_pooling: 'avg_pool' or 'router'.
+                - 'avg_pool': Uniform average pooling over the selected foundation models.
+                - 'router': Variable-K soft per-slice FMRouter (MoE-style gating).
             slice_pooling: 'abmil' or 'cls' (cls requires transformer).
             pooling_target: Which representation level to aggregate at inference.
                 Ignored in training mode, where Cobra always pools post-encoder hidden
                 states for contrastive pretraining. When None, inference defaults are
                 resolved by ``_resolve_pooling_target`` (see that helper for per-path
                 defaults). Meaning depends on ``slice_pooling``:
-                - 'abmil': attention weights come from encoder output; pooling_target
+                - 'abmil': ABMIL attention weights come from encoder output; pooling_target
                   selects which features they aggregate ('raw', 'post_embed', or
                   'post_encoder'). For tiled features, 'raw' pools flattened global
                   and regional FM tokens.
@@ -170,18 +159,31 @@ class Cobra(nn.Module):
                   sequence-encoder CLS token. Resolved pooling_target is None
             raw_output_dim: FM embedding dimension for the 'raw' pooling target.
                 Required in inference mode when the resolved pooling_target is 'raw'.
-            physical_pe: If True, add sinusoidal positional encoding based on physical slice positions (in mm) before the sequence encoder.
+            physical_pe: If True, add sinusoidal positional encoding based on normalized relative slice depth in [0, 1] before the sequence encoder.
                 Requires ``physical_positions`` to be passed during forward.
             regional_tokens: Number of regional crop tokens per slice for tiled multi-crop CLS (e.g. 4 for a 2x2 grid). 0 (default) disables tiled
                 mode and keeps the global-only CLS pathway. When > 0, [B, num_slices, 1+regional_tokens, embed_dim]
                 tokens are flattened to [B, num_slices*(1+regional_tokens), embed_dim] before the sequence encoder.
-            region_embedding: If True (and regional_tokens > 0), add a small learned region embedding over the (global + regional) tokens before flattening.
+            num_fms: Total number of foundation models. Required when fm_pooling='router'.
+            per_fm_adapter_mode: Projection-adapter keying for the FM-set paths (subset SSL and
+                inference FM-set). 'per_dim' shares one Embed MLP across FMs of the same input
+                dim. 'per_fm_id' builds one Embed MLP per global FM id so each FM is a distinct expert. 
+                Pair SSL and all packed paths always use the dim-keyed adapters based on COBRA approach.
+            fm_input_dims: Input feature dim per global FM id (ordered by global FM id). Required
+                when per_fm_adapter_mode='per_fm_id'; used to size the per-FM Embed adapters.
+            router_use_fm_embedding: Add learned per-FM identity embedding before scoring.
+            router_use_fm_logit_bias: Add learned per-FM additive logit bias to each FM token before scoring.
+            router_use_fm_logit_scale: Add learned per-FM positive logit scale factor to each FM token before scoring.
+            router_mode: 'soft' (dense softmax) or 'topk' (sparse top-k softmax).
+            router_top_k: Number of FMs kept when router_mode='topk'.
+            router_temperature: Router softmax temperature.
+            router_learnable_temperature: If True, the router temperature is a learned parameter.
             **kwargs: Additional encoder-specific parameters:
                 - d_state: Mamba2 state dimension (default: 128)
                 - dim_feedforward: Transformer FFN dimension (default: 4*embed_dim)
                 - norm_first: Pre-LN transformer (default: True)
                 - rotary_positional_encoding: RoPE config (default: None)
-                - att_dim: ABMIL hidden dimension for slice and FM attention pooling (default: 256)
+                - att_dim: ABMIL hidden dimension for slice pooling (default: 256)
         """
         super().__init__()
 
@@ -190,8 +192,13 @@ class Cobra(nn.Module):
 
         assert mode in ["train", "inference"]
         assert sequence_encoder in ["mamba2", "transformer"]
-        if mode == "inference":
-            assert fm_pooling in ["avg_pool", "attention"], f"Invalid fm_pooling '{fm_pooling}'. Must be one of 'avg_pool', 'attention'."
+        assert fm_pooling in ["avg_pool", "router"], (
+            f"Invalid fm_pooling '{fm_pooling}'. Must be one of 'avg_pool', 'router'."
+        )
+        assert per_fm_adapter_mode in ["per_dim", "per_fm_id"], (
+            f"Invalid per_fm_adapter_mode '{per_fm_adapter_mode}'. "
+            f"Must be one of 'per_dim', 'per_fm_id'."
+        )
         assert slice_pooling in ["abmil", "cls"], (
             f"Invalid slice_pooling '{slice_pooling}'. Must be one of 'abmil', 'cls'."
         )
@@ -217,18 +224,36 @@ class Cobra(nn.Module):
         self._raw_output_dim = raw_output_dim
         self.sequence_encoder = sequence_encoder
         self.fm_pooling = fm_pooling
+        self.num_fms = num_fms
         self.slice_pooling = slice_pooling
         self.physical_pe = physical_pe
 
         # Tiled multi-crop CLS: keep global + regional tokens as sequence tokens.
         self.regional_tokens = regional_tokens
-        self.region_embedding = region_embedding
-        self.region_embed = None
-        if regional_tokens > 0:
-            num_regions = 1 + regional_tokens  # global + regional crops
-            self.region_embed = nn.Embedding(num_regions, embed_dim) if region_embedding else None
 
-        self.embed = nn.ModuleDict({str(d): Embed(d, embed_dim) for d in input_dims})
+        # FM-set projection adapters.
+        self._last_fm_stats = None # For router load-balance/z-loss
+        self.per_fm_adapter_mode = per_fm_adapter_mode
+        self.fm_input_dims = list(fm_input_dims) if fm_input_dims is not None else None
+        self.embed = None
+        self.embed_fm = None
+        if per_fm_adapter_mode == "per_dim":
+            self.embed = nn.ModuleDict({str(d): Embed(d, embed_dim) for d in input_dims})
+        else:
+            if fm_input_dims is None:
+                raise ValueError(
+                    "per_fm_adapter_mode='per_fm_id' requires fm_input_dims "
+                    "(input dim per global FM id)."
+                )
+            if num_fms is not None and len(fm_input_dims) != num_fms:
+                raise ValueError(
+                    f"fm_input_dims length ({len(fm_input_dims)}) must equal num_fms "
+                    f"({num_fms})."
+                )
+            self.embed_fm = nn.ModuleDict(
+                {str(i): Embed(d, embed_dim) for i, d in enumerate(fm_input_dims)}
+            )
+
         self.norm = nn.LayerNorm(embed_dim)
 
         if self.sequence_encoder == "mamba2":
@@ -302,19 +327,24 @@ class Cobra(nn.Module):
                 for _ in range(self.num_heads)
             ])
         
-        # FM attention pooling for inference mode
-        # Learns to weight different foundation model embeddings at each slice position
-        # fm_attn is randomly initialized in inference mode and not loaded from checkpoint.
-        # This is intended for FINE-TUNING COBRA (where fm_attn will be trained).
-        # For LINEAR PROBING (frozen COBRA), use fm_pooling='avg_pool' instead.
-        self.fm_attn = None
-        if mode == "inference" and fm_pooling == "attention":
-            self.fm_attn = BatchedABMIL(
-                input_dim=embed_dim,
-                hidden_dim=kwargs.get('att_dim', 256),
-                dropout=0.5,
-                n_heads=1,
-                activation='softmax',
+        # FM fusion modules: weight/select different foundation model embeddings at each slice.
+        self.fm_router = None
+        if fm_pooling == "router":
+            if num_fms is None:
+                raise ValueError(
+                    "fm_pooling='router' requires num_fms (total number of FMs)."
+                )
+            self.fm_router = FMRouter(
+                embed_dim=embed_dim,
+                num_fms=num_fms,
+                use_fm_embedding=router_use_fm_embedding,
+                use_fm_logit_bias=router_use_fm_logit_bias,
+                use_fm_logit_scale=router_use_fm_logit_scale,
+                dropout=dropout,
+                router_mode=router_mode,
+                top_k=router_top_k,
+                temperature=router_temperature,
+                learnable_temperature=router_learnable_temperature,
             )
 
     def _apply_physical_pe(
@@ -324,11 +354,11 @@ class Cobra(nn.Module):
         seq_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Add sinusoidal PE keyed on physical positions (mm) to embedded features.
+        Add sinusoidal PE keyed on relative slice depth in [0, 1] to embedded features.
 
         PE at padded positions is zeroed out so that padding remains inert.
         Without this, PE(0) = [0, 1, 0, 1, ...] (cos(0)=1) would inject a
-        non-zero signal into padded positions and make position 0mm ambiguous
+        non-zero signal into padded positions and make relative depth 0 ambiguous
         with padding.
         """
         pe = sinusoidal_position_encoding(physical_positions, self.embed_dim)
@@ -433,6 +463,17 @@ class Cobra(nn.Module):
         
         return cls_to_slices.unsqueeze(1)  # [B, 1, num_slices]
 
+    def _per_dim_adapter(self, feat_dim: int) -> Embed:
+        """Return a dim-keyed adapter for FM-set, or fail clearly when it is not instantiated."""
+        if self.embed is None:
+            raise ValueError(
+                "Per-dim projection adapters are disabled "
+                "because per_fm_adapter_mode='per_fm_id'. "
+                "This mode only supports FM-set inputs with fm_ids (router subset SSL or FM-set inference). "
+                "Use per_fm_adapter_mode='per_dim' for pair SSL or packed dim-keyed inputs."
+            )
+        return self.embed[str(feat_dim)]
+
     def _embed_ssl_forward(self, x, input_feature_dims=None) -> torch.Tensor:
         """
         Foundation model feature embedding in SSL pretraining mode.
@@ -444,9 +485,9 @@ class Cobra(nn.Module):
         """
         if input_feature_dims is not None:
             assert len(x)==len(input_feature_dims), "Batch size mismatch between input x and input_feature_dims"
-            logits = torch.concat([self.embed[str(input_feature_dims[i].item())](x[i][..., :input_feature_dims[i].item()]).unsqueeze(0) for i in range(len(x))], dim=0) # [B, num_slices, (num_tiled_regions,) embed_dim]
+            logits = torch.concat([self._per_dim_adapter(input_feature_dims[i].item())(x[i][..., :input_feature_dims[i].item()]).unsqueeze(0) for i in range(len(x))], dim=0) # [B, num_slices, (num_tiled_regions,) embed_dim]
         else:
-            logits = self.embed[str(x.shape[-1])](x)  # [B, num_slices, (num_tiled_regions,) embed_dim]
+            logits = self._per_dim_adapter(x.shape[-1])(x)  # [B, num_slices, (num_tiled_regions,) embed_dim]
         return logits
 
     def _embed_ssl_forward_packed_global_only(
@@ -457,7 +498,7 @@ class Cobra(nn.Module):
     ) -> torch.Tensor:
         """Embed packed global-only CLS features [total_slices, input_embed_dim]."""
         if input_feature_dims is None:
-            return self.embed[str(x.shape[-1])](x)  # [total_slices, embed_dim]
+            return self._per_dim_adapter(x.shape[-1])(x)  # [total_slices, embed_dim]
 
         input_feature_dims = input_feature_dims.to(device=x.device, dtype=torch.long)
         total_seq_len = x.shape[0]
@@ -466,7 +507,7 @@ class Cobra(nn.Module):
 
         if len(unique_dims) == 1:
             feat_dim = unique_dims[0].item()
-            return self.embed[str(feat_dim)](x[:, :feat_dim])
+            return self._per_dim_adapter(feat_dim)(x[:, :feat_dim])
 
         slice_feat_dims = torch.repeat_interleave(input_feature_dims, seq_lens)  # [total_slices]
         logits = None
@@ -474,7 +515,7 @@ class Cobra(nn.Module):
             feat_dim = dim.item()
             mask = slice_feat_dims == dim  # [total_slices]
             x_group = x[mask, :feat_dim]  # [num_slices_for_dim, input_embed_dim]
-            embedded = self.embed[str(feat_dim)](x_group)  # [num_slices_for_dim, embed_dim]
+            embedded = self._per_dim_adapter(feat_dim)(x_group)  # [num_slices_for_dim, embed_dim]
             if logits is None:
                 logits = torch.zeros(total_seq_len, self.embed_dim, device=x.device, dtype=embedded.dtype)
             logits[mask] = embedded
@@ -488,7 +529,7 @@ class Cobra(nn.Module):
     ) -> torch.Tensor:
         """Embed packed tiled CLS features [total_slices, num_tiled_regions, input_embed_dim]."""
         if input_feature_dims is None:
-            return self.embed[str(x.shape[-1])](x)  # [total_slices, num_tiled_regions, embed_dim]
+            return self._per_dim_adapter(x.shape[-1])(x)  # [total_slices, num_tiled_regions, embed_dim]
 
         input_feature_dims = input_feature_dims.to(device=x.device, dtype=torch.long)
         total_seq_len, num_tiled_regions = x.shape[:2]
@@ -497,7 +538,7 @@ class Cobra(nn.Module):
 
         if len(unique_dims) == 1:
             feat_dim = unique_dims[0].item()
-            return self.embed[str(feat_dim)](x[..., :feat_dim])
+            return self._per_dim_adapter(feat_dim)(x[..., :feat_dim])
 
         slice_feat_dims = torch.repeat_interleave(input_feature_dims, seq_lens)  # [total_slices]
         logits = None
@@ -505,7 +546,7 @@ class Cobra(nn.Module):
             feat_dim = dim.item()
             mask = slice_feat_dims == dim  # [total_slices]
             x_group = x[mask, :, :feat_dim]  # [num_slices_for_dim, num_tiled_regions, input_embed_dim]
-            embedded = self.embed[str(feat_dim)](x_group)  # [num_slices_for_dim, num_tiled_regions, embed_dim]
+            embedded = self._per_dim_adapter(feat_dim)(x_group)  # [num_slices_for_dim, num_tiled_regions, embed_dim]
             if logits is None:
                 logits = torch.zeros(
                     total_seq_len,
@@ -545,174 +586,214 @@ class Cobra(nn.Module):
             "or [total_slices, num_tiled_regions, input_embed_dim] for tiled multi-crop CLS."
         )
 
-    def _get_num_tiled_regions(self, x, *, packed: bool = False) -> int:
-        """Return number of tiled regions from the shape of the input tensor."""
-        if isinstance(x, list):
-            return x[0].shape[2] if x[0].dim() == 4 else 1
-        if packed:
-            return x.shape[1] if x.dim() == 3 else 1
-        return x.shape[2] if x.dim() == 4 else 1
-
-    def _add_region_embedding(self, logits: torch.Tensor) -> torch.Tensor:
-        """Add optional global/regional identity embeddings before flattening."""
-        if self.region_embed is None:
-            return logits
-        num_regions = logits.shape[-2]
-        region_ids = torch.arange(num_regions, device=logits.device)
-        view_shape = [1] * logits.dim()
-        view_shape[-2] = num_regions
-        view_shape[-1] = self.embed_dim
-        return logits + self.region_embed(region_ids).view(*view_shape)
-
-    def _flatten_tiled_regions(self, logits: torch.Tensor, *, packed: bool = False) -> torch.Tensor:
-        """
-        Flatten tiled per-slice tokens into the sequence dimension.
-
-        Padded mode expects [B, num_slices, num_tiled_regions, embed_dim].
-        Packed mode expects [total_slices, num_tiled_regions, embed_dim].
-        Global-only tensors are passed through unchanged when the model is not tiled.
-        """
-        tiled_rank = 3 if packed else 4
-        global_rank = 2 if packed else 3
-
-        if logits.dim() == tiled_rank:
-            if self.regional_tokens <= 0:
-                shape_hint = (
-                    "[total_slices, num_tiled_regions, embed_dim]"
-                    if packed
-                    else "[B, num_slices, num_tiled_regions, embed_dim]"
-                )
-                raise ValueError(
-                    f"Expected tiled features {shape_hint} but the model was built without "
-                    "tiled token support. Set regional_tokens > 0 when constructing Cobra."
-                )
-
-            num_tiled_regions = logits.shape[1] if packed else logits.shape[2]
-            expected_regions = 1 + self.regional_tokens
-            if num_tiled_regions != expected_regions:
-                raise ValueError(
-                    f"Expected {expected_regions} tiled regions per slice "
-                    f"(1 global + {self.regional_tokens} regional), got {num_tiled_regions}."
-                )
-
-            logits = self._add_region_embedding(logits)
-            if packed:
-                return logits.reshape(logits.shape[0] * num_tiled_regions, self.embed_dim)
-
-            return logits.reshape(logits.shape[0], logits.shape[1] * num_tiled_regions, self.embed_dim)
-
-        if self.regional_tokens > 0 and logits.dim() == global_rank:
+    def _validate_num_regions(self, num_regions: int) -> None:
+        expected = 1 + self.regional_tokens
+        if self.regional_tokens <= 0:
             raise ValueError(
-                "regional_tokens > 0 but received global-only features. Provide tiled "
-                "multi-crop CLS caches with shape "
-                "[total_slices, num_tiled_regions, input_embed_dim] in packed mode or "
-                "[B, num_slices, num_tiled_regions, input_embed_dim] in padded mode."
+                "Received tiled regional-token features, but regional_tokens=0. "
+                "Set regional_tokens to the number of regional crop tokens."
+            )
+        if num_regions != expected:
+            raise ValueError(
+                f"Expected {expected} tokens per slice "
+                f"(1 global + {self.regional_tokens} regional), got {num_regions}."
             )
 
-        return logits
-
-    def _flatten_raw_tiled_regions(self, raw_x: torch.Tensor, *, packed: bool = False) -> torch.Tensor:
-        """Flatten raw tiled FM features to match ABMIL token attention length."""
-        if packed:
-            if raw_x.dim() == 3:
-                return raw_x.reshape(raw_x.shape[0] * raw_x.shape[1], raw_x.shape[2])
-            return raw_x
-        if raw_x.dim() == 4:
-            return raw_x.reshape(raw_x.shape[0], raw_x.shape[1] * raw_x.shape[2], raw_x.shape[3])
-        return raw_x
-
-    def _expand_seq_lengths_for_regions(
-        self,
+    @staticmethod
+    def _expand_lengths_for_regions(
         seq_lengths: torch.Tensor | None,
         num_regions: int,
     ) -> torch.Tensor | None:
-        if seq_lengths is None or num_regions == 1:
-            return seq_lengths
+        if seq_lengths is None:
+            return None
         return seq_lengths * num_regions
 
-    def _expand_positions_for_regions(
-        self,
+    @staticmethod
+    def _expand_physical_positions_for_regions(
         physical_positions: torch.Tensor | None,
         num_regions: int,
-        *,
-        dim: int,
     ) -> torch.Tensor | None:
-        if physical_positions is None or num_regions == 1:
-            return physical_positions
-        return physical_positions.repeat_interleave(num_regions, dim=dim)
+        if physical_positions is None:
+            return None
+        return physical_positions.repeat_interleave(num_regions, dim=-1)
 
-    def _expand_mask_for_regions(
+    def _flatten_regional_tokens(
         self,
-        mask: torch.Tensor | None,
-        num_regions: int,
+        x: torch.Tensor,
         *,
-        dim: int,
-    ) -> torch.Tensor | None:
-        if mask is None or num_regions == 1:
-            return mask
-        return mask.repeat_interleave(num_regions, dim=dim)
+        fm_set_layout: bool = False,
+        packed: bool = False,
+        seq_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, int]:
+        """
+        Flatten regional tokens into the sequence dimension without learned aggregation.
 
-    def _expand_packed_metadata_for_regions(
+        `fm_set_layout` is controlled by tensor layout:
+        - `fm_set_layout=False`: single-FM view without leading K axis. Global-only
+          shapes are `[B, D, E]` or packed `[T, E]`.
+        - `fm_set_layout=True`: FM-set layout with a leading K axis. Global-only
+          shape is `[K, B, D, E]`.
+        """
+        if fm_set_layout:
+            if x.dim() == 4:
+                return x, seq_lengths, 1
+            if x.dim() != 5:
+                raise ValueError(
+                    f"FM-set inputs must be rank 4 (global-only) or rank 5 "
+                    f"(regional tokens), got rank {x.dim()}."
+                )
+            num_fms, batch_size, num_slices, num_regions, embed_dim = x.shape
+            self._validate_num_regions(num_regions)
+            flat = x.reshape(num_fms, batch_size, num_slices * num_regions, embed_dim)
+            return flat, self._expand_lengths_for_regions(seq_lengths, num_regions), num_regions
+
+        tiled_rank = 3 if packed else 4
+        global_rank = 2 if packed else 3
+
+        if x.dim() == tiled_rank:
+            num_regions = x.shape[1] if packed else x.shape[2]
+            self._validate_num_regions(num_regions)
+            if packed:
+                total_slices, _, embed_dim = x.shape
+                flat = x.reshape(total_slices * num_regions, embed_dim)
+            else:
+                batch_size, num_slices, _, embed_dim = x.shape
+                flat = x.reshape(batch_size, num_slices * num_regions, embed_dim)
+            return flat, self._expand_lengths_for_regions(seq_lengths, num_regions), num_regions
+
+        if x.dim() != global_rank:
+            raise ValueError(
+                f"Expected global-only rank {global_rank}, got rank {x.dim()}."
+            )
+        return x, seq_lengths, 1
+
+    def _embed_subset_fm_set(
         self,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        seq_idx: torch.Tensor | None,
-        physical_positions: torch.Tensor | None,
-        slice_mask: torch.Tensor | None,
-        num_regions: int,
-    ) -> tuple[
-        torch.Tensor,
-        int,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
-        if num_regions == 1:
-            return cu_seqlens, max_seqlen, seq_idx, physical_positions, slice_mask
+        x: torch.Tensor,
+        input_feature_dims: torch.Tensor,
+        fm_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Embed a subset-SSL FM set into the FM-set layout.
 
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        token_lengths = lengths * num_regions
-        token_cu_seqlens = torch.zeros_like(cu_seqlens)
-        token_cu_seqlens[1:] = torch.cumsum(token_lengths, dim=0)
+        Args:
+            x: Subset global-only features [B, K, num_slices, input_embed_dim] or
+               subset tiled features [B, K, num_slices, num_tiled_regions, input_embed_dim].
+            input_feature_dims: Original feature dims per (sample, FM) with shape [B, K].
+            fm_ids: Global FM IDs per (sample, FM) with shape [B, K]. Required when
+                per_fm_adapter_mode='per_fm_id' to select the per-FM adapter.
 
-        token_seq_idx = (
-            seq_idx.repeat_interleave(num_regions, dim=0)
-            if seq_idx is not None
-            else None
+        Returns:
+            FM-set tensor [K, B, num_slices, (num_tiled_regions,) embed_dim]
+        """
+        if input_feature_dims is None:
+            raise ValueError(
+                "Subset SSL embedding requires input_feature_dims with shape [B, K]."
+            )
+        batch_size, num_fms = x.shape[0], x.shape[1]
+        spatial = x.shape[2:-1]  # (num_slices,) or (num_slices, num_tiled_regions)
+        x_flat = x.reshape(batch_size * num_fms, *x.shape[2:])  # [B * K, ..., input_embed_dim]
+        dims_flat = input_feature_dims.reshape(-1).to(device=x.device, dtype=torch.long)
+        assert dims_flat.shape[0] == x_flat.shape[0], (
+            f"input_feature_dims must have {x_flat.shape[0]} entries (B*K), "
+            f"got {dims_flat.shape[0]}."
         )
-        token_positions = self._expand_positions_for_regions(
-            physical_positions, num_regions, dim=0,
-        )
-        token_slice_mask = self._expand_mask_for_regions(
-            slice_mask, num_regions, dim=0,
-        )
-        return token_cu_seqlens, max_seqlen * num_regions, token_seq_idx, token_positions, token_slice_mask
 
-    def _pool_fm_embeddings(
+        out = None
+        if self.per_fm_adapter_mode == "per_fm_id":
+            # Group (sample, FM) entries by global FM id so each FM uses its own adapter.
+            if fm_ids is None:
+                raise ValueError(
+                    "per_fm_adapter_mode='per_fm_id' requires fm_ids with shape [B, K]."
+                )
+            ids_flat = fm_ids.reshape(-1).to(device=x.device, dtype=torch.long)
+            assert ids_flat.shape[0] == x_flat.shape[0], (
+                f"fm_ids must have {x_flat.shape[0]} entries (B*K), "
+                f"got {ids_flat.shape[0]}."
+            )
+            for fid in ids_flat.unique():
+                fm_id = int(fid.item())
+                feat_dim = int(self.fm_input_dims[fm_id])
+                group_mask = ids_flat == fid
+                embedded = self.embed_fm[str(fm_id)](x_flat[group_mask][..., :feat_dim])
+                if out is None:
+                    out = x_flat.new_zeros(batch_size * num_fms, *spatial, self.embed_dim)
+                out[group_mask] = embedded.to(out.dtype)
+        else:
+            # Group (sample, FM) entries by feature dim because Embed is keyed by dim and
+            # multiple FMs can share the same dimension.
+            for dim in dims_flat.unique():
+                feat_dim = int(dim.item())
+                group_mask = dims_flat == dim
+                embedded = self._per_dim_adapter(feat_dim)(x_flat[group_mask][..., :feat_dim])
+                if out is None:
+                    out = x_flat.new_zeros(batch_size * num_fms, *spatial, self.embed_dim)
+                out[group_mask] = embedded.to(out.dtype)
+
+        out = out.reshape(batch_size, num_fms, *spatial, self.embed_dim)  # [B, K, ..., E]
+        perm = [1, 0] + list(range(2, out.dim()))  # -> [K, B, ..., E]
+        return out.permute(*perm).contiguous()
+
+    def _fuse_fm_embeddings(
         self,
         fm_embs: torch.Tensor,
-        return_weights: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        fm_ids: torch.Tensor | None = None,
+        return_fm_stats: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
         """
-        Pool post-Embed representations across foundation models at each slice.
+        Fuse post-Embed, region-collapsed representations across foundation models.
 
         Args:
             fm_embs: [num_fms, B, num_slices, embed_dim].
-            return_weights: If True, also return FM weights [B, num_slices, num_fms].
+            fm_ids: Global FM IDs [B, num_fms] for the selected FMs (router/logging).
+            return_fm_stats: If True, return an FM statistics dict additionally.
+
+        Returns:
+            fused: [B, num_slices, embed_dim].
+            stats (optional): dict with fm_weights_local [B, num_slices, num_fms],
+                fm_ids [B, num_fms], router_logits [B, num_slices, num_fms] or None,
+                fm_weight_entropy [B, num_slices].
         """
         num_fms, batch_size, num_slices, embed_dim = fm_embs.shape
+        if fm_ids is None:
+            fm_ids = torch.arange(num_fms, device=fm_embs.device).unsqueeze(0).expand(
+                batch_size, -1
+            )
+        else:
+            fm_ids = fm_ids.to(device=fm_embs.device, dtype=torch.long)
+            if fm_ids.dim() == 1:
+                if fm_ids.numel() != num_fms:
+                    raise ValueError(
+                        f"Expected {num_fms} FM IDs for an FM set, got {fm_ids.numel()}."
+                    )
+                fm_ids = fm_ids.unsqueeze(0).expand(batch_size, -1)
+            elif fm_ids.shape == (1, num_fms) and batch_size != 1:
+                fm_ids = fm_ids.expand(batch_size, -1)
+            elif fm_ids.shape != (batch_size, num_fms):
+                raise ValueError(
+                    f"Expected fm_ids shape ({batch_size}, {num_fms}) or ({num_fms},), "
+                    f"got {tuple(fm_ids.shape)}."
+                )
+
+        if self.fm_pooling == "router":
+            if self.fm_router is None:
+                raise ValueError("fm_pooling='router' but FMRouter is not initialized.")
+            fused, stats = self.fm_router(
+                fm_embs,
+                fm_ids=fm_ids,
+                return_stats=True,
+            )
+            if return_fm_stats:
+                return fused, stats
+            return fused
 
         if num_fms == 1:
-            pooled = fm_embs[0]
+            fused = fm_embs[0]
             weights = torch.ones(
-                batch_size,
-                num_slices,
-                1,
-                device=fm_embs.device,
-                dtype=fm_embs.dtype,
+                batch_size, num_slices, 1, device=fm_embs.device, dtype=fm_embs.dtype
             )
         elif self.fm_pooling == "avg_pool":
-            pooled = fm_embs.mean(dim=0)
+            fused = fm_embs.mean(dim=0)
             weights = torch.full(
                 (batch_size, num_slices, num_fms),
                 1.0 / num_fms,
@@ -720,24 +801,48 @@ class Cobra(nn.Module):
                 dtype=fm_embs.dtype,
             )
         else:
-            # Attention-weighted pooling across foundation models for each slice.
-            fm_tokens = rearrange(fm_embs, 'k b t e -> (b t) k e')
-            weights_flat = self.fm_attn(fm_tokens)  # [B*num_slices, num_fms, 1]
-            pooled = torch.bmm(
-                weights_flat.transpose(2, 1),
-                fm_tokens,
-            ).squeeze(1)
-            pooled = rearrange(pooled, '(b t) e -> b t e', b=batch_size, t=num_slices)
-            weights = rearrange(
-                weights_flat.squeeze(-1),
-                '(b t) k -> b t k',
-                b=batch_size,
-                t=num_slices,
-            )
+            raise ValueError(f"Unsupported fm_pooling '{self.fm_pooling}'.")
 
-        if return_weights:
-            return pooled, weights
-        return pooled
+        if return_fm_stats:
+            probs = weights.clamp_min(1e-8)
+            stats = {
+                "fm_weights_local": weights,
+                "fm_ids": fm_ids,
+                "router_logits": None,
+                "fm_weight_entropy": -(probs * probs.log()).sum(dim=-1),
+            }
+            return fused, stats
+        return fused
+
+    def _fuse_fm_set(
+        self,
+        fm_embs: torch.Tensor,
+        fm_ids: torch.Tensor | None = None,
+        seq_lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+        """
+        Aggregate a set of FM embeddings to one fused representation per slice.
+
+        Args:
+            fm_embs: [K, B, num_slices, (num_regions,) embed_dim]
+            fm_ids: Global FM IDs [B, K] (router/logging).
+            seq_lengths: Optional [B] for masking padded slices in router stats.
+
+        Returns:
+            fused token embeddings [B, num_tokens, embed_dim], expanded sequence
+            lengths, and number of tokens per original slice.
+        """
+        fm_slice_embs, token_lengths, num_regions = self._flatten_regional_tokens(
+            fm_embs, fm_set_layout=True, seq_lengths=seq_lengths
+        )
+        fused, fm_stats = self._fuse_fm_embeddings(
+            fm_slice_embs, fm_ids=fm_ids, return_fm_stats=True
+        )
+        if token_lengths is not None:
+            fm_stats["slice_mask"] = self._build_mask(token_lengths, fm_slice_embs.shape[2])
+        self._last_fm_stats = fm_stats
+
+        return fused, token_lengths, num_regions
         
     def _packed_to_padded(
         self, 
@@ -798,58 +903,98 @@ class Cobra(nn.Module):
             return logits * mask.unsqueeze(-1).unsqueeze(-1)
         return logits
             
-    def _embed_inference_forward(
-        self,
-        x,
-        seq_lengths: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def _embed_inference_fm_set(self, x, fm_ids: torch.Tensor | None = None) -> torch.Tensor:
         """
-        Foundation model feature embedding in inference mode (zero padding).
+        Embed an inference FM set into the canonical FM-set layout.
 
-        Each FM input is [B, num_slices, input_embed_dim] (global-only CLS) or
-        [B, num_slices, num_tiled_regions, input_embed_dim] (tiled multi-crop CLS).
+        Args:
+            x: List of K FM tensors (K may be 1), each [B, num_slices, input_embed_dim]
+               (global-only CLS) or [B, num_slices, num_tiled_regions, input_embed_dim]
+               (tiled multi-crop CLS).
+            fm_ids: Global FM IDs for the K FMs, shape [K] or [B, K]. Required when
+                per_fm_adapter_mode='per_fm_id' to select the per-FM adapter.
+
+        Returns:
+            FM-set tensor [K, B, num_slices, embed_dim] or
+            [K, B, num_slices, num_tiled_regions, embed_dim].
         """
-        # Inference mode with ensembling feature embeddings from multiple slice encoders
-        embedded_features = [self.embed[str(xi.shape[-1])](xi) for xi in x]  # List of K [B, num_slices, (num_tiled_regions,) embed_dim]
+        if self.per_fm_adapter_mode == "per_fm_id":
+            if fm_ids is None:
+                raise ValueError(
+                    "per_fm_adapter_mode='per_fm_id' requires fm_ids to select per-FM adapters."
+                )
+            # FM identity is shared across the batch at inference; collapse [B, K] -> [K].
+            ids = fm_ids if fm_ids.dim() == 1 else fm_ids[0]
+            assert ids.shape[0] == len(x), (
+                f"fm_ids must have one entry per FM ({len(x)}), got {ids.shape[0]}."
+            )
+            embedded_features = []
+            for i, xi in enumerate(x):
+                fm_id = int(ids[i].item())
+                feat_dim = int(self.fm_input_dims[fm_id])
+                embedded_features.append(self.embed_fm[str(fm_id)](xi[..., :feat_dim]))
+        else:
+            embedded_features = [self._per_dim_adapter(xi.shape[-1])(xi) for xi in x]  # List of K [B, num_slices, (num_tiled_regions,) embed_dim]
         fm_embs = torch.stack(embedded_features, dim=0)  # [K, B, num_slices, (num_tiled_regions,) embed_dim]
         assert fm_embs.shape[-1] == self.embed_dim, f"Expected embed_dim {self.embed_dim}, got {fm_embs.shape[-1]}"
         assert fm_embs.dim() in (4, 5), f"Expected 4 or 5 dimensions, got {fm_embs.dim()}"
-        assert fm_embs.shape[0]==len(x), f"Expected length of input x {len(x)}, got {fm_embs.shape[0]}"
+        assert fm_embs.shape[0] == len(x), f"Expected length of input x {len(x)}, got {fm_embs.shape[0]}"
+        return fm_embs
 
-        if fm_embs.dim() == 5:
-            if self.regional_tokens <= 0:
-                raise ValueError(
-                    "Received tiled inference features "
-                    "[K, B, num_slices, num_tiled_regions, embed_dim] but the model "
-                    "was built without tiled token support. Set regional_tokens > 0."
-                )
+    def _prepare_pair_ssl_view(
+        self,
+        x: torch.Tensor,
+        input_feature_dims: torch.Tensor | None,
+        seq_lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+        """
+        Pair SSL (single-FM view): embed one FM tensor and aggregate tiled regions.
 
-            num_fms, batch_size, num_slices, num_tiled_regions, embed_dim = fm_embs.shape
-            expected_regions = 1 + self.regional_tokens
-            if num_tiled_regions != expected_regions:
-                raise ValueError(
-                    f"Expected {expected_regions} tiled regions per slice "
-                    f"(1 global + {self.regional_tokens} regional), got {num_tiled_regions}."
-                )
+        Input: [B, num_slices, (num_tiled_regions,) input_embed_dim].
+        Output: [B, num_tokens, embed_dim] with num_tokens=num_slices*num_regions.
+        """
+        logits = self._embed_ssl_forward(x, input_feature_dims)  # [B, D, (R,) E]
+        logits = self._zero_padded_slices(logits, seq_lengths)
+        return self._flatten_regional_tokens(logits, fm_set_layout=False, seq_lengths=seq_lengths)
 
-            if seq_lengths is not None:
-                mask = self._build_mask(seq_lengths, num_slices)
-                fm_embs = fm_embs * mask.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+    def _prepare_subset_fm_set(
+        self,
+        x: torch.Tensor,
+        input_feature_dims: torch.Tensor | None,
+        fm_ids: torch.Tensor,
+        seq_lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+        """
+        Subset SSL (FM set per view): embed the FM set and fuse across FMs.
 
-            # Keep every global/regional token as part of the sequence, then pool
-            # across FMs at each flattened slice-region token.
-            fm_embs = self._add_region_embedding(fm_embs)
-            fm_tokens = fm_embs.reshape(num_fms, batch_size, num_slices * num_tiled_regions, embed_dim)
-            return self._pool_fm_embeddings(fm_tokens)
+        Input: [B, K, num_slices, (num_tiled_regions,) input_embed_dim] plus fm_ids [B, K].
+        Output: [B, num_tokens, embed_dim] with num_tokens=num_slices*num_regions.
+        """
+        fm_embs = self._embed_subset_fm_set(x, input_feature_dims, fm_ids=fm_ids)  # [K, B, D, (R,) E]
+        logits, token_lengths, num_regions = self._fuse_fm_set(
+            fm_embs, fm_ids=fm_ids, seq_lengths=seq_lengths
+        )
+        return self._zero_padded_slices(logits, token_lengths), token_lengths, num_regions
 
-        if self.regional_tokens > 0:
-            raise ValueError(
-                "regional_tokens > 0 but received global-only inference features. "
-                "Provide tiled multi-crop CLS caches with shape "
-                "[B, num_slices, num_tiled_regions, input_embed_dim]."
-            )
+    def _prepare_inference_fm_set(
+        self,
+        x,
+        seq_lengths: torch.Tensor | None = None,
+        fm_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
+        """
+        Inference (single- or multi-FM): embed the FM set and fuse across FMs.
 
-        return self._pool_fm_embeddings(fm_embs)
+        Single-FM inference is the K=1 case of an FM set, so it shares this path.
+
+        Input: list of K FM tensors, each [B, num_slices, (num_tiled_regions,) input_embed_dim].
+        Output: [B, num_tokens, embed_dim] with num_tokens=num_slices*num_regions.
+        """
+        fm_embs = self._embed_inference_fm_set(x, fm_ids=fm_ids)  # [K, B, D, (R,) E]
+        logits, token_lengths, num_regions = self._fuse_fm_set(
+            fm_embs, fm_ids=fm_ids, seq_lengths=seq_lengths
+        )
+        return self._zero_padded_slices(logits, token_lengths), token_lengths, num_regions
 
     def _abmil_pooling(
         self, 
@@ -898,8 +1043,6 @@ class Cobra(nn.Module):
         cu_seqlens: torch.Tensor = None,
         max_seqlen: int = None,
         seq_idx: torch.Tensor = None,
-        slice_mask: torch.Tensor = None,
-        mask_token: torch.Tensor = None,
         physical_positions: torch.Tensor = None,
         **_,  # Ignore extra kwargs
     ) -> torch.Tensor:
@@ -909,34 +1052,26 @@ class Cobra(nn.Module):
         
         # Foundation model feature embedding
         if self.mode == "inference":
-            logits = self._embed_inference_forward(x)
+            # Inference FM set (K=1 when in single-FM inference mode) is aggregated to [B, num_slices, embed_dim].
+            logits, _, _ = self._prepare_inference_fm_set(x)
         else:
             logits = self._embed_ssl_forward_packed(x, cu_seqlens, input_feature_dims)
-
-        logits = self._flatten_tiled_regions(logits, packed=True)
-        cu_seqlens, max_seqlen, seq_idx, physical_positions, slice_mask = (
-            self._expand_packed_metadata_for_regions(
-                cu_seqlens,
-                max_seqlen,
-                seq_idx,
-                physical_positions,
-                slice_mask,
-                num_regions,
-            )
-        )
-
+            logits, _, num_regions = self._flatten_regional_tokens(logits, packed=True)
+            if num_regions > 1:
+                original_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                token_lengths = original_lengths * num_regions
+                cu_seqlens = torch.zeros_like(cu_seqlens)
+                cu_seqlens[1:] = torch.cumsum(token_lengths, dim=0)
+                max_seqlen = int(max_seqlen * num_regions)
+                if seq_idx is not None:
+                    seq_idx = seq_idx.repeat_interleave(num_regions)
+                if physical_positions is not None:
+                    physical_positions = physical_positions.repeat_interleave(num_regions, dim=0)
+        
         # Physical positional encoding (packed: positions is 1-D [total_seq_len])
         if self.physical_pe and physical_positions is not None:
             logits = self._apply_physical_pe(logits, physical_positions)
 
-        # MSP: replace masked positions with mask_token
-        if slice_mask is not None and mask_token is not None:
-            logits = torch.where(
-                slice_mask.unsqueeze(-1),
-                mask_token.expand_as(logits),
-                logits,
-            )
-        
         # Sequence encoder
         if self.sequence_encoder == "transformer" and hasattr(self, 'varlen_seq_enc'):
             # Transformer with FlashAttention varlen
@@ -992,48 +1127,41 @@ class Cobra(nn.Module):
         get_per_head_attention=False,
         return_slice_embeddings=False,
         seq_lengths=None,
-        slice_mask=None,
-        mask_token=None,
         physical_positions=None,
+        fm_ids=None,
         **_,
     ):
         """Forward pass main function."""
-        num_regions = self._get_num_tiled_regions(x, packed=False)
-
-        # Foundation model feature embedding
+        self._last_fm_stats = None
+        # Prepare slice features [B, num_slices, embed_dim]:
+        #   - inference: FM set (K may be 1), fused across FMs
+        #   - subset SSL: FM set per view, fused across FMs
+        #   - pair SSL: single-FM view, no FM fusion
         if self.mode == "inference":
-            logits = self._embed_inference_forward(x, seq_lengths=seq_lengths)
+            logits, token_lengths, num_regions = self._prepare_inference_fm_set(
+                x, seq_lengths=seq_lengths, fm_ids=fm_ids
+            )
+        elif fm_ids is not None:
+            logits, token_lengths, num_regions = self._prepare_subset_fm_set(
+                x, input_feature_dims, fm_ids=fm_ids, seq_lengths=seq_lengths
+            )
         else:
-            logits = self._embed_ssl_forward(x, input_feature_dims)
-            logits = self._zero_padded_slices(logits, seq_lengths)
-
-        if self.mode != "inference" or logits.dim() == 4:
-            logits = self._flatten_tiled_regions(logits, packed=False)
-
-        seq_lengths = self._expand_seq_lengths_for_regions(seq_lengths, num_regions)
-        physical_positions = self._expand_positions_for_regions(
-            physical_positions, num_regions, dim=1,
-        )
-        slice_mask = self._expand_mask_for_regions(slice_mask, num_regions, dim=1)
-        logits = self._zero_padded_slices(logits, seq_lengths)
-
-        # Physical positional encoding (padded: positions is [B, num_slices])
-        if self.physical_pe and physical_positions is not None:
-            logits = self._apply_physical_pe(logits, physical_positions, seq_lengths)
-
-        # MSP: replace masked positions with mask_token
-        if slice_mask is not None and mask_token is not None:
-            logits = torch.where(
-                slice_mask.unsqueeze(-1).expand_as(logits),
-                mask_token.unsqueeze(0).expand_as(logits),
-                logits,
+            logits, token_lengths, num_regions = self._prepare_pair_ssl_view(
+                x, input_feature_dims, seq_lengths=seq_lengths
             )
 
-        # Build attention mask if seq_lengths is provided
+        # Physical positional encoding (padded: positions is [B, num_tokens]).
+        if self.physical_pe and physical_positions is not None:
+            token_positions = self._expand_physical_positions_for_regions(
+                physical_positions, num_regions
+            )
+            logits = self._apply_physical_pe(logits, token_positions, token_lengths)
+
+        # Build attention mask if sequence lengths are provided.
         mask = None
-        if seq_lengths is not None:
+        if token_lengths is not None:
             max_len = logits.shape[1]  
-            mask = self._build_mask(seq_lengths, max_len)  # [B, num_tokens]
+            mask = self._build_mask(token_lengths, max_len)  # [B, num_tokens]
 
         # Prepend CLS token for cls pooling
         if self.slice_pooling == "cls":
@@ -1106,32 +1234,36 @@ class Cobra(nn.Module):
         get_per_head_attention=False,
         return_slice_embeddings=False,
         use_packed: bool = False,
-        slice_mask=None,
-        mask_token=None,
         physical_positions=None,
+        fm_ids=None,
         **kwargs,
     ):
         """
         Forward pass through the Cobra network.
-        
+        Input data cases:
+            Pair SSL (single-FM view), padded:
+                x = Tensor [B, num_slices, input_embed_dim]
+            Pair SSL (single-FM view), packed (use_packed=True):
+                x = Tensor [total_slices, input_embed_dim]
+            Subset SSL (FM set per view), padded:
+                x = Tensor [B, K, num_slices, input_embed_dim] with fm_ids [B, K]
+            Inference, single FM:
+                x = Tensor [B, num_slices, input_embed_dim] (normalized to a list of 1),
+                or List with a single tensor of that shape.
+            Inference, FM set (K >= 1):
+                x = List of K tensors, each [B, num_slices, input_embed_dim]
+
+        All FM-set paths (single-/multi-FM inference and subset SSL) normalize to [K, B, num_slices, embed_dim] before FM fusion, while pair/packed SSL stay
+        as single-FM views.
+
         Args:
-            x: Input tensor or list of tensors:
-                - SSL padded, global-only: [B, num_slices, input_embed_dim]
-                - SSL padded, tiled: [B, num_slices, num_tiled_regions, input_embed_dim]
-                - SSL packed, global-only: [total_slices, input_embed_dim]
-                - SSL packed, tiled: [total_slices, num_tiled_regions, input_embed_dim]
-                - Inference, global-only: List of K tensors, each [B, num_slices, input_embed_dim]
-                - Inference, tiled: List of K tensors, each [B, num_slices, num_tiled_regions, input_embed_dim]
+            x: Input tensor or list of tensors (see public input cases above).
             input_feature_dims: Feature dimensions per sample [B] (SSL mode).
             get_attention: If True, return aggregated attention map [B, 1, num_tokens].
             get_per_head_attention: If True, return per-head attention [B, num_heads, num_tokens] (ABMIL only).
             return_slice_embeddings: If True, return token-level embeddings [B, num_tokens, embed_dim] before pooling.
             use_packed: If True, use packed sequence for variable sequence length handling.
-            slice_mask: Optional boolean mask for MSP. True = masked.
-                - Padded mode: [B, num_slices]
-                - Packed mode: [total_seq_len]
-            mask_token: Learnable mask-token embedding [1, embed_dim] (for masked slice prediction).
-            physical_positions: Physical slice positions in mm for sinusoidal PE.
+            physical_positions: Normalized relative slice depth in [0, 1] for sinusoidal PE.
                 - Padded mode: [B, num_slices]
                 - Packed mode: [total_seq_len]
                 Only used when `physical_pe=True`.
@@ -1149,7 +1281,21 @@ class Cobra(nn.Module):
             If return_slice_embeddings=True: Token embeddings [B, num_tokens, embed_dim]
             Otherwise: Features [B, contrast_dim] (train) or [B, output_dim] (inference)
         """
+        # Single-FM inference may be passed as a bare tensor; treat it as an FM set of size 1
+        # so single- and multi-FM inference share the same FM-set path.
+        if self.mode == "inference" and isinstance(x, torch.Tensor):
+            x = [x]
+
         if use_packed:
+            if self.mode == "inference":
+                raise NotImplementedError(
+                    "Packed inference is not supported. Use padded inputs "
+                    "(list of [B, num_slices, F] tensors plus seq_lengths)."
+                )
+            if fm_ids is not None:
+                raise NotImplementedError(
+                    "Packed subset FM mode is not supported yet. Set use_packed=False for multi-FM subset SSL."
+                )
             if kwargs.get('cu_seqlens') is None or kwargs.get('max_seqlen') is None or kwargs.get('seq_idx') is None:
                 raise ValueError("cu_seqlens, max_seqlen, and seq_idx are required for packed mode.")
             return self._forward_packed(
@@ -1157,8 +1303,6 @@ class Cobra(nn.Module):
                 input_feature_dims=input_feature_dims,
                 get_attention=get_attention,
                 return_slice_embeddings=return_slice_embeddings,
-                slice_mask=slice_mask,
-                mask_token=mask_token,
                 physical_positions=physical_positions,
                 **kwargs,
             )
@@ -1169,8 +1313,7 @@ class Cobra(nn.Module):
                 get_attention=get_attention,
                 get_per_head_attention=get_per_head_attention,
                 return_slice_embeddings=return_slice_embeddings,
-                slice_mask=slice_mask,
-                mask_token=mask_token,
                 physical_positions=physical_positions,
+                fm_ids=fm_ids,
                 **kwargs,
             )

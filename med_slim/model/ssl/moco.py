@@ -15,10 +15,6 @@ An Empirical Study of Training Self-Supervised Vision Transformers.
     https://arxiv.org/abs/2306.00984
 [5] Guinot, Julien, et al. "Semi-Supervised Contrastive Learning of Musical
     Representations." ISMIR 2024. https://arxiv.org/abs/2407.13840
-[6] Assran, Mahmoud, et al. "Self-Supervised Learning from Images with a Joint-Embedding
-    Predictive Architecture." CVPR 2023. https://arxiv.org/abs/2301.08243
-[7] Mur-Labadia, Lorenzo, et al. "V-JEPA 2.1: Unlocking Dense Features in Video
-    Self-Supervised Learning." 2026. https://arxiv.org/abs/2603.14482
 """
 
 import torch
@@ -28,11 +24,6 @@ from typing import List, Optional
 from accelerate import Accelerator
 
 from med_slim.model.sequence_encoder.cobra import Cobra
-from med_slim.model.ssl.msp_predictor import MSPPredictor
-from med_slim.model.ssl.masking import (
-    generate_contiguous_slice_mask,
-    generate_contiguous_slice_mask_packed,
-)
 
 class MoCo(nn.Module): 
     """
@@ -62,15 +53,20 @@ class MoCo(nn.Module):
         pooling: str = "abmil",
         physical_pe: bool = False,
         regional_tokens: int = 0,
-        region_embedding: bool = False,
-        msp_enabled: bool = False,
-        msp_lambda_mask: float = 1.0,
-        msp_lambda_ctx: float = 0.0,
-        msp_mask_ratio: tuple = (0.3, 0.5),
-        msp_predictor_depth: int = 2,
-        msp_predictor_dim: int | None = None,
-        msp_max_seq_len: int = 512,
-        msp_ctx_distance_weighted: bool = True,
+        fm_pooling: str = "avg_pool",
+        num_fms: int | None = None,
+        per_fm_adapter_mode: str = "per_dim",
+        fm_input_dims: Optional[List[int]] = None,
+        router_use_fm_embedding: bool = True,
+        router_use_fm_logit_bias: bool = True,
+        router_use_fm_logit_scale: bool = False,
+        router_mode: str = "soft",
+        router_top_k: int | None = None,
+        router_temperature: float = 1.0,
+        router_learnable_temperature: bool = False,
+        router_load_balance_weight: float = 0.01,
+        router_z_loss_weight: float = 0.0,
+        router_entropy_weight: float = 0.0,
         **kwargs,
     ):
         """
@@ -85,21 +81,9 @@ class MoCo(nn.Module):
             T: Softmax temperature for contrastive loss.
             dropout: Dropout rate.
             sequence_encoder: "mamba2" (default) or "transformer".
-            pooling: Slice pooling method - "abmil" (default) or "cls" (requires transformer).
-            physical_pe: Add sinusoidal positional encoding from physical
-                slice positions (mm) before the sequence encoder.
-            msp_enabled: Enable Masked Slice Prediction auxiliary objective.
-            msp_lambda_mask: Weight for MSP loss on masked positions.
-            msp_lambda_ctx: Base weight λ for context loss on visible positions (V-JEPA 2.1).  Set to 0 to disable.  
-                When msp_ctx_distance_weighted=True, each visible slice receives
-                per-token weight λ_i = λ / sqrt(d_min) following Eq. 3 of V-JEPA 2.1 (Mur-Labadia et al., 2026).
-                When msp_ctx_distance_weighted=False, all visible slices contribute equally (uniform weight).
-            msp_mask_ratio: (min_ratio, max_ratio) for contiguous masking.
-            msp_predictor_depth: Number of residual MLP blocks in the MSP predictor.
-            msp_predictor_dim: Hidden dimension of the MSP predictor. Defaults to embed_dim // 4.
-            msp_max_seq_len: Maximum sequence length for positional embeddings.
-            msp_ctx_distance_weighted: Use V-JEPA 2.1 inverse-sqrt-distance weighting for context loss (Eq. 3).  
-                When msp_ctx_distance_weighted=False, all visible slices contribute equally (uniform weight).
+            pooling: Slice pooling method - "abmil" (default), "cross_attention", or "cls" (requires transformer).
+            physical_pe: Add sinusoidal positional encoding from normalized relative
+                slice depth in [0, 1] before the sequence encoder.
             **kwargs: Encoder/pooling-specific parameters (passed to Cobra):
                 - d_state (int): Mamba2 internal state dim (default: 128)
                 - dim_feedforward (int): Transformer FFN hidden size (default: 4 * embed_dim)
@@ -114,11 +98,17 @@ class MoCo(nn.Module):
 
         self.T = T
         self.accelerator = accelerator
-        self.msp_enabled = msp_enabled
-        self.msp_lambda_mask = msp_lambda_mask
-        self.msp_lambda_ctx = msp_lambda_ctx
-        self.msp_mask_ratio = tuple(msp_mask_ratio)
-        self.msp_ctx_distance_weighted = msp_ctx_distance_weighted
+
+        # FM fusion / router configuration
+        if fm_pooling not in ("avg_pool", "router"):
+            raise ValueError(
+                f"Invalid fm_pooling '{fm_pooling}'. Must be one of 'avg_pool', 'router'."
+            )
+        self.fm_pooling = fm_pooling
+        self.num_fms = num_fms
+        self.router_load_balance_weight = router_load_balance_weight
+        self.router_z_loss_weight = router_z_loss_weight
+        self.router_entropy_weight = router_entropy_weight
 
         # Shared encoder kwargs
         encoder_kwargs = dict(
@@ -131,7 +121,17 @@ class MoCo(nn.Module):
             slice_pooling=pooling,
             physical_pe=physical_pe,
             regional_tokens=regional_tokens,
-            region_embedding=region_embedding,
+            fm_pooling=fm_pooling,
+            num_fms=num_fms,
+            per_fm_adapter_mode=per_fm_adapter_mode,
+            fm_input_dims=fm_input_dims,
+            router_use_fm_embedding=router_use_fm_embedding,
+            router_use_fm_logit_bias=router_use_fm_logit_bias,
+            router_use_fm_logit_scale=router_use_fm_logit_scale,
+            router_mode=router_mode,
+            router_top_k=router_top_k,
+            router_temperature=router_temperature,
+            router_learnable_temperature=router_learnable_temperature,
             **kwargs,
         )
 
@@ -145,18 +145,6 @@ class MoCo(nn.Module):
             nn.Linear(2 * contrast_dim,contrast_dim),
             nn.BatchNorm1d(contrast_dim),
         )
-
-        # MSP components
-        if self.msp_enabled:
-            self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
-            nn.init.normal_(self.mask_token, std=0.02)
-            self.msp_predictor = MSPPredictor(
-                embed_dim=embed_dim,
-                hidden_dim=msp_predictor_dim,
-                num_layers=msp_predictor_depth,
-                max_seq_len=msp_max_seq_len,
-                dropout=dropout,
-            )
 
         for param_b, param_m in zip(self.base_encoder.parameters(), self.momentum_encoder.parameters()):
             param_m.data.copy_(param_b.data)  # initialize the momentum encoder with the base encoder
@@ -296,202 +284,152 @@ class MoCo(nn.Module):
         return loss * (2 * self.T)
 
     @staticmethod
-    def _distance_weights(
-        visible_positions: torch.Tensor,
-        mask_positions: torch.Tensor,
+    def aggregate_fm_usage(
+        fm_weights_local: torch.Tensor,
+        fm_ids: torch.Tensor,
+        num_fms: int,
+        slice_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Compute inverse-sqrt-distance weights for context tokens.
+        Per-global-FM routing mass fraction for one forward stats dict.
 
-        Implements Eq. 3 of Mur-Labadia et al. (2026):
-            λ_i = λ / sqrt(d_min(i, M))
+        Aggregates slice-averaged local softmax weights into global FM IDs.
+        Returns shape [num_fms] with non-negative entries that sum to 1 when
+        any routing mass is present.
+        """
+        if slice_mask is not None:
+            slice_valid = slice_mask.to(device=fm_weights_local.device, dtype=fm_weights_local.dtype)
+            denom = slice_valid.sum(dim=1).clamp_min(1.0)
+            importance = (fm_weights_local * slice_valid.unsqueeze(-1)).sum(dim=1) / denom[:, None]
+        else:
+            importance = fm_weights_local.mean(dim=1)  # [B, K]
 
-        The base λ is applied externally via msp_lambda_ctx.
+        flat_ids = fm_ids.to(device=importance.device, dtype=torch.long).reshape(-1)
+        flat_importance = importance.reshape(-1)
+        usage = torch.zeros(num_fms, device=importance.device, dtype=importance.dtype)
+        usage.index_add_(0, flat_ids, flat_importance)
+        return usage / usage.sum().clamp_min(1e-8)
+
+    def _fm_load_balance_loss(
+        self,
+        fm_weights_local: torch.Tensor,
+        fm_ids: torch.Tensor,
+        slice_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Load-balance loss over global FM IDs (not local subset positions).
+
+        Aggregates per-FM gating mass across batch and slices, then penalizes
+        deviation from the target mass each FM should receive when present.
+        The target is defined per sample: for a K-FM subset, each selected FM
+        should receive 1/K of the local softmax mass on that sample, not the average mass of all FMs.
 
         Args:
-            visible_positions: 1-D indices of visible slices [N_vis].
-            mask_positions: 1-D indices of masked slices [N_mask].
-
-        Returns:
-            Normalized per-token weights [N_vis] (float, same device).
+            fm_weights_local: [B, num_slices, K] FM weights per slice.
+            fm_ids: [B, K] global FM IDs for the selected FMs.
+            slice_mask: [B, num_slices] validity mask (True = valid slices), optional.
         """
-        dists = (visible_positions.unsqueeze(1) - mask_positions.unsqueeze(0)).abs()  # [N_vis, N_mask]
-        d_min = dists.min(dim=1).values.float().clamp(min=1.0)  # [N_vis]
-        w = 1.0 / d_min.sqrt()
-        w = w * (w.numel() / w.sum().clamp(min=1e-8))
-        return w
+        num_fms = self.num_fms if self.num_fms is not None else int(fm_ids.max().item()) + 1
+        device = fm_weights_local.device
 
-    def _compute_msp_loss(
-        self,
-        x1: torch.Tensor,
-        *,
-        input_feature_dims_1: torch.Tensor | None = None,
-        seq_lengths: torch.Tensor = None,
-        physical_positions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute Masked Slice Prediction loss.
-
-        Masks a contiguous block of slices from one FM-view, runs the student
-        encoder on the masked sequence, and predicts the teacher encoder's
-        hidden states at masked positions via the MSP predictor.
-
-        Returns:
-            (loss_msp, loss_ctx): MSP loss on masked positions and optional
-            context loss on visible positions.
-        """
-        B, num_slices, _ = x1.shape
-        device = x1.device
-
-        # Determine valid lengths per sample
-        if seq_lengths is not None:
-            eff_lengths = seq_lengths
+        if slice_mask is not None:
+            slice_valid = slice_mask.to(device=device, dtype=fm_weights_local.dtype)  # [B, D]
+            denom = slice_valid.sum(dim=1).clamp_min(1.0)  # [B]
+            importance = (fm_weights_local * slice_valid.unsqueeze(-1)).sum(dim=1) / denom[:, None]
         else:
-            eff_lengths = torch.full((B,), num_slices, dtype=torch.long, device=device)
+            importance = fm_weights_local.mean(dim=1)  # [B, K] average over slices
+        valid = torch.ones_like(importance)
 
-        # Generate contiguous slice mask [B, num_slices]
-        slice_mask = generate_contiguous_slice_mask(
-            eff_lengths, mask_ratio_range=self.msp_mask_ratio, max_seq_len=num_slices,
-        ).to(device)
+        per_sample_k = valid.sum(dim=1).clamp_min(1.0)  # [B]
+        target_local = valid / per_sample_k[:, None]    # [B, K]
 
-        # Student: mask and encode masked FM-view to get per-slice hidden states
-        h_student = self.base_encoder(
-            x1,
-            input_feature_dims=input_feature_dims_1,
-            seq_lengths=seq_lengths,
-            return_slice_embeddings=True,
-            slice_mask=slice_mask,
-            mask_token=self.mask_token,
-            physical_positions=physical_positions,
-        )  # [B, num_slices, embed_dim]
+        flat_ids = fm_ids.to(device=device, dtype=torch.long).reshape(-1)  # [B*K]
+        flat_importance = (importance * valid).reshape(-1)                 # [B*K]
+        flat_target = target_local.reshape(-1)                              # [B*K]
+        flat_valid = valid.reshape(-1)                                     # [B*K]
 
-        # Teacher: encode full FM-view to get per-slice hidden states (targets)
-        with torch.no_grad():
-            h_teacher = self.momentum_encoder(
-                x1,
-                input_feature_dims=input_feature_dims_1,
-                seq_lengths=seq_lengths,
-                return_slice_embeddings=True,
-                physical_positions=physical_positions,
-            )  # [B, num_slices, embed_dim]
+        usage = torch.zeros(num_fms, device=device, dtype=importance.dtype)
+        target = torch.zeros(num_fms, device=device, dtype=importance.dtype)
+        count = torch.zeros(num_fms, device=device, dtype=importance.dtype)
+        usage.index_add_(0, flat_ids, flat_importance)
+        target.index_add_(0, flat_ids, flat_target)
+        count.index_add_(0, flat_ids, flat_valid)
 
-        # Build valid mask (exclude padding from loss)
-        valid_mask = torch.ones(B, num_slices, dtype=torch.bool, device=device)
-        if seq_lengths is not None:
-            positions = torch.arange(num_slices, device=device).unsqueeze(0)
-            valid_mask = positions < seq_lengths.unsqueeze(1)
+        active = count > 0
+        k_active = active.sum()
+        if k_active <= 1:
+            return torch.zeros((), device=device, dtype=importance.dtype)
+        mean_usage = usage[active] / count[active].clamp_min(1e-8)
+        mean_target = target[active] / count[active].clamp_min(1e-8)
+        return k_active.to(importance.dtype) * ((mean_usage - mean_target) ** 2).sum()
 
-        # MSP loss: masked slice positions only
-        masked_valid = slice_mask & valid_mask  # [B, num_slices]
-        h_s_masked = h_student[masked_valid]    # [N_masked, embed_dim]
-        h_t_masked = h_teacher[masked_valid]    # [N_masked, embed_dim]
+    @staticmethod
+    def _router_z_loss(
+        router_logits: torch.Tensor,
+        slice_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Router z-loss: mean(logsumexp(logits, dim=-1) ** 2). Regularizes logit magnitude."""
+        per_slice = torch.logsumexp(router_logits.float(), dim=-1) ** 2  # [B, D]
+        if slice_mask is None:
+            return per_slice.mean()
+        valid = slice_mask.to(device=router_logits.device, dtype=per_slice.dtype)
+        return (per_slice * valid).sum() / valid.sum().clamp_min(1.0)
 
-        # Position indices (column index within each sample)
-        pos_masked = masked_valid.nonzero()[:, 1]  # [N_masked]
-
-        h_pred = self.msp_predictor(h_s_masked, pos_masked)
-        loss_msp = F.mse_loss(h_pred, h_t_masked.detach())
-
-        # Context loss: visible (non-masked and non-padded) slice positions
-        loss_ctx = torch.tensor(0.0, device=device)
-        if self.msp_lambda_ctx > 0:
-            visible_valid = (~slice_mask) & valid_mask
-            if visible_valid.any():
-                h_s_vis = h_student[visible_valid]     # [N_vis, embed_dim]
-                h_t_vis = h_teacher[visible_valid]
-
-                if self.msp_ctx_distance_weighted:
-                    vis_pos = visible_valid.nonzero()[:, 1]
-                    mask_pos = masked_valid.nonzero()[:, 1]
-                    w = self._distance_weights(vis_pos, mask_pos)  # [N_vis]
-                    per_token = ((h_s_vis - h_t_vis.detach()) ** 2).mean(dim=1)
-                    loss_ctx = (w * per_token).mean()
-                else:
-                    loss_ctx = F.mse_loss(h_s_vis, h_t_vis.detach())
-
-        return loss_msp, loss_ctx
-
-    def _compute_msp_loss_packed(
-        self,
-        x1: torch.Tensor,
-        *,
-        input_feature_dims_1: torch.Tensor = None,
-        cu_seqlens1: torch.Tensor = None,
-        max_seqlen1: int = None,
-        seq_idx1: torch.Tensor = None,
-        physical_positions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _collect_router_losses(self, stats_list: list) -> dict:
         """
-        Compute Masked Slice Prediction loss (packed mode).
+        Aggregate router load-balance / z-loss / entropy_for_loss over the provided FM stats.
 
-        Same logic as _compute_msp_loss but operates on packed tensors.
+        Args:
+            stats_list: list of FM stats dicts (e.g. from each contrastive view).
 
         Returns:
-            (loss_msp, loss_ctx)
+            dict with loss_router_balance, loss_router_z, loss_router_entropy (scalars),
+            and fm_weight_entropy (detached mean for logging).
         """
-        device = x1.device
-
-        # Generate contiguous slice mask [total_seq_len]
-        slice_mask = generate_contiguous_slice_mask_packed(
-            cu_seqlens1, mask_ratio_range=self.msp_mask_ratio,
-        ).to(device)
-
-        # Student: encode masked view → per-slice hidden states
-        h_student = self.base_encoder(
-            x1,
-            input_feature_dims=input_feature_dims_1,
-            use_packed=True,
-            cu_seqlens=cu_seqlens1,
-            max_seqlen=max_seqlen1,
-            seq_idx=seq_idx1,
-            return_slice_embeddings=True,
-            slice_mask=slice_mask,
-            mask_token=self.mask_token,
-            physical_positions=physical_positions,
-        )  # [total_seq_len, embed_dim]
-
-        # Teacher: encode full view → per-slice hidden states
-        with torch.no_grad():
-            h_teacher = self.momentum_encoder(
-                x1,
-                input_feature_dims=input_feature_dims_1,
-                use_packed=True,
-                cu_seqlens=cu_seqlens1,
-                max_seqlen=max_seqlen1,
-                seq_idx=seq_idx1,
-                return_slice_embeddings=True,
-                physical_positions=physical_positions,
-            )  # [total_seq_len, embed_dim]
-
-        # MSP loss: masked slice positions only
-        h_s_masked = h_student[slice_mask]  # [N_masked, embed_dim]
-        h_t_masked = h_teacher[slice_mask]
-
-        # Local positions within each sequence
-        global_indices = slice_mask.nonzero().squeeze(-1)
-        sample_ids = seq_idx1[global_indices].long()
-        local_positions = global_indices - cu_seqlens1[sample_ids]
-
-        h_pred = self.msp_predictor(h_s_masked, local_positions)
-        loss_msp = F.mse_loss(h_pred, h_t_masked.detach())
-
-        # Context loss: visible (non-masked and non-padded) slice positions
-        loss_ctx = torch.tensor(0.0, device=device)
-        if self.msp_lambda_ctx > 0:
-            visible_mask = ~slice_mask
-            if visible_mask.any():
-                h_s_vis = h_student[visible_mask]
-                h_t_vis = h_teacher[visible_mask]
-
-                if self.msp_ctx_distance_weighted:
-                    vis_global = visible_mask.nonzero().squeeze(-1)
-                    w = self._distance_weights(vis_global, global_indices)
-                    per_token = ((h_s_vis - h_t_vis.detach()) ** 2).mean(dim=1)
-                    loss_ctx = (w * per_token).mean()
+        device = next(self.parameters()).device
+        balance = torch.zeros((), device=device)
+        z_loss = torch.zeros((), device=device)
+        entropy_for_loss = torch.zeros((), device=device)
+        fm_weight_entropy = torch.zeros((), device=device)
+        fm_usage = None
+        if self.num_fms is not None:
+            fm_usage = torch.zeros(self.num_fms, device=device)
+        n = 0
+        for stats in stats_list:
+            if stats is None:
+                continue
+            weights = stats["fm_weights_local"]
+            fm_ids = stats["fm_ids"]
+            slice_mask = stats.get("slice_mask")
+            balance = balance + self._fm_load_balance_loss(
+                weights, fm_ids, slice_mask
+            )
+            if stats.get("router_logits") is not None:
+                z_loss = z_loss + self._router_z_loss(stats["router_logits"], slice_mask)
+            entropy = stats.get("fm_weight_entropy")
+            if entropy is not None:
+                if slice_mask is not None:
+                    valid = slice_mask.to(device=entropy.device, dtype=entropy.dtype)
+                    mean_entropy = (entropy * valid).sum() / valid.sum().clamp_min(1.0)
                 else:
-                    loss_ctx = F.mse_loss(h_s_vis, h_t_vis.detach())
-
-        return loss_msp, loss_ctx
+                    mean_entropy = entropy.mean()
+                entropy_for_loss = entropy_for_loss + mean_entropy
+                fm_weight_entropy = fm_weight_entropy + mean_entropy.detach()
+            if fm_usage is not None:
+                fm_usage = fm_usage + self.aggregate_fm_usage(
+                    weights, fm_ids, self.num_fms, slice_mask=slice_mask
+                )
+            n += 1
+        denom = max(n, 1)
+        out = {
+            "loss_router_balance": balance / denom,
+            "loss_router_z": z_loss / denom,
+            "loss_router_entropy": entropy_for_loss / denom,
+            "fm_weight_entropy": fm_weight_entropy / denom,
+        }
+        if fm_usage is not None:
+            out["fm_usage"] = fm_usage / denom
+        return out
 
     def _forward(
         self, 
@@ -505,43 +443,51 @@ class MoCo(nn.Module):
         labels: torch.Tensor | None = None,
         has_label: torch.Tensor | None = None,
         physical_positions: torch.Tensor | None = None,
+        fm_ids_1: torch.Tensor | None = None,
+        fm_ids_2: torch.Tensor | None = None,
     ) -> torch.Tensor | dict:
         """        
         Args:
-            x1: First view features [B, num_slices, feature_dim]
-            x2: Second view features [B, num_slices, feature_dim]
-            input_feature_dims_1: Original feature dims per-sample for x1 with shape [B].
-            input_feature_dims_2: Original feature dims per-sample for x2 with shape [B].
+            x1: First view features [B, num_slices, feature_dim] (pair) or
+                [B, K, num_slices, (regions,) feature_dim] (subset).
+            x2: Second view features, same layout as x1.
+            input_feature_dims_1: Original feature dims for x1 ([B] pair, [B, K] subset).
+            input_feature_dims_2: Original feature dims for x2 ([B] pair, [B, K] subset).
             m: Momentum parameter for momentum encoder update. Default: 0.99.
             seq_lengths: Actual sequence lengths with shape [B] for masking padded positions.
                          Shared across both views since positive pairs come from the same exam/plane.
             labels: Optional multi-label tensor [B, C] for semi-supervised contrastive learning.
             has_label: Optional boolean tensor [B] indicating which samples have classification labels.
-            physical_positions: Physical slice positions in mm [B, num_slices] for sinusoidal PE.
+            physical_positions: Normalized relative slice depth in [0, 1] [B, num_slices] for sinusoidal PE.
+            fm_ids_1, fm_ids_2: Global FM IDs [B, K] per view (subset mode only).
             
         Returns:
-            Contrastive loss.
+            Scalar contrastive loss, or a dict with auxiliary losses/metrics when
+            router losses are active.
         """
+        subset_mode = fm_ids_1 is not None
         pe_kwargs = dict(physical_positions=physical_positions)
 
         q1 = self.predictor(self.base_encoder(
             x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths,
-            **pe_kwargs,
+            fm_ids=fm_ids_1, **pe_kwargs,
         ))
+        stats1 = self.base_encoder._last_fm_stats if subset_mode else None
         q2 = self.predictor(self.base_encoder(
             x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths,
-            **pe_kwargs,
+            fm_ids=fm_ids_2, **pe_kwargs,
         ))
+        stats2 = self.base_encoder._last_fm_stats if subset_mode else None
        
         with torch.no_grad():
             self._update_momentum_encoder(m=m)
             k1 = self.momentum_encoder(
                 x1, input_feature_dims=input_feature_dims_1, seq_lengths=seq_lengths,
-                **pe_kwargs,
+                fm_ids=fm_ids_1, **pe_kwargs,
             )
             k2 = self.momentum_encoder(
                 x2, input_feature_dims=input_feature_dims_2, seq_lengths=seq_lengths,
-                **pe_kwargs,
+                fm_ids=fm_ids_2, **pe_kwargs,
             )
 
         loss_infonce = (
@@ -549,29 +495,54 @@ class MoCo(nn.Module):
             self.contrastive_loss(q2, k1, labels=labels, has_label=has_label)
         )
 
-        if not self.msp_enabled:
-            return loss_infonce
+        if subset_mode:
+            return self._router_aux_loss(loss_infonce, [stats1, stats2])
 
-        # MSP branch: masked slice prediction on the first FM-view
-        loss_msp, loss_ctx = self._compute_msp_loss(
-            x1,
-            input_feature_dims_1=input_feature_dims_1,
-            seq_lengths=seq_lengths,
-            physical_positions=physical_positions,
-        )
+        return loss_infonce
+
+    def _router_aux_loss(
+        self,
+        loss_infonce: torch.Tensor,
+        stats_list: list,
+    ) -> torch.Tensor | dict:
+        """
+        Combine InfoNCE with optional router auxiliary losses for subset FM mode.
+
+        - Router: total = InfoNCE + w_balance * balance + w_z * z + w_entropy * entropy.
+          The entropy loss term penalizes high entropy, encouraging sharper routing
+          when enabled (default off).
+        - Attention / avg_pool: InfoNCE only; log fm_weight_entropy for monitoring. 
+          Router aux weights (router_load_balance_weight, etc.) apply only when fm_pooling='router'.
+        """
+        router_losses = self._collect_router_losses(stats_list)
+
+        if self.fm_pooling != "router":
+            out = {
+                "loss": loss_infonce,
+                "loss_infonce": loss_infonce.detach(),
+                "fm_weight_entropy": router_losses["fm_weight_entropy"],
+            }
+            if "fm_usage" in router_losses:
+                out["fm_usage"] = router_losses["fm_usage"].detach()
+            return out
 
         total_loss = (
             loss_infonce
-            + self.msp_lambda_mask * loss_msp
-            + self.msp_lambda_ctx * loss_ctx
+            + self.router_load_balance_weight * router_losses["loss_router_balance"]
+            + self.router_z_loss_weight * router_losses["loss_router_z"]
+            + self.router_entropy_weight * router_losses["loss_router_entropy"]
         )
-
-        return {
+        out = {
             "loss": total_loss,
             "loss_infonce": loss_infonce.detach(),
-            "loss_msp": loss_msp.detach(),
-            "loss_ctx": loss_ctx.detach(),
+            "loss_router_balance": router_losses["loss_router_balance"].detach(),
+            "loss_router_z": router_losses["loss_router_z"].detach(),
+            "loss_router_entropy": router_losses["loss_router_entropy"].detach(),
+            "fm_weight_entropy": router_losses["fm_weight_entropy"],
         }
+        if "fm_usage" in router_losses:
+            out["fm_usage"] = router_losses["fm_usage"].detach()
+        return out
     
     def _forward_packed(
         self,
@@ -628,31 +599,7 @@ class MoCo(nn.Module):
             self.contrastive_loss(q2, k1, labels=labels, has_label=has_label)
         )
 
-        if not self.msp_enabled:
-            return loss_infonce
-
-        # MSP branch: masked slice prediction on view_1
-        loss_msp, loss_ctx = self._compute_msp_loss_packed(
-            x1,
-            input_feature_dims_1=input_feature_dims_1,
-            cu_seqlens1=cu_seqlens1,
-            max_seqlen1=max_seqlen1,
-            seq_idx1=seq_idx1,
-            physical_positions=physical_positions,
-        )
-
-        total_loss = (
-            loss_infonce
-            + self.msp_lambda_mask * loss_msp
-            + self.msp_lambda_ctx * loss_ctx
-        )
-
-        return {
-            "loss": total_loss,
-            "loss_infonce": loss_infonce.detach(),
-            "loss_msp": loss_msp.detach(),
-            "loss_ctx": loss_ctx.detach(),
-        }
+        return loss_infonce
 
     def forward(
         self, 
@@ -664,6 +611,8 @@ class MoCo(nn.Module):
         m: float = 0.99,
         use_packed: bool = False,
         physical_positions: torch.Tensor | None = None,
+        fm_ids_1: torch.Tensor | None = None,
+        fm_ids_2: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | dict:
         """        
@@ -678,7 +627,7 @@ class MoCo(nn.Module):
             input_feature_dims_2: Original feature dims per-sample for x2 with shape [B].
             m: Momentum parameter for momentum encoder update. Default: 0.99.
             use_packed: If True, use packed sequence for variable sequence length handling.
-            physical_positions: Physical slice positions in mm for sinusoidal PE.
+            physical_positions: Normalized relative slice depth in [0, 1] for sinusoidal PE.
                 - Padded mode: [B, num_slices]
                 - Packed mode: [total_seq_len]
             
@@ -691,10 +640,22 @@ class MoCo(nn.Module):
                     - seq_idx1, seq_idx2: Document index per token with shape [total_seq_len]
             
         Returns:
-            When MSP is disabled: scalar contrastive loss.
-            When MSP is enabled: dict with keys loss (total), loss_infonce, loss_msp, and loss_ctx.
+            Scalar contrastive loss, or a dict with router auxiliary losses in subset mode.
         """
+        subset_mode = fm_ids_1 is not None or fm_ids_2 is not None
+        if (fm_ids_1 is None) != (fm_ids_2 is None):
+            raise ValueError("Subset FM mode requires both fm_ids_1 and fm_ids_2.")
+        if self.fm_pooling == "router" and not subset_mode:
+            raise ValueError(
+                f"fm_pooling='{self.fm_pooling}' requires subset FM mode with fm_ids. "
+                "Use ssl_fm_mode='subset' or switch fm_pooling='avg_pool'."
+            )
         if use_packed:
+            if fm_ids_1 is not None:
+                raise NotImplementedError(
+                    "Packed subset FM mode is not supported yet. Use padded subset batches "
+                    "(use_packed=False) for fm_pooling router SSL."
+                )
             return self._forward_packed(
                 x1, x2,
                 input_feature_dims_1=input_feature_dims_1,
@@ -710,6 +671,8 @@ class MoCo(nn.Module):
                 input_feature_dims_2=input_feature_dims_2,
                 m=m,
                 physical_positions=physical_positions,
+                fm_ids_1=fm_ids_1,
+                fm_ids_2=fm_ids_2,
                 **kwargs,
             )
     

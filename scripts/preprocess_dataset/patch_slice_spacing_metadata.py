@@ -20,12 +20,11 @@ Usage:
 
 import argparse
 import os
-import sys
 from glob import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import nibabel as nib
-import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
@@ -41,8 +40,7 @@ def patch_one_file(
     Patch a single safetensors file with slice_spacing_mm.
 
     Uses the safetensors filename (not the metadata uid) to locate the
-    matching NIfTI, since some datasets store a different uid in metadata
-    than in the filename (e.g. KMAR-50K).
+    matching NIfTI at ``{data_dir}/{split}/{plane}/{uid}.nii.gz``.
 
     Returns:
         Status string for logging, or None if skipped.
@@ -55,14 +53,12 @@ def patch_one_file(
         return None  # already patched
 
     plane = metadata["plane"]
-    # Use filename stem as the canonical UID for NIfTI lookup
     file_uid = os.path.splitext(os.path.basename(safetensor_path))[0]
+    nifti_path = Path(data_dir) / split / plane / f"{file_uid}.nii.gz"
+    if not nifti_path.is_file():
+        return f"MISSING_NIFTI: {file_uid} (plane={plane})"
 
-    nifti_path = os.path.join(data_dir, split, plane, f"{file_uid}.nii.gz")
-    if not os.path.exists(nifti_path):
-        return f"MISSING_NIFTI: {nifti_path}"
-
-    zooms = nib.load(nifti_path).header.get_zooms()
+    zooms = nib.load(str(nifti_path)).header.get_zooms()
     slice_spacing_mm = float(zooms[2])
 
     metadata["slice_spacing_mm"] = str(slice_spacing_mm)
@@ -104,7 +100,7 @@ def main():
 
     if not all_files:
         print(f"No safetensors files found matching: {pattern}")
-        sys.exit(1)
+        raise SystemExit(1)
 
     print(f"Found {len(all_files)} safetensors files to patch")
     print(f"NIfTI source: {args.data_dir}")

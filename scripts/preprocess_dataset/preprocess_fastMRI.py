@@ -270,13 +270,15 @@ def main():
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="/hpcwork/rwth1833/datasets/fastMRI/knee",
+        required=True,
+        #default="/hpcwork/rwth1833/datasets/fastMRI/knee",
         help="Root folder containing fastMRI knee DICOM data",
     )
     parser.add_argument(
         "--save-dir",
         type=str,
-        default="/work/rwth1833/datasets/preprocessed/fastMRI",
+        required=True,
+        #default="/work/rwth1833/datasets/preprocessed/fastMRI",
         help="Output directory for NIfTI and metadata",
     )
     parser.add_argument(

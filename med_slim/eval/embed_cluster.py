@@ -44,7 +44,11 @@ from med_slim.data.feat_dataset import (
     linear_classifier_collate_fn,
 )
 from med_slim.model.sequence_encoder.cobra import _resolve_pooling_target
-from med_slim.eval.load_cobra import load_pretrained_cobra, load_cobra_from_experiment
+from med_slim.eval.load_cobra import (
+    load_pretrained_cobra,
+    load_cobra_from_experiment,
+    resolve_eval_fm_ids,
+)
 from med_slim.utils.viz.cluster import plot_embedding_clustering, compute_silhouette
 from med_slim.utils.label_metadata import (
     get_dataset_metadata,
@@ -72,6 +76,7 @@ def extract_embeddings(
     dataloader: DataLoader,
     accelerator: Accelerator,
     slice_level: bool = False,
+    fm_ids: list[int] | None = None,
 ):
     """
     Extract COBRA embeddings from a dataloader.
@@ -91,6 +96,7 @@ def extract_embeddings(
     all_embeddings = []
     all_labels = []
     all_sample_ids = []
+    fm_ids_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long, device=accelerator.device)
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting embeddings", disable=not accelerator.is_main_process):
@@ -107,6 +113,7 @@ def extract_embeddings(
                     features,
                     seq_lengths=seq_lengths,
                     physical_positions=physical_positions,
+                    fm_ids=fm_ids_tensor,
                     return_slice_embeddings=True,
                 )
                 B = embeddings.shape[0]
@@ -126,6 +133,7 @@ def extract_embeddings(
                     features,
                     seq_lengths=seq_lengths,
                     physical_positions=physical_positions,
+                    fm_ids=fm_ids_tensor,
                 )
                 all_embeddings.append(embeddings.float())
                 all_labels.append(batch_labels)
@@ -144,10 +152,12 @@ def _extract_volume_embeddings(
     cobra_model,
     dataloader: DataLoader,
     accelerator: Accelerator,
+    fm_ids: list[int] | None = None,
 ) -> np.ndarray:
     """Extract volume-level embeddings."""
     cobra_model.eval()
     all_embs = []
+    fm_ids_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long, device=accelerator.device)
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting embeddings", disable=not accelerator.is_main_process):
             seq_lengths = batch["seq_lengths"].to(accelerator.device)
@@ -159,6 +169,7 @@ def _extract_volume_embeddings(
                 features,
                 seq_lengths=seq_lengths,
                 physical_positions=physical_positions,
+                fm_ids=fm_ids_tensor,
             )
             all_embs.append(embs.float())
     embs = torch.cat(all_embs, dim=0)
@@ -208,6 +219,14 @@ def _run_multi_dataset(args, accelerator: Accelerator):
     cobra_cfg["regional_tokens"] = int(
         pretrain_state.get("regional_tokens", cobra_cfg.get("regional_tokens", 0))
     )
+    fm_pooling = (
+        args.fm_pooling
+        or pretrain_state.get("fm_pooling")
+        or cobra_cfg.get("fm_pooling", "avg_pool")
+    )
+    eval_fm_ids = resolve_eval_fm_ids(
+        fm_pooling, model_names, pretrain_cfg, pretrain_state
+    )
 
     resolved_pooling_target = _resolve_pooling_target(
         mode="inference",
@@ -217,6 +236,11 @@ def _run_multi_dataset(args, accelerator: Accelerator):
     )
     raw_output_dim = None
     if resolved_pooling_target == "raw":
+        if fm_pooling == "router":
+            raise ValueError(
+                f"pooling_target='raw' bypasses FM fusion and is not valid with fm_pooling='{fm_pooling}'. "
+                "Use pooling_target='post_embed' or 'post_encoder'."
+            )
         fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
         raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
 
@@ -225,7 +249,7 @@ def _run_multi_dataset(args, accelerator: Accelerator):
         accelerator=accelerator,
         model_config=cobra_cfg,
         encoder_type="momentum",
-        fm_pooling=args.fm_pooling or "avg_pool",
+        fm_pooling=fm_pooling,
         sequence_encoder=args.sequence_encoder,
         slice_pooling=args.slice_pooling,
         pooling_target=resolved_pooling_target,
@@ -278,7 +302,9 @@ def _run_multi_dataset(args, accelerator: Accelerator):
                 )
                 dataloader = accelerator.prepare(dataloader)
 
-                embs = _extract_volume_embeddings(cobra_model, dataloader, accelerator)
+                embs = _extract_volume_embeddings(
+                    cobra_model, dataloader, accelerator, fm_ids=eval_fm_ids
+                )
                 all_embeddings.append(embs)
                 plane_labels.extend([plane] * embs.shape[0])
 
@@ -336,6 +362,23 @@ def _run_single_dataset(args, accelerator: Accelerator):
         model_names = args.fm_model_names.split() if args.fm_model_names else feat_cfg.get("model_name", ["dinov2"])
         if isinstance(model_names, str):
             model_names = [model_names]
+        fm_pooling = exp_cfg.get("fm_pooling", getattr(cobra_model, "fm_pooling", "avg_pool"))
+        if args.fm_model_names:
+            eval_fm_ids = resolve_eval_fm_ids(
+                fm_pooling,
+                model_names,
+                {"feat_dataset": {"model_name": exp_cfg.get("fm_id_order")}},
+                None,
+            )
+        else:
+            eval_fm_ids = exp_cfg.get("eval_fm_ids")
+            if eval_fm_ids is None:
+                eval_fm_ids = resolve_eval_fm_ids(
+                    fm_pooling,
+                    model_names,
+                    {"feat_dataset": {"model_name": exp_cfg.get("fm_id_order")}},
+                    None,
+                )
         dataset_name = args.dataset_name or feat_cfg.get("dataset_name")
         output_dir = args.output_dir or os.path.join(args.experiment_dir, "embed_cluster")
         annotations_dir = args.annotations_dir or exp_cfg.get("annotations_dir")
@@ -373,6 +416,14 @@ def _run_single_dataset(args, accelerator: Accelerator):
         cobra_cfg["regional_tokens"] = int(
             pretrain_state.get("regional_tokens", cobra_cfg.get("regional_tokens", 0))
         )
+        fm_pooling = (
+            args.fm_pooling
+            or pretrain_state.get("fm_pooling")
+            or cobra_cfg.get("fm_pooling", "avg_pool")
+        )
+        eval_fm_ids = resolve_eval_fm_ids(
+            fm_pooling, model_names, pretrain_cfg, pretrain_state
+        )
 
         resolved_pooling_target = _resolve_pooling_target(
             mode="inference",
@@ -382,6 +433,11 @@ def _run_single_dataset(args, accelerator: Accelerator):
         )
         raw_output_dim = None
         if resolved_pooling_target == "raw":
+            if fm_pooling == "router":
+                raise ValueError(
+                    f"pooling_target='raw' bypasses FM fusion and is not valid with fm_pooling='{fm_pooling}'. "
+                    "Use pooling_target='post_embed' or 'post_encoder'."
+                )
             fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
             raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
 
@@ -390,7 +446,7 @@ def _run_single_dataset(args, accelerator: Accelerator):
             accelerator=accelerator,
             model_config=cobra_cfg,
             encoder_type="momentum",
-            fm_pooling=args.fm_pooling or "avg_pool",
+            fm_pooling=fm_pooling,
             sequence_encoder=args.sequence_encoder,
             slice_pooling=args.slice_pooling,
             pooling_target=resolved_pooling_target,
@@ -455,7 +511,7 @@ def _run_single_dataset(args, accelerator: Accelerator):
 
         # Volume-level embeddings
         vol_embs, vol_labs, vol_sids = extract_embeddings(
-            cobra_model, dataloader, accelerator, slice_level=False
+            cobra_model, dataloader, accelerator, slice_level=False, fm_ids=eval_fm_ids
         )
         vol_embeddings_list.append(vol_embs)
         vol_labels_list.append(vol_labs)
@@ -464,7 +520,7 @@ def _run_single_dataset(args, accelerator: Accelerator):
         # Slice-level embeddings
         if args.slice_level:
             sl_embs, sl_labs, sl_sids = extract_embeddings(
-                cobra_model, dataloader, accelerator, slice_level=True
+                cobra_model, dataloader, accelerator, slice_level=True, fm_ids=eval_fm_ids
             )
             slice_embeddings_list.append(sl_embs)
             slice_labels_list.append(sl_labs)
@@ -612,7 +668,7 @@ def main():
     parser.add_argument("--task", type=str, default=None, choices=["binary", "multiclass", "multilabel"],
                         help="Classification task type (single-dataset mode)")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "attention"])
+    parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "router"])
     parser.add_argument("--sequence-encoder", type=str, default=None, choices=["mamba2", "transformer"])
     parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
     parser.add_argument(

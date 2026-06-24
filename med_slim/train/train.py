@@ -45,7 +45,6 @@ def _apply_cli_overrides(cfg: dict, args) -> None:
     """Override CLI flags into cfg so that the saved config.yaml matches the actual run."""
     feat_cfg = cfg.setdefault("feat_dataset", {})
     cobra_cfg = cfg.setdefault("model", {}).setdefault("cobra", {})
-    msp_cfg = cfg.setdefault("msp", {})
 
     if args.model_names:
         fm_choices = {m["name"]: m["embed_dim"] for m in cfg["model"]["slice_encoder_models"]}
@@ -61,15 +60,6 @@ def _apply_cli_overrides(cfg: dict, args) -> None:
     if args.use_packed:
         feat_cfg["use_packed"] = True
 
-    if args.msp:
-        msp_cfg["enabled"] = True
-    if args.msp_lambda_mask is not None:
-        msp_cfg["lambda_mask"] = args.msp_lambda_mask
-    if args.msp_lambda_ctx is not None:
-        msp_cfg["lambda_ctx"] = args.msp_lambda_ctx
-    if args.msp_mask_ratio is not None:
-        msp_cfg["mask_ratio"] = list(args.msp_mask_ratio)
-
     cobra_cfg["pooling"] = args.pooling
     cobra_cfg["sequence_encoder"] = args.sequence_encoder
     if args.regional_tokens is not None:
@@ -80,6 +70,52 @@ def _apply_cli_overrides(cfg: dict, args) -> None:
     cobra_cfg["physical_pe"] = bool(
         args.physical_pe or cobra_cfg.get("physical_pe", False)
     )
+    if args.num_epochs is not None:
+        if args.num_epochs < 1:
+            raise ValueError(f"--num-epochs must be >= 1, got {args.num_epochs}")
+        cfg["train"]["num_epochs"] = args.num_epochs
+        print(f"CLI override: train.num_epochs={args.num_epochs}")
+    if args.regional_tokens is not None:
+        if args.regional_tokens < 0:
+            raise ValueError(f"--regional-tokens must be >= 0, got {args.regional_tokens}")
+        cfg["model"]["cobra"]["regional_tokens"] = args.regional_tokens
+        print(f"CLI override: model.cobra.regional_tokens={args.regional_tokens}")
+    
+    # FM fusion / subset / router CLI overrides
+    cobra_cfg_dict = cfg["model"]["cobra"]
+    if args.fm_pooling is not None:
+        cobra_cfg_dict["fm_pooling"] = args.fm_pooling
+        print(f"CLI override: fm_pooling={args.fm_pooling}")
+    if args.per_fm_adapter_mode is not None:
+        cobra_cfg_dict["per_fm_adapter_mode"] = args.per_fm_adapter_mode
+        print(f"CLI override: per_fm_adapter_mode={args.per_fm_adapter_mode}")
+    if args.router_mode is not None:
+        cobra_cfg_dict["router_mode"] = args.router_mode
+    if args.router_top_k is not None:
+        cobra_cfg_dict["router_top_k"] = args.router_top_k
+    if args.router_temperature is not None:
+        cobra_cfg_dict["router_temperature"] = args.router_temperature
+
+    if "ssl" not in cfg or cfg["ssl"] is None:
+        cfg["ssl"] = {}
+    if args.ssl_fm_mode is not None:
+        cfg["ssl"]["fm_mode"] = args.ssl_fm_mode
+        print(f"CLI override: ssl.fm_mode={args.ssl_fm_mode}")
+    if args.fm_subset_size is not None:
+        cfg["ssl"]["fm_subset_size"] = args.fm_subset_size
+    if args.fm_subset_min_overlap is not None:
+        cfg["ssl"]["fm_subset_min_overlap"] = args.fm_subset_min_overlap
+    if args.fm_subset_max_overlap is not None:
+        cfg["ssl"]["fm_subset_max_overlap"] = args.fm_subset_max_overlap
+
+    if "router" not in cfg or cfg["router"] is None:
+        cfg["router"] = {}
+    if args.router_load_balance_weight is not None:
+        cfg["router"]["load_balance_weight"] = args.router_load_balance_weight
+    if args.router_z_loss_weight is not None:
+        cfg["router"]["z_loss_weight"] = args.router_z_loss_weight
+    if args.router_confidence_weight is not None:
+        cfg["router"]["confidence_weight"] = args.router_confidence_weight
     
 
 def _build_pretrain_run_name(cfg: dict, timestamp: str = CURR_TIME) -> str:
@@ -139,11 +175,34 @@ def main(args, cfg):
 
     cobra_cfg = cfg["model"]["cobra"]
     sequence_encoder = cobra_cfg["sequence_encoder"]
-    pooling = cobra_cfg["pooling"]
-    physical_pe = cobra_cfg.get("physical_pe", False)
+    physical_pe = getattr(args, "physical_pe", False) or cobra_cfg.get("physical_pe", False)
     regional_tokens = cobra_cfg.get("regional_tokens", 0)
-    region_embedding = cobra_cfg.get("region_embedding", False)
-    
+
+    # FM fusion / router
+    fm_pooling = cobra_cfg.get("fm_pooling", "avg_pool")
+    ssl_cfg = cfg.get("ssl", {}) or {}
+    router_cfg = cfg.get("router", {}) or {}
+    ssl_fm_mode = ssl_cfg.get("fm_mode", "pair")
+    use_packed = getattr(args, "use_packed", False)
+    num_fms = len(cfg["feat_dataset"]["model_name"])
+    log_per_fm_usage = bool(router_cfg.get("log_per_fm_usage", False))
+
+    # Per-FM projection adapters: input dim per global FM id 
+    # (ordered by feat_dataset.model_name which defines the global FM id order used by the router).
+    per_fm_adapter_mode = cobra_cfg.get("per_fm_adapter_mode", "per_dim")
+    name_to_dim = {m["name"]: m["embed_dim"] for m in cfg["model"]["slice_encoder_models"]}
+    fm_input_dims = [name_to_dim[n] for n in cfg["feat_dataset"]["model_name"]]
+    if fm_pooling == "router" and ssl_fm_mode != "subset":
+        raise ValueError(
+            f"fm_pooling='{fm_pooling}' requires ssl_fm_mode='subset' (FM-set views with fm_ids). "
+            f"Got ssl_fm_mode='{ssl_fm_mode}'."
+        )
+    if ssl_fm_mode == "subset" and use_packed:
+        raise NotImplementedError(
+            "Packed subset FM mode is not supported yet. Use padded subset batches "
+            "(use_packed=False) for fm_pooling router SSL."
+        )
+
     # Build encoder-specific kwargs
     encoder_kwargs = {}
     
@@ -157,24 +216,16 @@ def main(args, cfg):
     if pooling == "abmil":
         encoder_kwargs["att_dim"] = cobra_cfg.get("attn_dim", 256)
     
-    # MSP (Masked Slice Prediction) config
-    msp_cfg = cfg.get("msp", {})
-    msp_enabled = msp_cfg.get("enabled", False)
-    msp_ctx_enabled = msp_enabled and msp_cfg.get("lambda_ctx", 0.0) > 0
-    if msp_enabled:
-        print("MSP enabled: Masked Slice Prediction auxiliary objective")
-        if msp_ctx_enabled:
-            print(f"Context loss enabled (lambda_ctx={msp_cfg['lambda_ctx']}, "
-                  f"distance_weighted={msp_cfg.get('ctx_distance_weighted', True)}, "
-                  f"warmup={msp_cfg.get('ctx_warmup_epochs', None)})")
-
     # Build model
     print("Creating model...")
     if physical_pe:
-        print("Physical positional encoding ENABLED (sinusoidal, keyed on mm positions)")
+        print("Physical positional encoding ENABLED (sinusoidal, normalized relative depth in [0, 1])")
     if regional_tokens > 0:
-        print(f"Tiled multi-crop CLS ENABLED (regional_tokens={regional_tokens}, "
-              f"region_embedding={region_embedding})")
+        print(
+            f"Flattened regional-token pretraining ENABLED "
+            f"(1 global + {regional_tokens} regional tokens per slice)"
+        )
+    print(f"FM fusion: fm_pooling={fm_pooling}, ssl_fm_mode={ssl_fm_mode}")
     model = MoCo(
         embed_dim=cobra_cfg["embed_dim"],
         contrast_dim=cobra_cfg["contrast_dim"],
@@ -188,15 +239,20 @@ def main(args, cfg):
         pooling=pooling,
         physical_pe=physical_pe,
         regional_tokens=regional_tokens,
-        region_embedding=region_embedding,
-        msp_enabled=msp_enabled,
-        msp_lambda_mask=msp_cfg.get("lambda_mask", 1.0),
-        msp_lambda_ctx=msp_cfg.get("lambda_ctx", 0.0),
-        msp_mask_ratio=tuple(msp_cfg.get("mask_ratio", [0.3, 0.5])),
-        msp_predictor_depth=msp_cfg.get("predictor_depth", 2),
-        msp_predictor_dim=msp_cfg.get("predictor_dim") if isinstance(msp_cfg.get("predictor_dim"), int) else None,
-        msp_max_seq_len=msp_cfg.get("max_seq_len", 512),
-        msp_ctx_distance_weighted=msp_cfg.get("ctx_distance_weighted", True),
+        fm_pooling=fm_pooling,
+        num_fms=num_fms,
+        per_fm_adapter_mode=per_fm_adapter_mode,
+        fm_input_dims=fm_input_dims,
+        router_use_fm_embedding=cobra_cfg.get("router_use_fm_embedding", True),
+        router_use_fm_logit_bias=cobra_cfg.get("router_use_fm_logit_bias", True),
+        router_use_fm_logit_scale=cobra_cfg.get("router_use_fm_logit_scale", False),
+        router_mode=cobra_cfg.get("router_mode", "soft"),
+        router_top_k=cobra_cfg.get("router_top_k", None),
+        router_temperature=cobra_cfg.get("router_temperature", 1.0),
+        router_learnable_temperature=cobra_cfg.get("router_learnable_temperature", False),
+        router_load_balance_weight=router_cfg.get("load_balance_weight", 0.01),
+        router_z_loss_weight=router_cfg.get("z_loss_weight", 0.0),
+        router_entropy_weight=router_cfg.get("confidence_weight", 0.0),
         **encoder_kwargs,
     )
 
@@ -230,6 +286,12 @@ def main(args, cfg):
         print("Packed mode: using raw variable-length sequences (no subsampling / zero-padding)")
     else:
         print(f"Pad-or-sample mode: all sequences will be sampled/padded to {num_target_slices} slices")
+    if ssl_fm_mode == "subset":
+        print(
+            f"Subset FM SSL: fm_subset_size={ssl_cfg.get('fm_subset_size')}, "
+            f"min_overlap={ssl_cfg.get('fm_subset_min_overlap', 1)}, "
+            f"max_overlap={ssl_cfg.get('fm_subset_max_overlap')}"
+        )
     dataset = PrecomputedFeatPairDataset(
         feat_dirs=feat_dirs,
         slice_encoder_models=slice_encoder_models,
@@ -239,6 +301,10 @@ def main(args, cfg):
         num_target_slices=num_target_slices,
         cache_in_memory=True,
         use_packed=use_packed,
+        ssl_fm_mode=ssl_fm_mode,
+        fm_subset_size=ssl_cfg.get("fm_subset_size"),
+        fm_subset_min_overlap=ssl_cfg.get("fm_subset_min_overlap", 1),
+        fm_subset_max_overlap=ssl_cfg.get("fm_subset_max_overlap"),
     )
 
     if dataset.has_annotations:
@@ -314,10 +380,6 @@ def main(args, cfg):
             curr_lr = adjust_learning_rate(optimizer, e + i / iters_per_epoch, scaled_lr, cfg)
             curr_m = adjust_moco_momentum(e + i / iters_per_epoch, cfg)
 
-            if msp_ctx_enabled:
-                curr_ctx_lambda = adjust_msp_ctx_lambda(e + i / iters_per_epoch, cfg)
-                accelerator.unwrap_model(model).msp_lambda_ctx = curr_ctx_lambda
-
             optimizer.zero_grad(set_to_none=True)
             
             # Semi-supervised mode: pass labels when available (SupCon for labeled, InfoNCE for unlabeled)
@@ -364,7 +426,11 @@ def main(args, cfg):
                 sizes1 = batch["orig_embed_dim1"].to(dtype=torch.long)
                 sizes2 = batch["orig_embed_dim2"].to(dtype=torch.long)
                 seq_lens = batch["seq_len"].to(dtype=torch.long)
-            
+
+                # Subset FM mode: pass global FM IDs so fusion/router/load-balance use stable identities
+                fm_ids_1 = batch["fm_ids1"].to(device=accelerator.device, dtype=torch.long) if "fm_ids1" in batch else None
+                fm_ids_2 = batch["fm_ids2"].to(device=accelerator.device, dtype=torch.long) if "fm_ids2" in batch else None
+
                 with accelerator.autocast():
                     result = model(
                         x1, x2, 
@@ -374,14 +440,22 @@ def main(args, cfg):
                         labels=labels,
                         has_label=has_label,
                         physical_positions=phys_pos,
+                        fm_ids_1=fm_ids_1,
+                        fm_ids_2=fm_ids_2,
                     )
             
             if isinstance(result, dict):
                 loss = result["loss"]
-                loss_components = {k: v.item() for k, v in result.items() if k != "loss"}
+                fm_usage = result.get("fm_usage")
+                loss_components = {
+                    k: v.item()
+                    for k, v in result.items()
+                    if k not in ("loss", "fm_usage") and torch.is_tensor(v) and v.ndim == 0
+                }
             else:
                 loss = result
                 loss_components = {}
+                fm_usage = None
 
             # NaN check
             if torch.isnan(loss) or torch.isinf(loss):
@@ -405,8 +479,20 @@ def main(args, cfg):
                 }
                 for comp_name, comp_val in loss_components.items():
                     log_dict[f"train/{comp_name}"] = comp_val
-                if msp_ctx_enabled:
-                    log_dict["train/msp_lambda_ctx"] = curr_ctx_lambda
+                if (
+                    log_per_fm_usage
+                    and fm_pooling == "router"
+                    and fm_usage is not None
+                ):
+                    for fm_idx, fm_name in enumerate(slice_encoder_models):
+                        if fm_idx < fm_usage.shape[0]:
+                            log_dict[f"train/fm_usage/{fm_name}"] = fm_usage[fm_idx].item()
+                if fm_pooling == "router":
+                    fm_router = accelerator.unwrap_model(model).base_encoder.fm_router
+                    if fm_router is not None:
+                        log_dict["train/router_temperature"] = (
+                            fm_router.log_temperature.exp().item()
+                        )
                 if has_label is not None:
                     num_labeled = has_label.sum().item()
                     log_dict["train/labeled_ratio"] = num_labeled / has_label.shape[0]
@@ -432,8 +518,25 @@ def main(args, cfg):
                     "pooling": pooling,
                     "physical_pe": physical_pe,
                     "regional_tokens": regional_tokens,
-                    "region_embedding": region_embedding,
-                    "msp_enabled": msp_enabled,
+                    "fm_pooling": fm_pooling,
+                    "num_fms": num_fms,
+                    "per_fm_adapter_mode": per_fm_adapter_mode,
+                    "fm_input_dims": fm_input_dims,
+                    "fm_id_order": cfg["feat_dataset"]["model_name"],
+                    "ssl_fm_mode": ssl_fm_mode,
+                    "fm_subset_size": ssl_cfg.get("fm_subset_size"),
+                    "fm_subset_min_overlap": ssl_cfg.get("fm_subset_min_overlap", 1),
+                    "fm_subset_max_overlap": ssl_cfg.get("fm_subset_max_overlap"),
+                    "router_mode": cobra_cfg.get("router_mode", "soft"),
+                    "router_top_k": cobra_cfg.get("router_top_k", None),
+                    "router_temperature": cobra_cfg.get("router_temperature", 1.0),
+                    "router_learnable_temperature": cobra_cfg.get("router_learnable_temperature", False),
+                    "router_use_fm_embedding": cobra_cfg.get("router_use_fm_embedding", True),
+                    "router_use_fm_logit_bias": cobra_cfg.get("router_use_fm_logit_bias", True),
+                    "router_use_fm_logit_scale": cobra_cfg.get("router_use_fm_logit_scale", False),
+                    "router_load_balance_weight": router_cfg.get("load_balance_weight", 0.01),
+                    "router_z_loss_weight": router_cfg.get("z_loss_weight", 0.0),
+                    "router_confidence_weight": router_cfg.get("confidence_weight", 0.0),
                 }
                 ckpt_name = f"medslim-epoch{e+1}.pth.tar"
                 torch.save(
@@ -463,32 +566,6 @@ def adjust_moco_momentum(epoch, cfg):
     )
     return m
 
-
-def adjust_msp_ctx_lambda(epoch, cfg):
-    """
-    Progressive warmup of the MSP context-loss coefficient λ_ctx.
-
-    Follows the V-JEPA 2.1 training recipe (Mur-Labadia et al., 2026)
-    which linearly warms up λ over a configurable epoch range to prevent
-    the context loss from dominating early training and degrading global
-    representations.
-
-    Returns the effective λ_ctx for the current epoch.
-    """
-    msp_cfg = cfg.get("msp", {})
-    base_lambda = msp_cfg.get("lambda_ctx", 0.0)
-    warmup = msp_cfg.get("ctx_warmup_epochs")
-    if not isinstance(warmup, list) or base_lambda == 0.0:
-        return base_lambda
-    warmup_start, warmup_end = warmup
-    if epoch < warmup_start:
-        return 0.0
-    if epoch >= warmup_end:
-        return base_lambda
-    progress = (epoch - warmup_start) / max(1, warmup_end - warmup_start)
-    return base_lambda * progress
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MedSliM-pretraining.")
     parser.add_argument(
@@ -517,6 +594,12 @@ if __name__ == "__main__":
         help="Path to latest checkpoint",
     )
     parser.add_argument(
+        "--num-epochs",
+        type=int,
+        default=None,
+        help="Override train.num_epochs from config.",
+    )
+    parser.add_argument(
         "--sequence-encoder",
         type=str,
         choices=["mamba2", "transformer"],
@@ -534,9 +617,8 @@ if __name__ == "__main__":
         "--physical-pe",
         action="store_true",
         help=(
-            "Enable sinusoidal physical positional encoding keyed on slice "
-            "positions in mm. Requires slice_spacing_mm in safetensors metadata "
-            "(falls back to normalised positions when unavailable)."
+            "Enable sinusoidal positional encoding keyed on normalized relative "
+            "slice depth in [0, 1] (fraction through the volume)."
         ),
     )
     parser.add_argument(
@@ -563,51 +645,54 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help=(
-            "Tiled multi-crop CLS: number of regional crop tokens per slice (e.g. 4 for a 2x2 grid). "
-            "Requires tiled feature caches produced with the matching `--regional-tokens` flag. "
-            "Overrides config model.cobra.regional_tokens. "
-            "0 keeps the original global-only CLS pathway."
+            "Flatten regional crop tokens into the sequence dimension. "
+            "Example: --regional-tokens 4 expects global + 2x2 regional tokens "
+            "per slice and creates num_slices*5 sequence tokens. "
+            "Overrides config model.cobra.regional_tokens."
         ),
     )
+    # FM fusion / router arguments
     parser.add_argument(
-        "--region-embedding",
-        action="store_true",
-        help=(
-            "Add a learned region embedding over flattened global + regional "
-            "tokens so quadrant identity can be used."
-        ),
-    )
-    # MSP (Masked Slice Prediction) arguments
-    parser.add_argument(
-        "--msp",
-        action="store_true",
-        help="Enable Masked Slice Prediction (MSP) auxiliary objective.",
-    )
-    parser.add_argument(
-        "--msp-lambda-mask",
-        type=float,
+        "--fm-pooling",
+        type=str,
+        choices=["avg_pool", "router"],
         default=None,
-        help="Weight for MSP loss on masked positions. Overrides config msp.lambda_mask.",
+        help="FM fusion mode. Overrides config model.cobra.fm_pooling.",
     )
     parser.add_argument(
-        "--msp-lambda-ctx",
-        type=float,
+        "--per-fm-adapter-mode",
+        type=str,
+        choices=["per_dim", "per_fm_id"],
         default=None,
         help=(
-            "Weight for context loss on visible positions (V-JEPA 2.1). "
-            "Overrides config msp.lambda_ctx."
+            "Projection-adapter keying for FM-set paths. 'per_dim' (shared by input dim) or "
+            "'per_fm_id' (one adapter per FM). Overrides config model.cobra.per_fm_adapter_mode."
         ),
     )
     parser.add_argument(
-        "--msp-mask-ratio",
-        nargs=2,
-        type=float,
+        "--ssl-fm-mode",
+        type=str,
+        choices=["pair", "subset"],
         default=None,
-        metavar=("MIN", "MAX"),
-        help=(
-            "Contiguous masking ratio range (min max). "
-            "Example: --msp-mask-ratio 0.3 0.5. Overrides config msp.mask_ratio."
-        ),
+        help="Positive-pair construction. 'pair' (cross-FM baseline) or 'subset'. Overrides config ssl.fm_mode.",
+    )
+    parser.add_argument("--fm-subset-size", type=int, default=None, help="FMs per view in subset mode.")
+    parser.add_argument("--fm-subset-min-overlap", type=int, default=None, help="Min shared FMs between views.")
+    parser.add_argument("--fm-subset-max-overlap", type=int, default=None, help="Max shared FMs between views.")
+    parser.add_argument("--router-mode", type=str, choices=["soft", "topk"], default=None, help="Router mode.")
+    parser.add_argument("--router-top-k", type=int, default=None, help="Top-k FMs when router_mode=topk.")
+    parser.add_argument("--router-temperature", type=float, default=None, help="Router softmax temperature.")
+    parser.add_argument(
+        "--router-load-balance-weight", type=float, default=None,
+        help="Weight for router load-balance loss. Overrides config router.load_balance_weight.",
+    )
+    parser.add_argument(
+        "--router-z-loss-weight", type=float, default=None,
+        help="Weight for router z-loss. Overrides config router.z_loss_weight.",
+    )
+    parser.add_argument(
+        "--router-confidence-weight", type=float, default=None,
+        help="Weight for router confidence (low-entropy) loss. Overrides config router.confidence_weight.",
     )
     args = parser.parse_args()
     

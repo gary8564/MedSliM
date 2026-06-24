@@ -19,11 +19,13 @@ from torch.overrides import has_torch_function, handle_torch_function
 from torch.nn.functional import _in_projection, _mha_shape_check, _in_projection_packed, _canonical_mask, _none_or_dtype
 from torch.nn.functional import pad, softmax, linear, scaled_dot_product_attention, dropout
 
-from .rotary_embedding_torch import RotaryEmbedding, AttentionLiereRotator
+from .positional_encoding import (
+    RotaryEmbedding,
+    AttentionLiereRotator,
+    apply_rotary_emb,
+)
 
 from flash_attn import flash_attn_varlen_func
-
-from .rotary_embedding_torch import apply_rotary_emb
 
 def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
     if activation == "relu":

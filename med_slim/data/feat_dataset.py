@@ -60,14 +60,6 @@ class FeatureCache:
             return f.get_tensor("feats"), f.metadata()
 
 
-def _slice_spacing_from_metadata(metadata: dict | None) -> float | None:
-    """Extract slice spacing metadata when available."""
-    if not metadata:
-        return None
-    spacing_str = metadata.get("slice_spacing_mm")
-    return float(spacing_str) if spacing_str is not None else None
-
-
 def _validate_feature_metadata(
     feats: torch.Tensor,
     metadata: dict,
@@ -185,7 +177,14 @@ def ssl_packed_collate_fn(batch):
     seq_idx = torch.repeat_interleave(torch.arange(batch_size, dtype=torch.int32), seq_lens)
     
     phys_pos_list = [
-        item.get("physical_positions", torch.arange(item["feats1"].shape[0], dtype=torch.float32))
+        item.get(
+            "physical_positions",
+            PrecomputedFeatPairDataset._compute_physical_positions(
+                np.arange(item["feats1"].shape[0]),
+                item["feats1"].shape[0],
+                item["feats1"].shape[0],
+            ),
+        )
         for item in batch
     ]
     phys_pos_packed = torch.cat(phys_pos_list, dim=0)  # [total_slices]
@@ -368,7 +367,13 @@ class PrecomputedFeatPairDataset(Dataset):
                  max_feature_dim: int,
                  num_target_slices: int = 32,
                  cache_in_memory: bool = False,
-                 use_packed: bool = False):
+                 use_packed: bool = False,
+                 ssl_fm_mode: str = "pair",
+                 fm_subset_size: int | None = None,
+                 fm_subset_min_overlap: int = 1,
+                 fm_subset_max_overlap: int | None = None,
+                 fm_name_to_id: Dict[str, int] | None = None,
+                 return_fm_names: bool = False):
         """
         Args:
             feat_dirs: List of dataset config dictionaries. Each dict must have:
@@ -388,6 +393,20 @@ class PrecomputedFeatPairDataset(Dataset):
             cache_in_memory: If True, preload all feature tensors into RAM at init to eliminate per-epoch disk I/O.
             use_packed: If True, return raw variable-length sequences (no subsampling or
                         zero-padding). Must be used with ssl_packed_collate_fn in the DataLoader.
+            ssl_fm_mode: Positive-pair construction strategy.
+                - "pair" (default): cross-FM pair baseline. Each view is exactly one FM;
+                  preserves the original outputs/shapes exactly.
+                - "subset": each view is a controlled-overlap subset of FMs. The main
+                  router SSL mode. Sampled sets always have fixed size fm_subset_size.
+            fm_subset_size: Number of FMs per view in subset mode. Required for "subset".
+                Must be strictly less than len(slice_encoder_models) so two non-identical
+                subsets can always be formed.
+            fm_subset_min_overlap: Minimum shared FMs between the two views (0..fm_subset_size).
+            fm_subset_max_overlap: Maximum shared FMs between the two views. Defaults to
+                fm_subset_size - 1 so views are never forced to be identical.
+            fm_name_to_id: Optional mapping FM name -> stable global FM ID. When None, IDs are
+                derived from slice_encoder_models order. FM identity never comes from feature dim.
+            return_fm_names: If True, also return the selected FM names per view (debugging/logging).
         """
         self.feat_dirs = feat_dirs
         self.slice_encoder_models = slice_encoder_models
@@ -396,7 +415,71 @@ class PrecomputedFeatPairDataset(Dataset):
         self.max_feature_dim = max_feature_dim
         self.num_target_slices = num_target_slices
         self.use_packed = use_packed
-        
+
+        # FM subset SSL configuration
+        if ssl_fm_mode not in ("pair", "subset"):
+            raise ValueError(
+                f"Invalid ssl_fm_mode '{ssl_fm_mode}'. Must be 'pair' or 'subset'."
+            )
+        self.ssl_fm_mode = ssl_fm_mode
+        self.fm_subset_size = fm_subset_size
+        self.fm_subset_min_overlap = fm_subset_min_overlap
+        self.fm_subset_max_overlap = fm_subset_max_overlap
+        self.return_fm_names = return_fm_names
+
+        # Stable global FM IDs follow slice_encoder_models order unless overridden.
+        if fm_name_to_id is None:
+            fm_name_to_id = {name: i for i, name in enumerate(slice_encoder_models)}
+        else:
+            missing = [m for m in slice_encoder_models if m not in fm_name_to_id]
+            if missing:
+                raise ValueError(f"fm_name_to_id is missing IDs for FMs: {missing}.")
+        self.fm_name_to_id = fm_name_to_id
+        self.num_fms = len(slice_encoder_models)
+
+        if ssl_fm_mode == "subset":
+            if use_packed:
+                raise NotImplementedError(
+                    "Packed subset FM mode is not supported yet. Use padded subset batches "
+                    "(use_packed=False) for fm_pooling router SSL."
+                )
+            if fm_subset_size is None:
+                raise ValueError("fm_subset_size is required when ssl_fm_mode='subset'.")
+            if not (1 <= fm_subset_size < self.num_fms):
+                raise ValueError(
+                    f"fm_subset_size must satisfy 1 <= size < num_fms ({self.num_fms}); "
+                    f"got {fm_subset_size}. A strict subset is required so two non-identical "
+                    "views can always be sampled (all-FM is only ever used on one side)."
+                )
+            if not (0 <= fm_subset_min_overlap <= fm_subset_size):
+                raise ValueError(
+                    f"fm_subset_min_overlap must satisfy 0 <= overlap <= fm_subset_size "
+                    f"({fm_subset_size}); got {fm_subset_min_overlap}."
+                )
+            fm_max_overlap = (
+                fm_subset_max_overlap
+                if fm_subset_max_overlap is not None
+                else fm_subset_size - 1
+            )
+            # Cap at fm_subset_size - 1 so the two views can never be forced identical.
+            fm_max_overlap = min(fm_max_overlap, fm_subset_size - 1)
+            if fm_max_overlap < fm_subset_min_overlap:
+                raise ValueError(
+                    f"fm_subset_max_overlap ({fm_max_overlap}) < fm_subset_min_overlap "
+                    f"({fm_subset_min_overlap}) after capping at fm_subset_size - 1."
+                )
+            min_possible_overlap = max(0, 2 * fm_subset_size - self.num_fms)
+            fm_min_overlap = max(fm_subset_min_overlap, min_possible_overlap)
+            if fm_min_overlap > fm_max_overlap:
+                raise ValueError(
+                    "No valid non-identical FM subset pair exists with the requested overlap "
+                    f"constraints. num_fms={self.num_fms}, fm_subset_size={fm_subset_size}, "
+                    f"min_overlap={fm_subset_min_overlap}, max_overlap={fm_max_overlap}, "
+                    f"minimum possible overlap={min_possible_overlap}."
+                )
+            self._fm_min_overlap = fm_min_overlap
+            self._fm_max_overlap = fm_max_overlap
+
         self.feat_dir_map = {}
         self.feat_path_dict = self._get_feat_path_dict_by_study_id()
         self.study_ids = list(self.feat_path_dict.keys())
@@ -616,27 +699,22 @@ class PrecomputedFeatPairDataset(Dataset):
     def _compute_physical_positions(
         selected_indices: np.ndarray,
         num_slices: int,
-        slice_spacing_mm: float | None,
         num_target_slices: int,
     ) -> torch.Tensor:
         """
-        Compute physical positions (in mm) for the selected slice indices.
+        Compute normalized relative depth in [0, 1] for selected slice indices.
 
-        When `slice_spacing_mm` is available (from precomputed features safetensors metadata),
-        positions are in absolute millimeters.  
-        Otherwise, fallback to normalized positions in [0, 1] (fraction of volume depth).
+        Maps each subsampled index to its fractional position through the original
+        volume (0 = first slice, 1 = last slice). This is spacing-independent and
+        portable across datasets with different slice thickness or resampling grids.
 
-        Padded positions (beyond `len(selected_indices)`) are set to 0.
+        Padded positions (beyond ``len(selected_indices)``) are set to 0.
 
         Returns:
-            Tensor [num_target_slices] of physical positions.
+            Tensor [num_target_slices] of relative depth values in [0, 1].
         """
-        if slice_spacing_mm is not None and slice_spacing_mm > 0:
-            positions = selected_indices.astype(np.float32) * slice_spacing_mm
-        else:
-            # Normalized fallback
-            denom = max(num_slices - 1, 1)
-            positions = selected_indices.astype(np.float32) / denom
+        denom = max(num_slices - 1, 1)
+        positions = selected_indices.astype(np.float32) / denom
 
         pos_tensor = torch.zeros(num_target_slices, dtype=torch.float32)
         pos_tensor[: len(positions)] = torch.from_numpy(positions)
@@ -715,18 +793,139 @@ class PrecomputedFeatPairDataset(Dataset):
     def __len__(self):
         return len(self.study_ids)
 
+    def _sample_fm_subsets(self) -> Tuple[List[int], List[int]]:
+        """
+        Sample two non-identical FM subsets (global FM IDs) with controlled overlap.
+
+        Returns (view1_ids, view2_ids). Guarantees set(view1) != set(view2) and at least
+        fm_subset_min_overlap shared FMs.
+        """
+        all_ids = list(range(self.num_fms))
+        size = self.fm_subset_size
+
+        # Directly sample a valid ordered pair with exact overlap. This avoids retry loops
+        # and enforces the requested overlap range after accounting for finite num_fms.
+        overlap = random.randint(self._fm_min_overlap, self._fm_max_overlap)
+        view1 = set(random.sample(all_ids, size))
+        shared = set(random.sample(list(view1), overlap))
+        outside_view1 = [fid for fid in all_ids if fid not in view1]
+        view2_extra = set(random.sample(outside_view1, size - overlap))
+        view2 = shared | view2_extra
+
+        return sorted(view1), sorted(view2)
+
+    def _build_subset_view(
+        self,
+        fm_id_list: List[int],
+        feats_by_id: Dict[int, torch.Tensor],
+        indices: np.ndarray,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Stack one subset-SSL view: [K_sub, num_slices, (regions,) max_feature_dim] + dims [K_sub]."""
+        view_feats = []
+        view_dims = []
+        for fid in fm_id_list:
+            feats, _, _ = self._subsample_or_pad_slices(feats_by_id[fid].clone(), indices)
+            feats, orig_dim = self._pad_feature_dim(feats)
+            view_feats.append(feats)
+            view_dims.append(orig_dim)
+        stacked = torch.stack(view_feats, dim=0)
+        return stacked, torch.tensor(view_dims, dtype=torch.long)
+
+    def _getitem_subset(self, study_id: str, plane: str, uid: str) -> Dict:
+        """Build a subset-mode positive pair: each view is a controlled-overlap FM set."""
+        fm_ids1, fm_ids2 = self._sample_fm_subsets()
+        needed_ids = sorted(set(fm_ids1) | set(fm_ids2))
+
+        feats_by_id: Dict[int, torch.Tensor] = {}
+        metadata_by_id: Dict[int, dict] = {}
+        num_slices = None
+        ref_ndim = None
+        ref_regions = None
+        for fid in needed_ids:
+            fm_name = self.slice_encoder_models[fid]
+            feats, metadata = self._get_feats(self._get_feat_path(study_id, fm_name, plane, uid))
+            feats_by_id[fid] = feats
+            metadata_by_id[fid] = metadata
+            if num_slices is None:
+                num_slices = feats.shape[0]
+                ref_ndim = feats.ndim
+                ref_regions = feats.shape[1] if feats.ndim == 3 else None
+            else:
+                assert feats.shape[0] == num_slices, (
+                    f"Slice-count mismatch across FMs for study {study_id}, plane {plane}: "
+                    f"FM '{fm_name}' has {feats.shape[0]} slices vs {num_slices}."
+                )
+                assert feats.ndim == ref_ndim, (
+                    f"Token layout mismatch across FMs for study {study_id}: FM '{fm_name}' "
+                    f"has {feats.ndim}D features but expected {ref_ndim}D. Do not mix "
+                    "global-only and tiled multi-crop CLS caches."
+                )
+                if ref_ndim == 3:
+                    assert feats.shape[1] == ref_regions, (
+                        f"num_tiled_regions mismatch across FMs for study {study_id}: FM "
+                        f"'{fm_name}' has {feats.shape[1]} regions vs {ref_regions}."
+                    )
+
+        indices = self._compute_subsample_indices(num_slices, self.num_target_slices)
+        physical_positions = self._compute_physical_positions(
+            indices, num_slices, self.num_target_slices,
+        )
+
+        feats1, dims1 = self._build_subset_view(fm_ids1, feats_by_id, indices)
+        feats2, dims2 = self._build_subset_view(fm_ids2, feats_by_id, indices)
+        seq_len = min(num_slices, self.num_target_slices)
+
+        result = {
+            "feats1": feats1,                              # [K_sub, num_slices, (regions,) max_feature_dim]
+            "feats2": feats2,
+            "orig_embed_dim1": dims1,                      # [K_sub]
+            "orig_embed_dim2": dims2,                      # [K_sub]
+            "fm_ids1": torch.tensor(fm_ids1, dtype=torch.long),   # [K_sub]
+            "fm_ids2": torch.tensor(fm_ids2, dtype=torch.long),   # [K_sub]
+            "seq_len": torch.as_tensor(seq_len, dtype=torch.long),
+            "physical_positions": physical_positions,      # [num_target_slices] in [0, 1]
+            "study_id": study_id,
+            "dataset_name": study_id.split("_", 1)[0],
+            "plane": plane,
+            "uid": uid,
+        }
+
+        if self.return_fm_names:
+            result["fm_names1"] = [self.slice_encoder_models[i] for i in fm_ids1]
+            result["fm_names2"] = [self.slice_encoder_models[i] for i in fm_ids2]
+
+        self._attach_labels(result, study_id)
+        return result
+
+    def _attach_labels(self, result: Dict, study_id: str) -> None:
+        """Attach semi-supervised classification labels to a result dict when available."""
+        if self._num_labels <= 0:
+            return
+        dataset_name, exam_id = study_id.split("_", 1)
+        label_tensor = self._annotations.get(dataset_name, {}).get(exam_id, None)
+        if label_tensor is not None:
+            result["label"] = label_tensor.clone()
+            result["has_label"] = torch.tensor(True)
+        else:
+            result["label"] = torch.zeros(self._num_labels, dtype=torch.float32)
+            result["has_label"] = torch.tensor(False)
+
     def __getitem__(self, idx):
         study_id = self.study_ids[idx]
         
-        # 1. Select a random view plane from the study
+        # Select a random view plane from the study
         available_planes = list(self.feat_path_dict[study_id].keys())
         selected_view_plane = random.choice(available_planes)
         
-        # 2. Select a random MRI sequence UID
+        # Select a random MRI sequence UID
         uid_list = self.feat_path_dict[study_id][selected_view_plane]
         selected_uid = random.choice(uid_list)
-        
-        # 3. Cross-FM positive pair from the selected series
+
+        # Subset mode: each view is a controlled-overlap FM set
+        if self.ssl_fm_mode == "subset":
+            return self._getitem_subset(study_id, selected_view_plane, selected_uid)
+
+        # Cross-FM positive pair from the selected series
         fm1, fm2 = random.sample(self.slice_encoder_models, 2)
         feat_path1 = self._get_feat_path(study_id, fm1, selected_view_plane, selected_uid)
         feat_path2 = self._get_feat_path(study_id, fm2, selected_view_plane, selected_uid)
@@ -750,8 +949,6 @@ class PrecomputedFeatPairDataset(Dataset):
                 f"{feats1.shape[1]} v.s. {feats2.shape[1]}."
             )
 
-        slice_spacing_mm = _slice_spacing_from_metadata(metadata1)
-        
         if self.use_packed:
             seq_len = num_slices
             indices = np.arange(num_slices)
@@ -761,9 +958,10 @@ class PrecomputedFeatPairDataset(Dataset):
             feats1, seq_len, indices = self._subsample_or_pad_slices(feats1, indices)
             feats2, _, _ = self._subsample_or_pad_slices(feats2, indices)
         
-        # Physical positions for sinusoidal PE
+        # Relative depth in [0, 1] for sinusoidal PE
         physical_positions = self._compute_physical_positions(
-            indices, num_slices, slice_spacing_mm, 
+            indices,
+            num_slices,
             num_slices if self.use_packed else self.num_target_slices,
         )
         
@@ -781,7 +979,11 @@ class PrecomputedFeatPairDataset(Dataset):
             "orig_embed_dim1": torch.as_tensor(orig_embed_dim1, dtype=torch.long),
             "orig_embed_dim2": torch.as_tensor(orig_embed_dim2, dtype=torch.long),
             "seq_len": torch.as_tensor(seq_len, dtype=torch.long),
-            "physical_positions": physical_positions,  # [num_target_slices] in mm
+            "physical_positions": physical_positions,  # [num_target_slices] in [0, 1]
+            "study_id": study_id,
+            "dataset_name": study_id.split("_", 1)[0],
+            "plane": selected_view_plane,
+            "uid": selected_uid,
         }
         
         # Add labels for semi-supervised contrastive learning
@@ -955,9 +1157,8 @@ class FeatClassificationDataset(Dataset):
                     f"{dict(zip(self.slice_encoder_models, region_counts))}."
                 )
         
-        slice_spacing_mm = _slice_spacing_from_metadata(metadata)
         physical_positions = PrecomputedFeatPairDataset._compute_physical_positions(
-            np.arange(seq_lengths[0]), seq_lengths[0], slice_spacing_mm, seq_lengths[0]
+            np.arange(seq_lengths[0]), seq_lengths[0], seq_lengths[0]
         )
 
         return {
@@ -1041,9 +1242,8 @@ class UnlabeledFeatDataset(Dataset):
                 f"{dict(zip(self.slice_encoder_models, seq_lengths))}"
             )
 
-        slice_spacing_mm = _slice_spacing_from_metadata(metadata)
         physical_positions = PrecomputedFeatPairDataset._compute_physical_positions(
-            np.arange(seq_lengths[0]), seq_lengths[0], slice_spacing_mm, seq_lengths[0]
+            np.arange(seq_lengths[0]), seq_lengths[0], seq_lengths[0]
         )
 
         return {
@@ -1210,9 +1410,8 @@ class MultiViewFeatClassificationDataset(Dataset):
             
             features_by_view[view_plane] = feat_embeds
             seq_lengths_by_view[view_plane] = seq_lengths[0]
-            slice_spacing_mm = _slice_spacing_from_metadata(metadata)
             physical_positions_by_view[view_plane] = PrecomputedFeatPairDataset._compute_physical_positions(
-                np.arange(seq_lengths[0]), seq_lengths[0], slice_spacing_mm, seq_lengths[0]
+                np.arange(seq_lengths[0]), seq_lengths[0], seq_lengths[0]
             )
         
         return {

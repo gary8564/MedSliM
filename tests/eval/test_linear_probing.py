@@ -11,6 +11,7 @@ from med_slim.eval.linear_classifier import (
     _compute_loss,
     _compute_metrics,
 )
+from med_slim.eval.load_cobra import resolve_eval_fm_ids
 from med_slim.utils.metrics.linear import get_loss_criterion
 
 
@@ -23,10 +24,12 @@ class DummyCobra(nn.Module):
         self.weight = nn.Parameter(torch.ones(1))
         self.output_dim = output_dim
         self.last_physical_positions = None
+        self.last_fm_ids = None
         self.calls = []
 
-    def forward(self, features, seq_lengths=None, physical_positions=None, **_):
+    def forward(self, features, seq_lengths=None, physical_positions=None, fm_ids=None, **_):
         self.last_physical_positions = physical_positions
+        self.last_fm_ids = fm_ids
         self.calls.append(physical_positions)
         batch_size = features[0].shape[0]
         return torch.zeros(batch_size, self.output_dim, device=features[0].device)
@@ -65,6 +68,26 @@ def test_single_view_classifier_passes_physical_positions():
     assert torch.allclose(cobra.last_physical_positions, physical_positions)
 
 
+def test_single_view_classifier_passes_fm_ids():
+    cobra = DummyCobra(output_dim=64).to(DEVICE)
+    model = SingleViewClassifier(
+        cobra_model=cobra,
+        input_dim=64,
+        num_classes=2,
+        freeze_cobra=True,
+        fm_ids=[2, 0],
+    ).to(DEVICE)
+    features = [
+        torch.randn(3, 5, 16, device=DEVICE),
+        torch.randn(3, 5, 16, device=DEVICE),
+    ]
+    seq_lengths = torch.tensor([5, 4, 3], device=DEVICE)
+
+    model(features, seq_lengths)
+
+    assert torch.equal(cobra.last_fm_ids, torch.tensor([2, 0], device=DEVICE))
+
+
 def test_multi_view_classifier_passes_physical_positions():
     cobra = DummyCobra(output_dim=64).to(DEVICE)
     view_planes = ["sagittal", "coronal"]
@@ -94,6 +117,27 @@ def test_multi_view_classifier_passes_physical_positions():
     assert len(cobra.calls) == len(view_planes)
     for plane, call in zip(view_planes, cobra.calls):
         assert torch.allclose(call, physical_positions[plane])
+
+
+def test_resolve_eval_fm_ids_uses_checkpoint_order():
+    pretrain_state = {"fm_id_order": ["dinov2", "rad-dino", "mri-core"]}
+    fm_ids = resolve_eval_fm_ids(
+        "router",
+        ["mri-core", "dinov2"],
+        pretrain_cfg={},
+        pretrain_state=pretrain_state,
+    )
+    assert fm_ids == [2, 0]
+
+
+def test_resolve_eval_fm_ids_ignores_non_router_pooling():
+    fm_ids = resolve_eval_fm_ids(
+        "avg_pool",
+        ["mri-core"],
+        pretrain_cfg={},
+        pretrain_state=None,
+    )
+    assert fm_ids is None
 
 
 def test_compute_loss_binary():

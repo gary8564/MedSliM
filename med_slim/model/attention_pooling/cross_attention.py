@@ -1,4 +1,7 @@
-"""Cross-attention pooling module used by the Curia classifier."""
+"""
+Cross-attention pooling modules for inter-slice aggregation which aggregates a sequence of slice embeddings
+[B, num_slices, embed_dim] into a volume embedding [B, embed_dim] using learnable query tokens.
+"""
 
 import torch
 import torch.nn as nn

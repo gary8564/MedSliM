@@ -2,24 +2,16 @@
 #
 # Patch slice_spacing_mm metadata into all precomputed feature caches.
 # CPU-only, no GPU needed. Runs in ~5-15 min depending on I/O.
-#
-# Usage:  bash scripts/preprocess_dataset/patch_all_spacing.sh
-# Or via SLURM (for filesystem bandwidth):
-#   sbatch --account=rwth1833 --partition=c23g --cpus-per-task=16 \
-#          --mem-per-cpu=4G --time=00:30:00 \
-#          scripts/preprocess_dataset/patch_all_spacing.sh
 
 ### SLURM defaults (ignored if run interactively)
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --partition=c23g
+#SBATCH --partition=c23mm
 #SBATCH --cpus-per-task=16
 #SBATCH --mem-per-cpu=4G
-#SBATCH --time=00:30:00
+#SBATCH --time=01:30:00
 #SBATCH --job-name=patch_spacing
 #SBATCH --output=logs/patch_spacing_%j.txt
-#SBATCH --account=rwth1833
 
 source .venv/bin/activate
 

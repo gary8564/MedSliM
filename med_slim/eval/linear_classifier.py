@@ -44,7 +44,7 @@ from med_slim.data.feat_dataset import (
     linear_classifier_collate_fn,
     multiview_classifier_collate_fn,
 )
-from med_slim.eval.load_cobra import _build_cobra, load_pretrained_cobra
+from med_slim.eval.load_cobra import load_pretrained_cobra, resolve_eval_fm_ids
 from med_slim.utils.callbacks.early_stopping import EarlyStopping
 from med_slim.utils.metrics.linear import get_loss_criterion, get_eval_metrics, get_num_classes, compute_class_weights_for_weighted_loss
 from med_slim.utils.viz.linear import compute_and_visualize_metrics, compute_youden_thresholds
@@ -297,10 +297,13 @@ class SingleViewClassifier(nn.Module):
         classifier_hidden_dim: int = 512,
         classifier_dropout: float = 0.5,
         freeze_cobra: bool = True,
+        fm_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.freeze_cobra = freeze_cobra
+        fm_id_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long)
+        self.register_buffer("fm_ids", fm_id_tensor, persistent=False)
         
         # COBRA encoder
         self.cobra = cobra_model
@@ -345,6 +348,7 @@ class SingleViewClassifier(nn.Module):
             features,
             seq_lengths=seq_lengths,
             physical_positions=physical_positions,
+            fm_ids=self.fm_ids,
         )  # [B, embed_dim]
         
         # Cast embedding back to float32 for classifier
@@ -378,12 +382,15 @@ class MultiViewClassifier(nn.Module):
         attention_hidden_dim: int = 128,
         attention_dropout: float = 0.1,
         freeze_cobra: bool = True,
+        fm_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.view_planes = view_planes
         self.num_views = len(view_planes)
         self.num_classes = num_classes
         self.freeze_cobra = freeze_cobra
+        fm_id_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long)
+        self.register_buffer("fm_ids", fm_id_tensor, persistent=False)
         
         # COBRA encoder (shared across views, typically frozen)
         self.cobra = cobra_model
@@ -441,6 +448,7 @@ class MultiViewClassifier(nn.Module):
                 feats,
                 seq_lengths=seq_length,
                 physical_positions=phys_pos,
+                fm_ids=self.fm_ids,
             )  # [B, embed_dim]
             
             # Cast embedding back to float32 for downstream classifier
@@ -487,10 +495,8 @@ def _build_optimizer(
 
     When COBRA is unfrozen (fine-tuning):
         - base_lr for new / randomly-initialised modules:
-            classifier head, fm_attn (FM-attention ABMIL),
-            attention_aggregator (multi-view only).
-        - base_lr * backbone_lr_scale for the pretrained COBRA backbone
-            (embed layers, sequence encoder, ABMIL pooling, norms, cls_token).
+            classifier head, attention_aggregator (multi-view only).
+        - base_lr * backbone_lr_scale for the pretrained COBRA backbone.
 
     Args:
         model: SingleViewClassifier or MultiViewClassifier
@@ -512,19 +518,16 @@ def _build_optimizer(
     backbone_lr_scale = float(hyperparams.get("backbone_lr_scale", 0.1))
     backbone_lr = base_lr * backbone_lr_scale
 
-    # Pretrained COBRA backbone params: base_lr * backbone_lr_scale
+    # Pretrained COBRA params: base_lr * backbone_lr_scale. 
     pretrained_param_ids = set()
     pretrained_params = []
     for name, param in model.cobra.named_parameters():
         if not param.requires_grad:
             continue
-        # fm_attn is randomly initialised → full LR (handled below)
-        if "fm_attn" in name:
-            continue
         pretrained_params.append(param)
         pretrained_param_ids.add(id(param))
 
-    # Everything else: base_lr (classifier head, fm_attn, attention_aggregator for multi-view)
+    # Everything else: base_lr (classifier head, attention_aggregator for multi-view)
     new_params = [
         p for p in model.parameters()
         if p.requires_grad and id(p) not in pretrained_param_ids
@@ -1079,6 +1082,7 @@ def run_single_view_evaluation(
         classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
         classifier_dropout=linear_hyperparams.get("dropout", 0.5),
         freeze_cobra=freeze_cobra,
+        fm_ids=cfg.get("eval_fm_ids"),
     )
     
     if accelerator.is_main_process:
@@ -1267,6 +1271,7 @@ def run_single_view_kfold_evaluation(
             classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
             classifier_dropout=linear_hyperparams.get("dropout", 0.5),
             freeze_cobra=freeze_cobra,
+            fm_ids=cfg.get("eval_fm_ids"),
         )
         if fold_idx == 0:
             _log_trainable_params(model, accelerator)
@@ -1457,6 +1462,7 @@ def collect_predictions_per_view_classifier(
         classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
         classifier_dropout=linear_hyperparams.get("dropout", 0.5),
         freeze_cobra=freeze_cobra,
+        fm_ids=cfg.get("eval_fm_ids"),
     )
     _log_trainable_params(model, accelerator)
     
@@ -2585,6 +2591,7 @@ def run_multiview_evaluation(
         attention_hidden_dim=attention_hyperparams.get("hidden_dim", 128),
         attention_dropout=attention_hyperparams.get("dropout", 0.1),
         freeze_cobra=freeze_cobra,
+        fm_ids=cfg.get("eval_fm_ids"),
     )
     
     if accelerator.is_main_process:
@@ -2753,13 +2760,6 @@ def main(args):
     
     logger.info(f"FM choices: {model_names}")
 
-    if args.fm_pooling == "attention" and len(model_names) == 1:
-        raise ValueError(
-            f"fm_pooling='attention' requires multiple foundation models, but only "
-            f"'{model_names[0]}' was specified. Use fm_pooling='avg_pool' for single-FM "
-            f"inference, or provide multiple models via --fm-model-names."
-        )
-
     # Build the channel map: list of (channel_name, feat_dir, plane).
     # Each channel becomes an independent entry in the logistic ensemble.
     #   - Single-sequence: channels = planes  (e.g. ["sagittal", "coronal"])
@@ -2809,6 +2809,7 @@ def main(args):
         pretrain_cfg = yaml.safe_load(f)
     cobra_cfg = pretrain_cfg["model"]["cobra"]
     checkpoint_slice_pooling = None
+    pretrain_state = None
     if checkpoint_path and os.path.exists(checkpoint_path):
         pretrain_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         checkpoint_slice_pooling = pretrain_state.get("pooling")
@@ -2818,24 +2819,56 @@ def main(args):
         cobra_cfg["regional_tokens"] = int(
             pretrain_state.get("regional_tokens", cobra_cfg.get("regional_tokens", 0))
         )
-        cobra_cfg["region_embedding"] = bool(
-            pretrain_state.get("region_embedding", cobra_cfg.get("region_embedding", False))
+    fm_pooling = (
+        args.fm_pooling
+        or (pretrain_state.get("fm_pooling") if pretrain_state is not None else None)
+        or cobra_cfg.get("fm_pooling", "avg_pool")
+    )
+    if fm_pooling not in ("avg_pool", "router"):
+        raise ValueError(
+            f"Invalid fm_pooling '{fm_pooling}'. Must be 'avg_pool' or 'router'."
         )
+    fm_id_order = (
+        pretrain_state.get("fm_id_order") if pretrain_state is not None else None
+    ) or pretrain_cfg.get("feat_dataset", {}).get("model_name")
+    eval_fm_ids = resolve_eval_fm_ids(
+        fm_pooling, model_names, pretrain_cfg, pretrain_state
+    )
     cfg["cobra_config"] = cobra_cfg
     cfg["physical_pe"] = cobra_cfg.get("physical_pe", False)
     cfg["regional_tokens"] = cobra_cfg.get("regional_tokens", 0)
-    cfg["region_embedding"] = cobra_cfg.get("region_embedding", False)
+    cfg["fm_id_order"] = fm_id_order
+    cfg["eval_fm_ids"] = eval_fm_ids
+    if pretrain_state is not None:
+        cfg["num_fms"] = pretrain_state.get("num_fms")
+        cfg["router_mode"] = pretrain_state.get("router_mode", cobra_cfg.get("router_mode", "soft"))
+        cfg["router_top_k"] = pretrain_state.get("router_top_k", cobra_cfg.get("router_top_k"))
+        cfg["router_temperature"] = pretrain_state.get("router_temperature", cobra_cfg.get("router_temperature", 1.0))
+        cfg["router_learnable_temperature"] = pretrain_state.get(
+            "router_learnable_temperature",
+            cobra_cfg.get("router_learnable_temperature", False),
+        )
+    if accelerator.is_main_process and eval_fm_ids is not None:
+        logger.info(f"Router eval FM IDs for {model_names}: {eval_fm_ids}")
     resolved_pooling_target = _resolve_pooling_target(
         mode="inference",
         pooling_target=args.pooling_target,
         regional_tokens=cobra_cfg.get("regional_tokens", 0),
         slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
     )
-    cfg["fm_pooling"] = args.fm_pooling
+    if fm_pooling == "router" and resolved_pooling_target == "raw":
+        raise ValueError(
+            f"pooling_target='raw' bypasses FM fusion and is not valid with fm_pooling='{fm_pooling}'. "
+            "Use pooling_target='post_embed' or 'post_encoder'."
+        )
+    cfg["fm_pooling"] = fm_pooling
     cfg["pooling_target"] = resolved_pooling_target
-    cfg["sequence_encoder"] = args.sequence_encoder
-    cfg["slice_pooling"] = args.slice_pooling
-    cfg["no_pretrained_cobra"] = args.no_pretrained_cobra
+    cfg["sequence_encoder"] = (
+        args.sequence_encoder
+        or (pretrain_state.get("sequence_encoder") if pretrain_state is not None else None)
+        or "mamba2"
+    )
+    cfg["slice_pooling"] = args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil")
 
     # Determine raw FM output dimension for 'raw' pooling target.
     # Tiled caches are [B, num_slices, num_tiled_regions, input_embed_dim], so
@@ -2860,47 +2893,25 @@ def main(args):
             config=cfg,
             dir=output_dir,
         )
-    
-    if args.no_pretrained_cobra:
-        if cfg.get("freeze_cobra", True):
-            raise ValueError(
-                "--no-pretrained-cobra builds randomly initialized aggregation modules. "
-                "Use --fine-tune (or freeze_cobra: false) so they can train."
-            )
-        sequence_encoder = args.sequence_encoder or "mamba2"
-        slice_pooling = args.slice_pooling or "abmil"
-        if accelerator.is_main_process:
-            logger.info(
-                "Building randomly initialized COBRA: "
-                f"sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}"
-            )
-        cobra_model = _build_cobra(
-            model_config=cobra_cfg,
-            sequence_encoder=sequence_encoder,
-            slice_pooling=slice_pooling,
-            fm_pooling=args.fm_pooling,
-            pooling_target=resolved_pooling_target,
-            raw_output_dim=raw_output_dim,
+    if checkpoint_path is None:
+        raise ValueError(
+            "checkpoint_path is required for downstream SSL evaluation. "
+            "Set it in linear_classifier.yml or pass --checkpoint-path."
         )
-    else:
-        if checkpoint_path is None:
-            raise ValueError(
-                "checkpoint_path is required unless --no-pretrained-cobra is set."
-            )
-        if accelerator.is_main_process:
-            logger.info("Loading pretrained COBRA model...")
-            logger.info(f"Checkpoint path: {checkpoint_path}")
-        cobra_model = load_pretrained_cobra(
-            checkpoint_path=checkpoint_path,
-            accelerator=accelerator,
-            model_config=cobra_cfg,
-            encoder_type=cfg["encoder_type"],
-            fm_pooling=args.fm_pooling,
-            sequence_encoder=args.sequence_encoder,  
-            slice_pooling=args.slice_pooling,
-            pooling_target=resolved_pooling_target,
-            raw_output_dim=raw_output_dim,
-        )
+    if accelerator.is_main_process:
+        logger.info("Loading pretrained COBRA model...")
+        logger.info(f"Checkpoint path: {checkpoint_path}")
+    cobra_model = load_pretrained_cobra(
+        checkpoint_path=checkpoint_path,
+        accelerator=accelerator,
+        model_config=cobra_cfg,
+        encoder_type=cfg["encoder_type"],
+        fm_pooling=fm_pooling,
+        sequence_encoder=args.sequence_encoder,
+        slice_pooling=args.slice_pooling,
+        pooling_target=resolved_pooling_target,
+        raw_output_dim=raw_output_dim,
+    )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
 
@@ -3144,15 +3155,9 @@ if __name__ == "__main__":
         "--pretrain-config-path",
         type=str,
         default=None,
-        help="Path to the MedSliM pretraining config. Required when using "
-             "--no-pretrained-cobra without a checkpoint_path."
-    )
-    parser.add_argument(
-        "--no-pretrained-cobra",
-        action="store_true",
-        help="Build COBRA/aggregation modules from random initialization instead "
-             "of loading a contrastively pretrained checkpoint. Use with "
-             "--fine-tune so the aggregation modules are trainable."
+        help=(
+            "Path to the MedSliM pretraining config. If specified, overrides the config file."
+        )
     )
     parser.add_argument(
         "--feat-dir",
@@ -3185,11 +3190,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fm-pooling",
         type=str,
-        choices=["avg_pool", "attention"],
-        default="avg_pool",
-        help="Foundation model pooling method: 'avg_pool' (average pooling) or 'attention' (learned FM weighting, requires fine-tuning)."
-        # NOTE: 'attention' pooling is not supported for linear probing since fm_attn weights 
-        # are randomly initialized and frozen. Use 'attention' only when fine-tuning COBRA.
+        choices=["avg_pool", "router"],
+        default=None,
+        help=(
+            "Foundation model pooling method: 'avg_pool' or 'router'. "
+            "If not specified, uses the checkpoint's saved fm_pooling when available; "
+            "router requires matching pretrained weights for SSL evaluation."
+        ),
     )
     parser.add_argument(
         "--slice-pooling",

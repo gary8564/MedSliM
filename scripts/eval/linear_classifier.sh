@@ -54,6 +54,14 @@ if [[ -n "${SLICE_POOLING}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --slice-pooling ${SLICE_POOLING}"
 fi
 
+if [[ -n "${FM_POOLING}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --fm-pooling ${FM_POOLING}"
+fi
+
+if [[ -n "${SEQUENCE_ENCODER}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --sequence-encoder ${SEQUENCE_ENCODER}"
+fi
+
 if [[ -n "${POOLING_TARGET}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --pooling-target ${POOLING_TARGET}"
 fi
@@ -66,8 +74,6 @@ python ./med_slim/eval/linear_classifier.py \
   --feat-dir "${FEAT_DIR}" \
   --fm-model-names "${FM_MODEL_NAMES}" \
   --weighted-loss \
-  --fm-pooling "${FM_POOLING}" \
-  --sequence-encoder "${SEQUENCE_ENCODER}" \
   --n-folds ${N_FOLDS} \
   --train-fraction "${TRAIN_FRACTION}" \
   --num-repeats "${NUM_REPEATS}" \

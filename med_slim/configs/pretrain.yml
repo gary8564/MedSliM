@@ -10,14 +10,14 @@ feat_dataset:
       # annotations_path: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/train.csv"
       # target_columns: ["abnormal", "acl", "meniscus"]
     # Unlabeled (pure InfoNCE)
-    # - name: fastMRI
-    #   feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adaptive"
-    # - name: kmar-50k
-    #   feat_dir: "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive"
-  model_name: 
+    - name: fastMRI
+      feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adaptive"
+    - name: kmar-50k
+      feat_dir: "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive"
+  model_name:
     - "dinov2"
-    - "rad-dino"
     - "dinov3"
+    - "rad-dino"
     - "medsiglip"
     - "biomedclip"
     - "ark"
@@ -101,21 +101,48 @@ model:
     transformer_norm_first: true  # Pre-LN transformer
     # Pooling-specific (ABMIL)
     attn_dim: 256
-    # Physical positional encoding: sinusoidal encoding keyed on slice
-    # positions in mm. Essential for cross-domain pretraining where
-    # slice spacings vary across anatomies and protocols.
+    # Physical positional encoding: sinusoidal encoding keyed on normalized
+    # relative slice depth in [0, 1] (fraction through the volume).
+    # Spacing-independent and portable across mixed cohorts/protocols.
     physical_pe: false
-    # Tiled multi-crop CLS (within-slice region aggregation). 
-    # 0 = original global-only CLS pathway.
-    # A positive perfect square (e.g. 4 for a 2x2 grid) collapses [B, D, 1+regional_tokens, E] region tokens to [B, D, E] before the
-    # sequence encoder. Requires tiled feature caches precomputed with the matching `--regional-tokens` flag.
-    regional_tokens: 4 # 0 = original global-only CLS pathway.
-    region_embedding: true  # learned region (quadrant) identity embedding
+    # Flattened regional-token pretraining.
+    # 0 = global CLS only. A positive perfect square (e.g. 4 for 2x2 tiles)
+    # expects feature caches with 1 global + regional_tokens per-slice CLS tokens
+    # and flattens [B, D, 1+regional_tokens, E] to [B, D*(1+regional_tokens), E].
+    # This does not use MSP or WithinSliceAggregator.
+    regional_tokens: 0
+    # FM fusion: how to combine foundation-model embeddings per slice.
+    fm_pooling: router          # avg_pool | router
+    # Projection-adapter keying for the FM-set paths (subset SSL / FM-set inference).
+    # per_dim: share one Embed MLP across FMs of the same input dim (legacy router/paired/packed SSL default).
+    # per_fm_id: one Embed MLP per FM so each FM is a distinct expert (recommended for router).
+    per_fm_adapter_mode: per_fm_id   # per_dim | per_fm_id
+    router_use_fm_embedding: true
+    router_use_fm_logit_bias: true
+    router_use_fm_logit_scale: false
+    router_mode: soft           # soft | topk
+    router_top_k: null
+    router_temperature: 0.7      # softmax temperature (lower = sharper routing)
+    router_learnable_temperature: false  # keep false to avoid unchecked logit-scale drift
+
+# FM subset SSL: positive-pair construction across foundation models.
+ssl:
+  fm_mode: subset                 # pair | subset
+  fm_subset_size: 4
+  fm_subset_min_overlap: 0       # disjoint FM subsets for stronger cross-FM augmentation
+  fm_subset_max_overlap: 0
+
+# Router auxiliary losses (only active when model.cobra.fm_pooling == router).
+router:
+  load_balance_weight: 0.001 
+  z_loss_weight: 0.0
+  confidence_weight: 0.0
+  log_per_fm_usage: true
 
 train:
   momentum: 0.99
   temperature: 0.2
-  batch_size: 256
+  batch_size: 512 #256
   num_epochs: 2000
   learning_rate: 5e-4 #2e-4 
   warmup_epochs: 50 #100
@@ -123,22 +150,5 @@ train:
   num_workers: 20
   early_stopping: 
     patience: 10
-  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet" #"MRNet-fastMRI-KMAR50K"
-
-# Masked Slice Prediction (MSP): JEPA-style auxiliary objective.
-# Predicts teacher encoder hidden states for contiguously masked slices.
-# Combined with InfoNCE: L = L_InfoNCE + lambda_mask * L_MSP + lambda_ctx * L_ctx
-# Set enabled: false to fall back to pure InfoNCE (default MedSliM behavior).
-msp:
-  enabled: false
-  lambda_mask: 1.0        # Weight for MSP loss on masked positions
-  lambda_ctx: 0.0         # Base weight λ for context loss on visible positions (V-JEPA 2.1); 0 = disabled
-  mask_ratio: [0.3, 0.5]  # [min_ratio, max_ratio] for contiguous masking
-  predictor_depth: 2      # Number of residual MLP blocks in the MSP predictor
-  predictor_dim: null      # Hidden dim of predictor (null = embed_dim // 4)
-  max_seq_len: 512        # Max sequence length for positional embeddings
-  ctx_distance_weighted: true  # Per-token weight λ_i = λ / sqrt(d_min); false = uniform weight
-  ctx_warmup_epochs: null      # [start, end] epoch range for linear warmup of lambda_ctx; 
-                               # null = no warmup
-                               # Example: ctx_warmup_epochs: [50, 150] linearly ramps lambda_ctx from 0 to lambda_ctx over epochs 50–150
+  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K" #"MRNet"
 

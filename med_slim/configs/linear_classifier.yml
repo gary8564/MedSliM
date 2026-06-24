@@ -22,14 +22,14 @@ freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning 
 # Feature cache directory structure:
 #   {feat_dir}/{model_name}/{split}/{plane}/*.safetensors
 # 
-# Example for single-sequence dataset (e.g. MRNet and kneeMRI):
+# Example for single-sequence (e.g. MRNet or kneeMRI):
 #   feat_dataset:
 #     dataset_name: "MRNet"
 #     feat_dir: "/path/to/feat_caches/MRNet/slices_raw/crop"
 #     plane: ["sagittal", "coronal", "axial"]   # multi-view channels
 #     model_name: ["mri-core"]
 #
-# Example for multi-sequence dataset (e.g. SKM-TEA):
+# Example for multi-sequence ensembling (e.g. SKM-TEA with DESS_E1 and DESS_E2):
 #   feat_dataset:
 #     dataset_name: "SKM-TEA"
 #     sequences: # map each MRI sequence to its own feat_dir
@@ -76,7 +76,7 @@ output_dir: "/hpcwork/qj474765/experiments/MedSliM-linear-probing"
 # Note: For fine-tuning, use lower learning rate and enable early stopping
 hyperparams:
   batch_size: 8
-  base_lr: 1e-5 # Base learning rate for linear heads (and optionally for fm_attn)
+  base_lr: 1e-5 # Base learning rate for linear heads
   backbone_lr_scale: 0.1 # COBRA backbone learning rate = base_lr * backbone_lr_scale when fine-tuning COBRA
   weight_decay: 0.1 #0.01  # L2 regularization to prevent overfitting
   warmup_ratio: 0.1  
