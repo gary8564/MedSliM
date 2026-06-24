@@ -17,3 +17,4 @@ scripts/preprocess_dataset/patch_all_spacing.sh
 figures
 *.log
 plans
+reports
