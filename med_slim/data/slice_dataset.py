@@ -263,10 +263,10 @@ class SliceDataset(data.Dataset):
     def __getitem__(self, index):
         sample_id = self.sample_ids[index]
         uid = str(sample_id)
-        img = tio.ScalarImage(self.get_nifti_path(uid))
-        if self.transform is not None:
-            img = self.transform(img)
-        return {'uid': uid, "orientation": self.plane, 'source': img}
+        nifti_path = self.get_nifti_path(uid)
+        img = tio.ScalarImage(nifti_path)
+        source = self.transform(img) if self.transform is not None else img
+        return {'uid': uid, "orientation": self.plane, 'source': source}
 
 
 class TiledSliceDataset(SliceDataset):

@@ -12,32 +12,28 @@ from typing import Tuple, Union, List, Optional, Sequence, Callable
 from torchio.transforms.transform import TypeMaskingMethod 
 from torchio import Subject, Image
 
+from med_slim.utils.preprocessing.slice_axis_resolver import resolve_slice_axis
+
 TypeRangeFloat = Tuple[float, float]  # type: ignore
 TypeTripletInt = Union[int, Tuple[int, int, int], Sequence[int]]  # type: ignore
 
-PLANE_TO_AXIS = {"axial": 2, "sagittal": 0, "coronal": 1}
+def _get_affine(subject: tio.Subject) -> np.ndarray:
+    affine = np.asarray(next(iter(subject.get_images_dict().values())).affine, dtype=float)
+    if affine.shape != (4, 4) or not np.isfinite(affine[:3, :3]).all():
+        return np.eye(4)
+    return affine
 
 
 def _slice_axis_from_subject(subject: tio.Subject, plane: str) -> int:
     """
-    Return the through-plane (slice) axis for RAS+ oriented images.
-
-    
-    - Axial scans: slice axis = 2 (I-S direction)
-    - Sagittal scans: slice axis = 0 (R-L direction)  
-    - Coronal scans: slice axis = 1 (A-P direction)
+    Return the through-plane axis for a canonicalized subject.
     """
-    candidate = PLANE_TO_AXIS[plane]
-    shape = np.array(subject.spatial_shape)
-    spacing = np.array(subject.spacing)
-    other = [i for i in range(3) if i != candidate]
-
-    if shape[candidate] < min(shape[a] for a in other):
-        return candidate
-    if spacing[candidate] > max(spacing[a] for a in other):
-        return candidate
-
-    return 2
+    return resolve_slice_axis(
+        np.asarray(subject.spatial_shape, dtype=float),
+        np.asarray(subject.spacing, dtype=float),
+        plane,
+        affine=_get_affine(subject),
+    )
 
 
 def _permute_slice_to_last(subject: tio.Subject, slice_axis: int) -> tio.Subject:
