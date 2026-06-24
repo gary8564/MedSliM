@@ -16,13 +16,18 @@ import yaml
 import logging
 import numpy as np
 import pandas as pd
+import torch
 from pathlib import Path
 from typing import Any, Dict, Optional
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 
 from med_slim.data.feat_dataset import FeatClassificationDataset, linear_classifier_collate_fn
-from med_slim.eval.load_cobra import load_pretrained_cobra, load_cobra_from_experiment
+from med_slim.eval.load_cobra import (
+    load_pretrained_cobra,
+    load_cobra_from_experiment,
+    resolve_eval_fm_ids,
+)
 from med_slim.eval.extract_feats import get_volume_attention, get_volume_attention_per_head
 from med_slim.utils.viz.attention import plot_attention_profile, plot_per_head_attention_profile, compute_attention_metrics
 from med_slim.utils.label_metadata import get_dataset_metadata, get_annotation_paths_by_split, format_display_name, build_multiclass_label_names
@@ -143,7 +148,7 @@ def main():
                         help="Classification task type to override the one specified in `eval_datasets.yaml`")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-samples", type=int, default=None, help="Max samples to visualize (None = all)")
-    parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "attention"])
+    parser.add_argument("--fm-pooling", type=str, default=None, choices=["avg_pool", "router"])
     parser.add_argument("--sequence-encoder", type=str, default=None, choices=["mamba2", "transformer"])
     parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cross_attention", "cls"])
     parser.add_argument("--per-head", action="store_true",
@@ -178,6 +183,23 @@ def main():
         model_names = args.fm_model_names.split() if args.fm_model_names else feat_cfg.get("model_name", ["dinov2"])
         if isinstance(model_names, str):
             model_names = [model_names]
+        fm_pooling = exp_cfg.get("fm_pooling", getattr(cobra_model, "fm_pooling", "avg_pool"))
+        if args.fm_model_names:
+            eval_fm_ids = resolve_eval_fm_ids(
+                fm_pooling,
+                model_names,
+                {"feat_dataset": {"model_name": exp_cfg.get("fm_id_order")}},
+                None,
+            )
+        else:
+            eval_fm_ids = exp_cfg.get("eval_fm_ids")
+            if eval_fm_ids is None:
+                eval_fm_ids = resolve_eval_fm_ids(
+                    fm_pooling,
+                    model_names,
+                    {"feat_dataset": {"model_name": exp_cfg.get("fm_id_order")}},
+                    None,
+                )
         dataset_name = args.dataset_name or feat_cfg.get("dataset_name")
         if args.output_dir:
             output_dir = args.output_dir
@@ -223,18 +245,28 @@ def main():
         # Load COBRA from pretrained checkpoint
         pretrain_config_path = Path(args.checkpoint_path).parent / "config.yaml"
         cobra_cfg = {}
+        pretrain_cfg = {}
         if pretrain_config_path.exists():
             with open(pretrain_config_path) as f:
                 pretrain_cfg = yaml.safe_load(f)
             cobra_cfg = pretrain_cfg.get("model", {}).get("cobra", {})
+        pretrain_state = torch.load(args.checkpoint_path, map_location="cpu", weights_only=False)
+        fm_pooling = (
+            args.fm_pooling
+            or pretrain_state.get("fm_pooling")
+            or cobra_cfg.get("fm_pooling", "avg_pool")
+        )
+        eval_fm_ids = resolve_eval_fm_ids(
+            fm_pooling, model_names, pretrain_cfg, pretrain_state
+        )
 
         cobra_model = load_pretrained_cobra(
             checkpoint_path=args.checkpoint_path,
             accelerator=accelerator,
             model_config=cobra_cfg,
             encoder_type="momentum",
-            fm_pooling=args.fm_pooling or "avg_pool",
-            sequence_encoder=args.sequence_encoder or "mamba2",
+            fm_pooling=fm_pooling,
+            sequence_encoder=args.sequence_encoder,
             slice_pooling=args.slice_pooling,
         )
         cobra_model = cobra_model.to(accelerator.device)
@@ -303,7 +335,7 @@ def main():
 
     # Extract attention weights
     attention_weights, labels, sample_ids, seq_lengths = get_volume_attention(
-        cobra_model, dataloader, accelerator, max_samples=args.num_samples
+        cobra_model, dataloader, accelerator, max_samples=args.num_samples, fm_ids=eval_fm_ids
     )
 
     # Extract per-head attention
@@ -311,7 +343,7 @@ def main():
     effective_slice_pooling = slice_pooling
     if args.per_head and effective_slice_pooling == "abmil":
         per_head_data = get_volume_attention_per_head(
-            cobra_model, dataloader, accelerator, max_samples=args.num_samples
+            cobra_model, dataloader, accelerator, max_samples=args.num_samples, fm_ids=eval_fm_ids
         )
 
     if not accelerator.is_main_process:

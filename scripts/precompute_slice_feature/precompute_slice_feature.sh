@@ -10,7 +10,7 @@
 #SBATCH --time=3:00:00                 
 #SBATCH --job-name=precompute_slice_feature_%j
 #SBATCH --output=stdout_precompute_slice_feature_%j.txt    
-#SBATCH --account=rwth1833
+#SBATCH --account=p0021834
 
 
 ### Setup
@@ -19,23 +19,23 @@ source .venv/bin/activate
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
-DATA_DIR="/hpcwork/rwth1833/datasets/preprocessed/fastMRI" #"/hpcwork/rwth1833/datasets/preprocessed/MRNet"
-SAVE_DIR="/hpcwork/rwth1833/feat_caches/fastMRI" #"/hpcwork/rwth1833/feat_caches/MRNet"
-PLANE="axial"
-USE_RAW_SLICE_RESOLUTION=false  
-MODEL_NAME="medsiglip" # "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "ark", "mri-core"
-SPLIT="train"
+DATA_DIR="/hpcwork/rwth1833/datasets/preprocessed/kneeMRI" #"/hpcwork/rwth1833/datasets/preprocessed/MRNet"
+SAVE_DIR="/hpcwork/rwth1833/feat_caches/kneeMRI" #"/hpcwork/rwth1833/feat_caches/MRNet"
+PLANE="sagittal"
+USE_RAW_SLICE_RESOLUTION=true  
+MODEL_NAME="curia" # "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "ark", "mri-core", "medimageinsight", "curia"
+SPLIT="test"
 # Local checkpoints for models that require them
 declare -A CHECKPOINTS=(
   ["ark"]="/hpcwork/rwth1833/models/Ark6_swinLarge768_ep50.pth.tar"
   ["mri-core"]="/hpcwork/rwth1833/models/mri_foundation.pth"
 )
 # Preprocessing modes: "resize", "resample", "crop", or "adaptive"
-SPATIAL_MODE="adaptive"
+SPATIAL_MODE="crop"
 # Tiled multi-crop CLS. 
 # e.g., 0 = original global CLS; 4 = global + 2 x 2 regional crops.
 REGIONAL_TOKENS=0
-MRI_SEQUENCES="all"  # for fastMRI; use "none" when datasets do not contain multi-sequence
+MRI_SEQUENCES="none"  # for fastMRI; use "none" when datasets do not contain multi-sequence
 EXTRA_ARGS="--amp bf16"
 
 # Conditionally extend extra args

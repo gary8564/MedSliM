@@ -11,7 +11,7 @@
 # ------------------------------------------------------------------------------
 # Path to pretrained MedSliM checkpoint
 checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet/2026-05-26-17:29/medslim-epoch3000.pth.tar"
-# Optional when running --no-pretrained-cobra; otherwise inferred from checkpoint_path parent.
+# Optional; otherwise inferred as config.yaml next to checkpoint_path.
 # pretrain_config_path: "/path/to/pretrain/config.yaml"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
@@ -22,14 +22,14 @@ freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning 
 # Feature cache directory structure:
 #   {feat_dir}/{model_name}/{split}/{plane}/*.safetensors
 # 
-# Example for single-sequence dataset (e.g. MRNet and kneeMRI):
+# Example for single-sequence (e.g. MRNet or kneeMRI):
 #   feat_dataset:
 #     dataset_name: "MRNet"
 #     feat_dir: "/path/to/feat_caches/MRNet/slices_raw/crop"
 #     plane: ["sagittal", "coronal", "axial"]   # multi-view channels
 #     model_name: ["mri-core"]
 #
-# Example for multi-sequence dataset (e.g. SKM-TEA):
+# Example for multi-sequence ensembling (e.g. SKM-TEA with DESS_E1 and DESS_E2):
 #   feat_dataset:
 #     dataset_name: "SKM-TEA"
 #     sequences: # map each MRI sequence to its own feat_dir
@@ -39,8 +39,8 @@ freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning 
 #     model_name: ["dinov2"]
 
 feat_dataset:
-  dataset_name: "MRNet"
-  feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+  dataset_name: "kneeMRI"
+  feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
   plane:
     - "sagittal"
     # - "coronal"
@@ -51,7 +51,7 @@ feat_dataset:
   model_name:
     - "mri-core"
 
-annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/MRNet"
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
 
 # ------------------------------------------------------------------------------
 # Output directory configuration
@@ -64,7 +64,7 @@ output_dir: "/hpcwork/qj474765/experiments/MedSliM-linear-probing"
 # Note: For fine-tuning, use lower learning rate and enable early stopping
 hyperparams:
   batch_size: 8
-  base_lr: 1e-5 # Base learning rate for linear heads (and optionally for fm_attn)
+  base_lr: 1e-5 # Base learning rate for linear heads
   backbone_lr_scale: 0.1 # COBRA backbone learning rate = base_lr * backbone_lr_scale when fine-tuning COBRA
   weight_decay: 0.1 #0.01  # L2 regularization to prevent overfitting
   warmup_ratio: 0.1  

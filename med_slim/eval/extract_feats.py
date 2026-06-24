@@ -31,6 +31,7 @@ def get_volume_feats(
     cobra_model: Cobra,
     dataloader: DataLoader,
     accelerator: Accelerator,
+    fm_ids: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List]:
     """
     Extract volume-level embeddings using pretrained COBRA model.
@@ -49,6 +50,7 @@ def get_volume_feats(
     all_volume_feats = []
     all_labels = []
     all_sample_ids = []
+    fm_ids_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long, device=accelerator.device)
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting volume embeddings", disable=not accelerator.is_main_process):
@@ -67,6 +69,7 @@ def get_volume_feats(
                 encoder_feats,
                 seq_lengths=seq_lengths,
                 physical_positions=physical_positions,
+                fm_ids=fm_ids_tensor,
             )
             
             # Cast to float32 for downstream eval 
@@ -85,6 +88,7 @@ def get_patient_feats(
     multiview_dataloader: DataLoader,
     accelerator: Accelerator,
     aggregation: str = "mean",
+    fm_ids: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List]:
     """
     Extract patient-level embeddings by aggregating multiple volumes.
@@ -108,6 +112,7 @@ def get_patient_feats(
     all_patient_feats = []
     all_labels = []
     all_sample_ids = []
+    fm_ids_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long, device=accelerator.device)
     
     with torch.no_grad():
         for batch in tqdm(multiview_dataloader, desc="Extracting patient embeddings", disable=not accelerator.is_main_process):
@@ -132,6 +137,7 @@ def get_patient_feats(
                     encoder_feats,
                     seq_lengths=seq_lengths,
                     physical_positions=physical_positions,
+                    fm_ids=fm_ids_tensor,
                 )
                 view_embeddings.append(view_emb)
             
@@ -159,6 +165,7 @@ def get_volume_attention(
     dataloader: DataLoader,
     accelerator: Accelerator,
     max_samples: Optional[int] = None,
+    fm_ids: Optional[List[int]] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[str], List[int]]:
     """
     Extract slice-level attention weights using pretrained COBRA model.
@@ -182,6 +189,7 @@ def get_volume_attention(
     all_labels = []
     all_sample_ids = []
     all_seq_lengths = []
+    fm_ids_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long, device=accelerator.device)
     
     sample_count = 0
     
@@ -201,6 +209,7 @@ def get_volume_attention(
                 features,
                 seq_lengths=seq_lengths,
                 physical_positions=physical_positions,
+                fm_ids=fm_ids_tensor,
                 get_per_head_attention=True,
             )
             # attention shape: [B, num_heads, max_seq_len]
@@ -228,79 +237,12 @@ def get_volume_attention(
     return all_attention, all_labels, all_sample_ids, all_seq_lengths
 
 
-def get_volume_region_attention(
-    cobra_model: Cobra,
-    dataloader: DataLoader,
-    accelerator: Accelerator,
-    max_samples: Optional[int] = None,
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[str], List[int]]:
-    """
-    Extract within-slice region attention weights from a tiled multi-crop CLS COBRA model.
-
-    For each slice, the global CLS token attends over the regional crop tokens; the
-    resulting distribution shows which quadrant the model focused on per slice. This is
-    complementary to the slice-level attention from ``get_volume_attention`` and should
-    always be interpreted alongside it (a region can dominate a slice the volume ignores).
-
-    Args:
-        cobra_model: Pretrained COBRA model built with regional_tokens > 0.
-        dataloader: DataLoader yielding batches of tiled slice features
-            [B, num_slices, num_tiled_regions, embed_dim].
-        accelerator: HuggingFace Accelerator.
-        max_samples: Maximum number of samples to process (None = all).
-
-    Returns:
-        region_attention: List of arrays [num_slices, num_tiled_regions-1] per sample.
-        labels: List of label arrays per sample.
-        sample_ids: List of sample IDs.
-        seq_lengths: List of sequence lengths.
-    """
-    cobra_model.eval()
-    all_attention = []
-    all_labels = []
-    all_sample_ids = []
-    all_seq_lengths = []
-    sample_count = 0
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Extracting region attention", disable=not accelerator.is_main_process):
-            seq_lengths = batch["seq_lengths"].to(accelerator.device)
-            physical_positions = batch.get("physical_positions")
-            if physical_positions is not None:
-                physical_positions = physical_positions.to(accelerator.device, dtype=torch.float32)
-            features = [f.to(accelerator.device, dtype=next(cobra_model.parameters()).dtype)
-                        for f in batch["features"]]
-
-            region_attn = cobra_model(
-                features,
-                seq_lengths=seq_lengths,
-                physical_positions=physical_positions,
-                get_region_attention=True,
-            )  # [B, num_slices, 1, num_tiled_regions-1]
-            region_attn = region_attn.squeeze(2).cpu().numpy()  # [B, num_slices, num_tiled_regions-1]
-
-            batch_size = region_attn.shape[0]
-            for i in range(batch_size):
-                if max_samples and sample_count >= max_samples:
-                    break
-                seq_len = seq_lengths[i].item()
-                all_attention.append(region_attn[i, :seq_len])  # [seq_len, num_tiled_regions-1]
-                all_labels.append(batch["labels"][i].cpu().numpy())
-                all_sample_ids.append(batch["sample_ids"][i])
-                all_seq_lengths.append(seq_len)
-                sample_count += 1
-
-            if max_samples and sample_count >= max_samples:
-                break
-
-    return all_attention, all_labels, all_sample_ids, all_seq_lengths
-
-
 def get_volume_attention_per_head(
     cobra_model: Cobra,
     dataloader: DataLoader,
     accelerator: Accelerator,
     max_samples: Optional[int] = None,
+    fm_ids: Optional[List[int]] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[str], List[int], int]:
     """
     Extract per-head slice-level attention weights from COBRA ABMIL pooling.
@@ -324,6 +266,7 @@ def get_volume_attention_per_head(
     all_sample_ids = []
     all_seq_lengths = []
     num_heads = 0
+    fm_ids_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long, device=accelerator.device)
 
     sample_count = 0
 
@@ -340,6 +283,7 @@ def get_volume_attention_per_head(
                 features,
                 seq_lengths=seq_lengths,
                 physical_positions=physical_positions,
+                fm_ids=fm_ids_tensor,
                 get_per_head_attention=True,
             )
             # attention shape: [B, num_heads, max_seq_len]

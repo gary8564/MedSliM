@@ -5,14 +5,34 @@ import pickle
 from pathlib import Path
 from functools import partial
 from multiprocessing import Pool
+from typing import Sequence, Union
 
 import numpy as np
 import pandas as pd
 import torchio as tio
 from tqdm import tqdm
 
+from med_slim.utils.preprocessing.slice_axis_resolver import build_slice_last_affine
 
 logger = logging.getLogger(__name__)
+
+
+def _save_slice_last_nifti(
+    volume: np.ndarray,
+    out_path: Union[str, Path],
+    plane: str,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    *,
+    from_d_first: bool = True,
+) -> tio.ScalarImage:
+    img = tio.ScalarImage(
+        tensor=np.asarray(volume, dtype=np.float32)[None],
+        affine=build_slice_last_affine(plane, spacing),
+    )
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return img
 
 
 def setup_logging(verbose: bool) -> None:
@@ -40,19 +60,15 @@ def pickle_to_nifti(task: dict) -> dict | None:
         # Load pickle data
         with open(vol_path, "rb") as f:
             vol_data = pickle.load(f)
-
+            
         # Data shape is (D, H, W), need to convert to (W, H, D) for torchio
         # torchio expects (C, W, H, D) where C is channel
         vol_data = np.swapaxes(vol_data, 0, -1)  # (D, H, W) -> (W, H, D)
 
-        # Create NIfTI image
-        img = tio.ScalarImage(tensor=vol_data[None])  # Add channel dimension
-
-        # Save to output path
         out_dir = save_dir / split / plane
         out_dir.mkdir(parents=True, exist_ok=True)
         out_file = out_dir / f"{uid}.nii.gz"
-        img.save(out_file)
+        img = _save_slice_last_nifti(vol_data, out_file, plane=plane)
 
         result = {
             "ID": uid,
@@ -98,25 +114,29 @@ def main():
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="/hpcwork/rwth1833/datasets/kneeMRI",
+        #default="/hpcwork/rwth1833/datasets/kneeMRI",
+        required=True,
         help="Root folder containing kneeMRI dataset",
     )
     parser.add_argument(
         "--save-dir",
         type=str,
-        default="/home/rwth1833/datasets/preprocessed/kneeMRI",
+        #default="/hpcwork/rwth1833/datasets/preprocessed/kneeMRI",
+        required=True,
         help="Output directory for NIfTI and metadata",
     )
     parser.add_argument(
         "--split",
         type=str,
         default="train",
-        help="Split name used in output folder structure (e.g., train/val/test)",
+        choices=["train", "test"],
+        help="Split name used in output folder structure (e.g., train/test)",
     )
     parser.add_argument(
         "--plane",
         type=str,
         default="sagittal",
+        choices=["sagittal", "coronal", "axial"],
         help="Plane of the MRI scans (sagittal/coronal/axial)",
     )
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers")

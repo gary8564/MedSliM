@@ -29,7 +29,7 @@ from med_slim.data.feat_dataset import (
     FeatClassificationDataset,
     linear_classifier_collate_fn,
 )
-from med_slim.eval.load_cobra import load_pretrained_cobra
+from med_slim.eval.load_cobra import load_pretrained_cobra, resolve_eval_fm_ids
 from med_slim.utils.metrics.linear import get_num_classes
 from med_slim.utils.viz.linear import compute_and_visualize_metrics
 from med_slim.utils.label_metadata import (
@@ -52,6 +52,7 @@ def extract_cobra_features(
     dataloader: DataLoader,
     accelerator: Accelerator,
     normalize: bool = True,
+    fm_ids: Optional[List[int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Extract volume-level embeddings from COBRA and optionally L2-normalize.
@@ -73,6 +74,7 @@ def extract_cobra_features(
     all_sample_ids = []
 
     model_dtype = next(cobra_model.parameters()).dtype
+    fm_ids_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long, device=accelerator.device)
 
     for batch in tqdm(dataloader, desc="Extracting COBRA features",
                       disable=not accelerator.is_main_process):
@@ -86,6 +88,7 @@ def extract_cobra_features(
             features,
             seq_lengths=seq_lengths,
             physical_positions=physical_positions,
+            fm_ids=fm_ids_tensor,
         )  # [B, output_dim]
         embeddings = embeddings.float()
 
@@ -156,6 +159,7 @@ def run_knn_evaluation(
     output_dir: str,
     nb_knn_list: List[int],
     temperature: float,
+    fm_ids: Optional[List[int]] = None,
 ) -> Dict:
     """
     Run KNN evaluation pipeline.
@@ -200,7 +204,7 @@ def run_knn_evaluation(
     if accelerator.is_main_process:
         logger.info("Extracting training features...")
     train_features, train_labels, _ = extract_cobra_features(
-        cobra_model, train_loader, accelerator
+        cobra_model, train_loader, accelerator, fm_ids=fm_ids
     )
     if accelerator.is_main_process:
         logger.info(f"Train features: {train_features.shape}")
@@ -208,7 +212,7 @@ def run_knn_evaluation(
     if accelerator.is_main_process:
         logger.info("Extracting test features...")
     test_features, test_labels, test_sample_ids = extract_cobra_features(
-        cobra_model, test_loader, accelerator
+        cobra_model, test_loader, accelerator, fm_ids=fm_ids
     )
     if accelerator.is_main_process:
         logger.info(f"Test features: {test_features.shape}")
@@ -450,6 +454,15 @@ def main(args):
         pretrain_state.get("regional_tokens", cobra_cfg.get("regional_tokens", 0))
     )
     cfg["cobra_config"] = cobra_cfg
+    fm_pooling = (
+        args.fm_pooling
+        or pretrain_state.get("fm_pooling")
+        or cobra_cfg.get("fm_pooling", "avg_pool")
+    )
+    eval_fm_ids = resolve_eval_fm_ids(
+        fm_pooling, model_names, pretrain_cfg, pretrain_state
+    )
+    fm_id_order = pretrain_state.get("fm_id_order") or pretrain_cfg.get("feat_dataset", {}).get("model_name")
 
     resolved_pooling_target = _resolve_pooling_target(
         mode="inference",
@@ -461,13 +474,18 @@ def main(args):
     # Determine raw FM output dimension when pooling_target='raw'
     raw_output_dim = None
     if resolved_pooling_target == "raw":
-        if len(model_names) > 1:
-            logger.warning("Only single-FM inference mode is supported when pooling_target='raw'.")
-            logger.warning("Using first FM model for raw output dimension.")
+        if fm_pooling == "router":
+            raise ValueError(
+                f"pooling_target='raw' bypasses FM fusion and is not valid with fm_pooling='{fm_pooling}'. "
+                "Use pooling_target='post_embed' or 'post_encoder'."
+            )
         fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
         raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
     cfg["pooling_target"] = resolved_pooling_target
     cfg["raw_output_dim"] = raw_output_dim
+    cfg["fm_pooling"] = fm_pooling
+    cfg["fm_id_order"] = fm_id_order
+    cfg["eval_fm_ids"] = eval_fm_ids
 
     # Initialize wandb
     if accelerator.is_main_process:
@@ -492,7 +510,7 @@ def main(args):
         accelerator=accelerator,
         model_config=cobra_cfg,
         encoder_type=cfg.get("encoder_type", "momentum"),
-        fm_pooling="avg_pool",
+        fm_pooling=fm_pooling,
         sequence_encoder=args.sequence_encoder,
         slice_pooling=args.slice_pooling,
         pooling_target=resolved_pooling_target,
@@ -537,6 +555,7 @@ def main(args):
         output_dir=output_dir,
         nb_knn_list=args.nb_knn,
         temperature=args.temperature,
+        fm_ids=eval_fm_ids,
     )
 
     if accelerator.is_main_process:
@@ -579,6 +598,10 @@ if __name__ == "__main__":
         "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"], default=None,
         help="Which representation level ABMIL attention weights aggregate. "
              "If using default None, Cobra resolves to raw for global-only FM caches and post_embed for tiled multi-crop CLS caches.",
+    )
+    parser.add_argument(
+        "--fm-pooling", type=str, choices=["avg_pool", "router"], default=None,
+        help="FM fusion mode. If omitted, uses the checkpoint's saved fm_pooling when available.",
     )
     args = parser.parse_args()
     main(args)

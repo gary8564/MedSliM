@@ -16,7 +16,6 @@ from einops import rearrange, repeat
 from typing import Literal
 
 # helper functions
-
 def exists(val):
     return val is not None
 
@@ -24,7 +23,6 @@ def default(val, d):
     return val if exists(val) else d
 
 # broadcat, as tortoise-tts was using it
-
 def broadcat(tensors, dim = -1):
     broadcasted_tensors = broadcast_tensors(*tensors)
     return torch.cat(broadcasted_tensors, dim = dim)
@@ -36,7 +34,6 @@ def slice_at_dim(t, dim_slice: slice, *, dim):
     return t[tuple(colons)]
 
 # rotary embedding helper functions
-
 def rotate_half(x):
     x = rearrange(x, '... (d r) -> ... d r', r = 2)
     x1, x2 = x.unbind(dim = -1)
@@ -80,7 +77,6 @@ def apply_rotary_emb(
     return out.type(dtype)
 
 # learned rotation helpers
-
 def apply_learned_rotations(rotations, t, start_index = 0, freq_ranges = None):
     if exists(freq_ranges):
         rotations = einsum('..., f -> ... f', rotations, freq_ranges)
@@ -89,8 +85,35 @@ def apply_learned_rotations(rotations, t, start_index = 0, freq_ranges = None):
     rotations = repeat(rotations, '... n -> ... (n r)', r = 2)
     return apply_rotary_emb(rotations, t, start_index = start_index)
 
-# classes
+# Sinusoidal position encoding
+def sinusoidal_position_encoding(
+    positions: torch.Tensor,
+    dim: int,
+    base: float = 10000.0,
+) -> torch.Tensor:
+    """
+    Compute sinusoidal positional encoding from continuous positions (e.g. relative depth in [0, 1]).
 
+    PE(p, 2i)   = sin(p / base^{2i/d})
+    PE(p, 2i+1) = cos(p / base^{2i/d})
+
+    Args:
+        positions: Arbitrary-shape tensor of continuous positions.
+        dim: Embedding dimensionality (must be even).
+        base: Frequency base (default 10000, following Vaswani et al.).
+
+    Returns:
+        Sinusoidal encoding with shape ``(*positions.shape, dim)``.
+    """
+    assert dim % 2 == 0, "Embedding dimension must be even for sinusoidal PE"
+    half = dim // 2
+    freq_indices = torch.arange(half, device=positions.device, dtype=positions.dtype)
+    inv_freq = 1.0 / (base ** (freq_indices / half))  
+    angles = positions.unsqueeze(-1) * inv_freq 
+    return torch.cat([angles.sin(), angles.cos()], dim=-1) 
+
+
+# Rotary embedding class
 class RotaryEmbedding(Module):
     def __init__(
         self,
@@ -138,21 +161,17 @@ class RotaryEmbedding(Module):
         self.learned_freq = learned_freq
 
         # dummy for device
-
         self.register_buffer('dummy', torch.tensor(0), persistent = False)
 
         # default sequence dimension
-
         self.seq_before_head_dim = seq_before_head_dim
         self.default_seq_dim = -3 if seq_before_head_dim else -2
 
         # interpolation factors
-
         assert interpolate_factor >= 1.
         self.interpolate_factor = interpolate_factor
 
-        # xpos
-
+        # xpos   
         self.use_xpos = use_xpos
 
         if not use_xpos:
@@ -166,7 +185,6 @@ class RotaryEmbedding(Module):
         self.cached_scales_seq_len = 0
 
         # add apply_rotary_emb as static method
-
         self.apply_rotary_emb = staticmethod(apply_rotary_emb)
 
     @property
@@ -286,7 +304,6 @@ class RotaryEmbedding(Module):
         all_freqs = []
 
         # handle offset
-
         if exists(offsets):
             if not is_tensor(offsets):
                 offsets = tensor(offsets)
@@ -294,7 +311,6 @@ class RotaryEmbedding(Module):
             assert len(offsets) == len(dims)
 
         # get frequencies for each axis
-
         for ind, dim in enumerate(dims):
 
             offset = 0
@@ -317,7 +333,6 @@ class RotaryEmbedding(Module):
             all_freqs.append(freqs[new_axis_slice])
 
         # concat all freqs
-
         all_freqs = broadcast_tensors(*all_freqs)
         return torch.cat(all_freqs, dim = -1)
 
@@ -362,6 +377,7 @@ def flat_to_skew(x, liere_block_size, axes_length, spacial_dims):
         A[i, j, :, d] = x[:, :, d]
         A[j, i, :, d] = -x[:, :, d]  # skew
     return A
+
 
 class AttentionLiereRotator(torch.nn.Module):
     def __init__(self, head_dim, liere_block_size, spacial_dims, axes_length, num_heads):
@@ -412,7 +428,7 @@ class AttentionLiereRotator(torch.nn.Module):
             matrices = matrices.to_sparse()
         
         # rotating the vector through multiplication
-        # -- making head_dim first
+        # making head_dim first
         x = x.permute(0, 3, 1, 2)
 
         # NOTE: have to upcast x too because of `"bmm_sparse_cuda" not implemented for 'Half'`

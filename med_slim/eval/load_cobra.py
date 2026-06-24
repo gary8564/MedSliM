@@ -13,6 +13,37 @@ init_logging()
 logger = logging.getLogger(__name__)
 
 
+def resolve_eval_fm_ids(
+    fm_pooling: str,
+    model_names: list[str],
+    pretrain_cfg: Dict,
+    pretrain_state: Optional[Dict],
+) -> Optional[list[int]]:
+    """Map eval FM names to the global FM IDs used when training the router."""
+    if fm_pooling != "router":
+        return None
+
+    fm_id_order = None
+    if pretrain_state is not None:
+        fm_id_order = pretrain_state.get("fm_id_order")
+    if fm_id_order is None:
+        fm_id_order = pretrain_cfg.get("feat_dataset", {}).get("model_name")
+    if not fm_id_order:
+        raise ValueError(
+            "fm_pooling='router' requires the pretraining FM order to recover global FM IDs. "
+            "Expected checkpoint['fm_id_order'] or pretrain config feat_dataset.model_name."
+        )
+
+    name_to_id = {name: idx for idx, name in enumerate(fm_id_order)}
+    missing = [name for name in model_names if name not in name_to_id]
+    if missing:
+        raise ValueError(
+            "Requested FM models are not present in the router pretraining FM order: "
+            f"{missing}. Available FMs: {fm_id_order}."
+        )
+    return [name_to_id[name] for name in model_names]
+
+
 def _build_cobra(
     model_config: Dict,
     sequence_encoder: str,
@@ -22,7 +53,10 @@ def _build_cobra(
     raw_output_dim: Optional[int] = None,
     physical_pe: Optional[bool] = None,
     regional_tokens: Optional[int] = None,
-    region_embedding: Optional[bool] = None,
+    num_fms: Optional[int] = None,
+    per_fm_adapter_mode: str = "per_dim",
+    fm_input_dims: Optional[list] = None,
+    router_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Cobra:
     """Construct a COBRA model in inference mode from model configuration."""
     embed_dim = model_config["embed_dim"]
@@ -31,8 +65,6 @@ def _build_cobra(
         physical_pe = model_config.get("physical_pe", False)
     if regional_tokens is None:
         regional_tokens = model_config.get("regional_tokens", 0)
-    if region_embedding is None:
-        region_embedding = model_config.get("region_embedding", False)
 
     if sequence_encoder == "mamba2":
         encoder_kwargs["d_state"] = model_config.get("mamba_d_state", 128)
@@ -44,8 +76,12 @@ def _build_cobra(
             4 * embed_dim,
         )
 
-    if slice_pooling == "abmil" or fm_pooling == "attention":
+    if slice_pooling == "abmil":
         encoder_kwargs["att_dim"] = model_config["attn_dim"]
+
+    # Router config (only relevant when fm_pooling == "router").
+    if router_kwargs:
+        encoder_kwargs.update(router_kwargs)
 
     num_layers = model_config.get("num_layers", model_config.get("num_mamba_layers"))
 
@@ -64,9 +100,44 @@ def _build_cobra(
         raw_output_dim=raw_output_dim,
         physical_pe=physical_pe,
         regional_tokens=regional_tokens,
-        region_embedding=region_embedding,
+        num_fms=num_fms,
+        per_fm_adapter_mode=per_fm_adapter_mode,
+        fm_input_dims=fm_input_dims,
         **encoder_kwargs,
     )
+
+
+def _resolve_per_fm_adapter(meta: Dict[str, Any], cobra_weights: Dict[str, Any], prefix: str = ""):
+    """
+    Resolve (per_fm_adapter_mode, fm_input_dims) from checkpoint metadata or weights.
+
+    Prefers saved metadata. 
+    Fallback to inferring from FM-keyed adapter weights when metadata is missing 
+    (e.g. older checkpoints saved before the metadata was added).
+    (``<prefix>embed_fm.<id>.head.1.weight`` has shape ``[embed_dim, input_dim]``).
+
+    Args:
+        meta: Metadata.
+        cobra_weights: The cobra encoder state dict.
+        prefix: Key prefix on the cobra weights.
+    """
+    fm_input_dims = meta.get("fm_input_dims")
+    embed_fm_prefix = f"{prefix}embed_fm."
+    head_suffix = ".head.1.weight"
+
+    has_per_fm_weights = any(k.startswith(embed_fm_prefix) for k in cobra_weights.keys())
+    if not has_per_fm_weights:
+        # No FM-keyed adapters in this checkpoint; use dim-keyed adapters.
+        return "per_dim", None
+
+    if fm_input_dims is None:
+        dims_by_id: Dict[int, int] = {}
+        for key, tensor in cobra_weights.items():
+            if key.startswith(embed_fm_prefix) and key.endswith(head_suffix):
+                fm_id = int(key[len(embed_fm_prefix):].split(".")[0])
+                dims_by_id[fm_id] = int(tensor.shape[1])
+        fm_input_dims = [dims_by_id[i] for i in sorted(dims_by_id)]
+    return "per_fm_id", fm_input_dims
 
 
 def load_pretrained_cobra(
@@ -93,7 +164,7 @@ def load_pretrained_cobra(
     - sequence_encoder (str, optional): Override sequence encoder type. If None, uses checkpoint or defaults to "mamba2".
     - slice_pooling (str, optional): Override slice pooling type. If None, uses saved checkpoint.
     - pooling_target (str, optional): Which representation to pool at inference ('post_encoder', 'post_embed', 'raw'). 
-     If None, Cobra resolves a safe default from mode and regional_tokens.
+     If None, Cobra resolves a safe default from mode and slice pooling.
     - raw_output_dim (int, optional): FM embedding dimension, required when pooling_target='raw'.
 
     Returns:
@@ -113,13 +184,9 @@ def load_pretrained_cobra(
         slice_pooling = state_dict.get("pooling", "abmil")  # Default for older checkpoints
     if physical_pe is None:
         physical_pe = state_dict.get("physical_pe", model_config.get("physical_pe", False))
-    regional_tokens = state_dict.get("regional_tokens", model_config.get("regional_tokens", 0))
-    region_embedding = state_dict.get("region_embedding", model_config.get("region_embedding", False))
-    logger.info(f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, fm_pooling={fm_pooling}, pooling_target={pooling_target}, physical_pe={physical_pe}, regional_tokens={regional_tokens}")
-    
-    model = _build_cobra(model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target, raw_output_dim, physical_pe, regional_tokens, region_embedding)
-    logger.info(f"Inference pooling_target={model.pooling_target}")
-    
+    regional_tokens = int(
+        state_dict.get("regional_tokens", model_config.get("regional_tokens", 0))
+    )
     # Extract encoder weights from checkpoint
     if "state_dict" not in list(state_dict.keys()):
         raise ValueError(f"`state_dict` key not found in saved model checkpoint {checkpoint_path}.")
@@ -143,7 +210,54 @@ def load_pretrained_cobra(
     
     if len(cobra_weights) == 0:
         raise ValueError(f"No {encoder_type} encoder weights found in checkpoint.")
-    
+
+    # FM fusion: detect router from the encoder weights. 
+    num_fms = state_dict.get("num_fms")
+    router_kwargs = None
+    has_router_weights = any(k.startswith("fm_router.") for k in cobra_weights.keys())
+    if fm_pooling == "router":
+        if not has_router_weights:
+            raise ValueError(
+                "fm_pooling='router' requested but checkpoint has no fm_router.* weights."
+            )
+        if num_fms is None:
+            embed_key = "fm_router.fm_embed.weight"
+            bias_key = "fm_router.fm_logit_bias.weight"
+            if embed_key in cobra_weights:
+                num_fms = int(cobra_weights[embed_key].shape[0])
+            elif bias_key in cobra_weights:
+                num_fms = int(cobra_weights[bias_key].shape[0])
+            else:
+                raise ValueError("Cannot infer num_fms for router from checkpoint.")
+        router_kwargs = dict(
+            router_use_fm_embedding=state_dict.get("router_use_fm_embedding", "fm_router.fm_embed.weight" in cobra_weights),
+            router_use_fm_logit_bias=state_dict.get("router_use_fm_logit_bias", "fm_router.fm_logit_bias.weight" in cobra_weights),
+            router_use_fm_logit_scale=state_dict.get("router_use_fm_logit_scale", "fm_router.fm_logit_scale.weight" in cobra_weights),
+            router_mode=state_dict.get("router_mode", "soft"),
+            router_top_k=state_dict.get("router_top_k", None),
+            router_temperature=state_dict.get("router_temperature", 1.0),
+            router_learnable_temperature=state_dict.get("router_learnable_temperature", False),
+        )
+    elif fm_pooling == "avg_pool" and has_router_weights:
+        logger.info("Checkpoint contains fm_router weights but fm_pooling='avg_pool' override is active (router bypassed).")
+
+    # Per-FM projection adapters: rebuild FM-keyed adapters when the checkpoint used them.
+    per_fm_adapter_mode, fm_input_dims = _resolve_per_fm_adapter(state_dict, cobra_weights)
+
+    logger.info(
+        f"Loading COBRA with sequence_encoder={sequence_encoder}, slice_pooling={slice_pooling}, "
+        f"fm_pooling={fm_pooling}, pooling_target={pooling_target}, physical_pe={physical_pe}, "
+        f"regional_tokens={regional_tokens}, num_fms={num_fms}, "
+        f"per_fm_adapter_mode={per_fm_adapter_mode}"
+    )
+
+    model = _build_cobra(
+        model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target,
+        raw_output_dim, physical_pe, regional_tokens, num_fms=num_fms, per_fm_adapter_mode=per_fm_adapter_mode,
+        fm_input_dims=fm_input_dims, router_kwargs=router_kwargs,
+    )
+    logger.info(f"Inference pooling_target={model.pooling_target}")
+
     # strict=False: proj layer exists in pretrained model but excluded from checkpoint (not used in inference mode)
     model.load_state_dict(cobra_weights, strict=False)
     logger.info(f"{encoder_type.capitalize()} COBRA model loaded successfully.")
@@ -199,54 +313,56 @@ def load_cobra_from_experiment(
     else:
         slice_pooling = "cls"
 
-    # Attention pooling if cobra.fm_attn.* exists
-    has_fm_attn = any(k.startswith("cobra.fm_attn.") for k in raw.keys())
-    fm_pooling = "attention" if has_fm_attn else "avg_pool"
+    # FM fusion: detect router (cobra.fm_router.*)
+    has_fm_router = any(k.startswith("cobra.fm_router.") for k in raw.keys())
+    if has_fm_router:
+        fm_pooling = "router"
+    else:
+        fm_pooling = "avg_pool"
+
+    num_fms = cobra_cfg.get("num_fms", cfg.get("num_fms"))
+    router_kwargs = None
+    if has_fm_router:
+        if num_fms is None:
+            embed_key = "cobra.fm_router.fm_embed.weight"
+            bias_key = "cobra.fm_router.fm_logit_bias.weight"
+            if embed_key in raw:
+                num_fms = int(raw[embed_key].shape[0])
+            elif bias_key in raw:
+                num_fms = int(raw[bias_key].shape[0])
+            else:
+                raise ValueError("Cannot infer num_fms for router from classifier.pt.")
+        router_kwargs = dict(
+            router_use_fm_embedding="cobra.fm_router.fm_embed.weight" in raw,
+            router_use_fm_logit_bias="cobra.fm_router.fm_logit_bias.weight" in raw,
+            router_use_fm_logit_scale="cobra.fm_router.fm_logit_scale.weight" in raw,
+            router_mode=cfg.get("router_mode", "soft"),
+            router_top_k=cfg.get("router_top_k", None),
+            router_temperature=cfg.get("router_temperature", 1.0),
+            router_learnable_temperature=cfg.get("router_learnable_temperature", False),
+        )
     physical_pe = cobra_cfg.get("physical_pe", cfg.get("physical_pe", False))
+    regional_tokens = int(cobra_cfg.get("regional_tokens", cfg.get("regional_tokens", 0)))
     pooling_target = cfg.get("pooling_target")
     raw_output_dim = cfg.get("raw_output_dim")
 
-    # Tiled multi-crop CLS: detect within-slice aggregator from weight keys.
     has_within_slice = any(k.startswith("cobra.within_slice_agg.") for k in raw.keys())
-    region_embed_key = "cobra.within_slice_agg.region_embed.weight"
-    has_region_embed = region_embed_key in raw
-    region_embedding = has_region_embed
-
-    regional_tokens = int(cobra_cfg.get("regional_tokens", cfg.get("regional_tokens", 0)))
     if has_within_slice:
-        if regional_tokens == 0:
-            if has_region_embed:
-                regional_tokens = int(raw[region_embed_key].shape[0]) - 1
-                logger.warning(
-                    "regional_tokens is specified as global-only setting, " 
-                    "but the model checkpoint contains within_slice_agg weights."
-                    "Inferred regional_tokens=%s from within_slice_agg.region_embed weights",
-                    regional_tokens,
-                )
-            else:
-                raise ValueError(
-                    "classifier.pt contains within_slice_agg weights, but regional_tokens "
-                    "is missing from cobra_config. Re-run linear probing after setting "
-                    "regional_tokens in the saved experiment config."
-                )
-        elif has_region_embed:
-            inferred = int(raw[region_embed_key].shape[0]) - 1
-            if regional_tokens != inferred:
-                raise ValueError(
-                    f"regional_tokens={regional_tokens} in cobra_config conflicts with "
-                    f"region_embed weights implying regional_tokens={inferred}."
-                )
-    elif regional_tokens > 0:
         raise ValueError(
-            f"cobra_config specifies regional_tokens={regional_tokens}, but classifier.pt "
-            "has no within_slice_agg weights."
+            "classifier.pt contains removed within_slice_agg weights. "
+            "Re-run the experiment with global-only CLS or flattened regional-token features."
         )
+
+    # Per-FM projection adapters: rebuild FM-keyed adapters when present (cobra.* prefix).
+    per_fm_meta = {**cfg, **cobra_cfg}
+    per_fm_adapter_mode, fm_input_dims = _resolve_per_fm_adapter(per_fm_meta, raw, prefix="cobra.")
 
     logger.info(
         "Loading COBRA from experiment: "
         f"sequence_encoder={seq_enc}, slice_pooling={slice_pooling}, "
         f"fm_pooling={fm_pooling}, pooling_target={pooling_target}, "
-        f"physical_pe={physical_pe}, regional_tokens={regional_tokens}"
+        f"physical_pe={physical_pe}, regional_tokens={regional_tokens}, "
+        f"per_fm_adapter_mode={per_fm_adapter_mode}"
     )
 
     model = _build_cobra(
@@ -258,7 +374,10 @@ def load_cobra_from_experiment(
         raw_output_dim=raw_output_dim,
         physical_pe=physical_pe,
         regional_tokens=regional_tokens,
-        region_embedding=region_embedding,
+        num_fms=num_fms,
+        per_fm_adapter_mode=per_fm_adapter_mode,
+        fm_input_dims=fm_input_dims,
+        router_kwargs=router_kwargs,
     )
     logger.info(f"Inference pooling_target={model.pooling_target}")
 

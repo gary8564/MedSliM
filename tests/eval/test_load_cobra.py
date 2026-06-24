@@ -3,7 +3,7 @@ import pytest
 import torch
 from accelerate import Accelerator
 
-from med_slim.eval.load_cobra import load_cobra_from_experiment
+from med_slim.eval.load_cobra import load_cobra_from_experiment, _resolve_per_fm_adapter
 
 
 def _testcase_cobra_config():
@@ -24,8 +24,7 @@ def _testcase_experiment(
     tmp_path,
     *,
     regional_tokens=0,
-    include_region_embed=False,
-    embed_regional_tokens=None,
+    include_within_slice_weights=False,
 ):
     exp_dir = tmp_path / "exp"
     ckpt_dir = exp_dir / "ckpt"
@@ -39,37 +38,72 @@ def _testcase_experiment(
     (exp_dir / "config.yml").write_text(yaml.dump(config))
 
     state = {"cobra.attn.weight": torch.randn(1, 16, 32)}
-    if include_region_embed:
-        rt = embed_regional_tokens if embed_regional_tokens is not None else regional_tokens
-        num_regions = 1 + rt
-        state["cobra.within_slice_agg.region_embed.weight"] = torch.randn(num_regions, 32)
+    if include_within_slice_weights:
+        state["cobra.within_slice_agg.region_embed.weight"] = torch.randn(5, 32)
         state["cobra.within_slice_agg.attn.weight"] = torch.randn(1, 16, 32)
     torch.save(state, ckpt_dir / "classifier.pt")
     return exp_dir
 
 
 def test_load_cobra_from_experiment(tmp_path):
-    exp_dir = _testcase_experiment(
-        tmp_path,
-        regional_tokens=0,
-        include_region_embed=True,
-        embed_regional_tokens=4,
-    )
+    exp_dir = _testcase_experiment(tmp_path)
+    model, _ = load_cobra_from_experiment(str(exp_dir), Accelerator())
+    assert model.pooling_target == "post_encoder"
+    assert model.regional_tokens == 0
+
+
+def test_load_cobra_from_experiment_preserves_flattened_regional_tokens(tmp_path):
+    exp_dir = _testcase_experiment(tmp_path, regional_tokens=4)
     model, _ = load_cobra_from_experiment(str(exp_dir), Accelerator())
     assert model.regional_tokens == 4
 
 
-def test_load_cobra_from_experiment_raises_on_regional_tokens_conflict(tmp_path):
-    exp_dir = _testcase_experiment(tmp_path, regional_tokens=2, include_region_embed=True)
-    ckpt_path = exp_dir / "ckpt" / "classifier.pt"
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state["cobra.within_slice_agg.region_embed.weight"] = torch.randn(5, 32)
-    torch.save(state, ckpt_path)
-    with pytest.raises(ValueError, match="conflicts with"):
+def test_load_cobra_from_experiment_rejects_removed_within_slice_weights(tmp_path):
+    exp_dir = _testcase_experiment(tmp_path, include_within_slice_weights=True)
+    with pytest.raises(ValueError, match="removed within_slice_agg"):
         load_cobra_from_experiment(str(exp_dir), Accelerator())
 
 
-def test_load_cobra_from_experiment_raises_when_config_expects_tiled_but_weights_missing(tmp_path):
-    exp_dir = _testcase_experiment(tmp_path, regional_tokens=4, include_region_embed=False)
-    with pytest.raises(ValueError, match="no within_slice_agg weights"):
-        load_cobra_from_experiment(str(exp_dir), Accelerator())
+# --------------------------------------------------------------------------- #
+# Per-FM projection adapters: checkpoint -> (per_fm_adapter_mode, fm_input_dims)
+# --------------------------------------------------------------------------- #
+def test_resolve_per_fm_adapter_defaults_to_per_dim():
+    mode, dims = _resolve_per_fm_adapter({}, {"fm_router.fm_embed.weight": torch.randn(3, 8)})
+    assert mode == "per_dim"
+    assert dims is None
+
+
+def test_resolve_per_fm_adapter_uses_metadata():
+    meta = {"per_fm_adapter_mode": "per_fm_id", "fm_input_dims": [64, 128, 128]}
+    weights = {
+        "embed_fm.0.head.1.weight": torch.randn(32, 64),
+        "embed_fm.1.head.1.weight": torch.randn(32, 128),
+        "embed_fm.2.head.1.weight": torch.randn(32, 128),
+    }
+    mode, dims = _resolve_per_fm_adapter(meta, weights)
+    assert mode == "per_fm_id"
+    assert dims == [64, 128, 128]
+
+
+def test_resolve_per_fm_adapter_infers_dims_from_weights():
+    """Older checkpoints without metadata recover fm_input_dims from adapter weights."""
+    weights = {
+        "embed_fm.0.head.1.weight": torch.randn(32, 64),
+        "embed_fm.2.head.1.weight": torch.randn(32, 128),
+        "embed_fm.1.head.1.weight": torch.randn(32, 256),
+        "embed_fm.0.head.0.weight": torch.randn(64),  # non-Linear key ignored
+    }
+    mode, dims = _resolve_per_fm_adapter({}, weights)
+    assert mode == "per_fm_id"
+    # Ordered by FM id: 0 -> 64, 1 -> 256, 2 -> 128.
+    assert dims == [64, 256, 128]
+
+
+def test_resolve_per_fm_adapter_supports_prefix():
+    weights = {
+        "cobra.embed_fm.0.head.1.weight": torch.randn(32, 64),
+        "cobra.embed_fm.1.head.1.weight": torch.randn(32, 128),
+    }
+    mode, dims = _resolve_per_fm_adapter({}, weights, prefix="cobra.")
+    assert mode == "per_fm_id"
+    assert dims == [64, 128]

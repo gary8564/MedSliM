@@ -1,19 +1,49 @@
 import logging
 import sys
 import argparse
-import torchio as tio 
-import numpy as np 
+from pathlib import Path
+from typing import Sequence, Union
+
+import numpy as np
 import pandas as pd
+import torchio as tio
 from tqdm import tqdm
 from functools import partial
 from multiprocessing import Pool
-from pathlib import Path 
 
+from med_slim.utils.preprocessing.slice_axis_resolver import PLANE_TO_AXIS, build_slice_last_affine
 
 logger = logging.getLogger(__name__)
 
 # Zero-pad IDs to match filenames (e.g. 0 -> 0000)
 ID_WIDTH = 4
+
+def _save_slice_last_nifti(
+    volume: np.ndarray,
+    out_path: Union[str, Path],
+    plane: str,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+) -> tio.ScalarImage:
+    img = tio.ScalarImage(
+        tensor=np.asarray(volume, dtype=np.float32)[None],
+        affine=build_slice_last_affine(plane, spacing),
+    )
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return img
+
+
+def _extract_plane_from_rel_path(rel_path: Path) -> str:
+    """Infer view plane from a path like ``train/sagittal`` or ``valid/coronal``."""
+    for part in rel_path.parts:
+        if part in PLANE_TO_AXIS:
+            return part
+    raise ValueError(
+        f"Cannot infer plane from {rel_path!r}; "
+        f"expected one of {sorted(PLANE_TO_AXIS)} in the path."
+    )
+
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -27,27 +57,22 @@ def setup_logging(verbose: bool) -> None:
         logger.addHandler(handler)
         
 def npy2nifti(path_file, save_dir, data_dir):
-    # Read
     data = np.load(path_file)
     
     # In torchio.ScalarImage, the tensor shape should be [C, W, H, D]. But the data shape is [D, H, W].
     # So we need to swap the dimension.
     data = np.swapaxes(data, 0, -1)
-    
-    # Convert to Nifti 
-    img = tio.ScalarImage(tensor=data[None])
 
-    # Write
     file_stem = path_file.stem
     if file_stem.isdigit():
         file_stem = f"{int(file_stem):0{ID_WIDTH}d}"
     rel_path = path_file.parent.relative_to(data_dir)
-    # Replace "valid" with "test" in the output path
     if rel_path.parts[0] == "valid":
         rel_path = Path("test") / Path(*rel_path.parts[1:])
     path_out_dir = save_dir / rel_path
-    path_out_dir.mkdir(parents=True, exist_ok=True)
-    img.save(path_out_dir / f'{file_stem}.nii.gz')
+    out_file = path_out_dir / f'{file_stem}.nii.gz'
+    plane = _extract_plane_from_rel_path(rel_path)
+    _save_slice_last_nifti(data, out_file, plane=plane)
     
 def combine_annotation_csv(data_dir, split):
     # Combine different annotation csv files into one

@@ -30,6 +30,7 @@ def get_transforms(model_name: str,
     
     Args:
         model_name: Name of the pretrained model
+        plane: Acquisition plane ('axial', 'sagittal', 'coronal')
         num_slices: Number of slices in the image
         spatial_mode: How to handle in-plane spatial dimensions:
             - 'resize': Scale to target size (recommended for 2.5D with pretrained 2D models)
@@ -37,9 +38,10 @@ def get_transforms(model_name: str,
             - 'crop': CropOrPad to target size
         random_rotate: Whether to random rotate the image
         random_center: Whether to random center the crop
-        invert_intensity: Whether to invert the intensity of 
+        invert_intensity: Whether to invert the intensity of the image
+        noise: Whether to add random noise to the image
         crop_empty_slices: Whether to trim near-empty edge slices before spatial transforms
-        to_tensor: Whether to convert the torchioimage to a tensor
+        to_tensor: Whether to convert the TorchIO image to a tensor
     Returns:
         Tuple of (train_transform, val_transform)
     """

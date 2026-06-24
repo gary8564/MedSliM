@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import math
 import os
 import glob
@@ -26,6 +27,8 @@ from med_slim.utils.model_config import get_slice_encoder_config
 
 load_dotenv()
 SPATIAL_MODES = ["resize", "resample", "crop", "adaptive"]
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_mri_sequences(raw: Optional[list[str]] = None) -> Optional[str | list[str]]:
@@ -113,7 +116,7 @@ def main():
     parser.add_argument("--amp", type=str, default=None, choices=["fp16", "bf16"],
                         help="Use automatic mixed precision: 'fp16' or 'bf16' (recommended)")
     parser.add_argument("--model-name", type=str, default="dinov2",
-                        choices=["ark", "dinov2", "dinov3", "rad-dino", "medsiglip",
+                        choices=["ark", "curia", "dinov2", "dinov3", "rad-dino", "medsiglip",
                                  "biomedclip", "mri-core", "medimageinsight"],
                         help="Slice encoder backbone.")
     parser.add_argument("--model-repo", type=str, default=None,
@@ -189,7 +192,7 @@ def main():
     ).to(device).eval()
 
     if args.compile:
-        print("Compiling model with torch.compile()...")
+        logger.info("Compiling model with torch.compile()...")
         slice_encoder = torch.compile(slice_encoder)
 
     # Determine num_slices and batch size
@@ -239,23 +242,37 @@ def main():
                 labels.append(f"r{r}c{c}")
         region_order = ",".join(labels)
 
-    print("Configuration:")
-    print(f"  spatial_mode: {spatial_mode}")
-    print(f"  num_slices: {num_slices_for_logging}")
-    print(f"  crop_empty_slices: {args.crop_empty_slices}")
-    print(f"  batch_size: {batch_size}")
-    print(f"  plane: {args.plane}")
-    print(f"  split: {args.split}")
-    print(f"  model_name: {args.model_name}")
+    logger.info(
+        "Configuration: spatial_mode=%s, num_slices=%s, crop_empty_slices=%s, "
+        "batch_size=%d, plane=%s, split=%s, model_name=%s",
+        spatial_mode,
+        num_slices_for_logging,
+        args.crop_empty_slices,
+        batch_size,
+        args.plane,
+        args.split,
+        args.model_name,
+    )
     if mri_sequences is not None:
-        print(f"  mri_sequences: {mri_sequences}")
+        logger.info("  mri_sequences: %s", mri_sequences)
     if tiled_mode:
-        print(f"  regional_tokens: {regional_tokens} (tile grid {grid_size}x{grid_size}, "
-              f"{num_regions} tokens/slice)")
-        print(f"  tiling: crop at original resolution, resize each crop to FM size (H, W)={(fm_h, fm_w)}")
+        logger.info(
+            "  regional_tokens: %d (tile grid %dx%d, %d tokens/slice)",
+            regional_tokens,
+            grid_size,
+            grid_size,
+            num_regions,
+        )
+        logger.info(
+            "  tiling: crop at original resolution, resize each crop to FM size (H, W)=%s",
+            (fm_h, fm_w),
+        )
     if args.model_name == "curia":
-        print(f"  curia_token_mode: {args.curia_token_mode}")
-        print(f"  curia_spatial_pool_kernel_size: {args.curia_spatial_pool_kernel_size}")
+        logger.info("  curia_token_mode: %s", args.curia_token_mode)
+        logger.info(
+            "  curia_spatial_pool_kernel_size: %s",
+            args.curia_spatial_pool_kernel_size,
+        )
 
     folder_name = spatial_mode
     if tiled_mode:
@@ -291,14 +308,17 @@ def main():
             uid = ds.sample_ids[idx]
             img_path = ds.get_nifti_path(uid)
             n_slices = nib.load(str(img_path)).shape[2]
-            if n_slices >= args.min_slices:
-                valid_indices.append(idx)
-            else:
+            if n_slices < args.min_slices:
                 skipped.append((uid, n_slices))
+                continue
+            valid_indices.append(idx)
         if skipped:
-            print(f"Skipping {len(skipped)} volumes with less than {args.min_slices} slices:")
-            for uid, n in skipped:
-                print(f"  {uid}: {n} slices")
+            logger.warning(
+                "Skipping %d volumes with fewer than %d slices: %s",
+                len(skipped),
+                args.min_slices,
+                ", ".join(f"{uid}({n})" for uid, n in skipped),
+            )
             ds = Subset(ds, valid_indices)
 
     # Apply sharding for parallel processing
@@ -306,7 +326,13 @@ def main():
         all_indices = list(range(len(ds)))
         shard_indices = [idx for idx in all_indices if idx % args.num_shards == args.shard_id]
         ds = Subset(ds, shard_indices)
-        print(f"Shard {args.shard_id}/{args.num_shards}: Processing {len(ds)}/{len(all_indices)} samples")
+        logger.info(
+            "Shard %d/%d: processing %d/%d samples",
+            args.shard_id,
+            args.num_shards,
+            len(ds),
+            len(all_indices),
+        )
 
     data_loader = DataLoader(
         ds,

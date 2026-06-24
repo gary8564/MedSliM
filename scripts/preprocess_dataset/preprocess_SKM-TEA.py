@@ -12,6 +12,7 @@ Echo 1 provides strong anatomical contrast; Echo 2 is more sensitive to
 fluid and edema (useful for effusions, ligamentous injuries).
 
 Input data structure:
+    {data_dir}/dicoms/{scan_id}.tar.gz (raw downloaded tarball)
     {data_dir}/raw_images/{scan_id}/*.dcm
     {data_dir}/annotations/v1.0.0/{train,val,test}.json
 
@@ -30,15 +31,19 @@ import argparse
 import json
 import logging
 import sys
+import tarfile
 import warnings
 from pathlib import Path
 from multiprocessing import Pool
+from typing import Sequence, Union
 
 import numpy as np
 import pandas as pd
 import pydicom
 import torchio as tio
 from tqdm import tqdm
+
+from med_slim.utils.preprocessing.slice_axis_resolver import build_slice_last_affine
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,87 @@ LABEL_COLUMNS = list(SUPERCATEGORY_COLUMNS.values())
 
 # Echo number → subdirectory name (sequence type)
 ECHO_TO_SEQ = {1: "DESS_E1", 2: "DESS_E2"}
+
+
+def setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logger.setLevel(level)
+    if not logger.handlers:
+        logger.addHandler(handler)
+
+
+def extract_dicom_archives(
+    archive_dir: Path,
+    output_dir: Path,
+    *,
+    skip_existing: bool = True,
+) -> tuple[int, int, int]:
+    """
+    Extract ``{scan_id}.tar.gz`` archives into ``{output_dir}/{scan_id}/``.
+
+    Returns:
+        (extracted, skipped, failed) counts.
+    """
+    archive_dir = Path(archive_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not archive_dir.is_dir():
+        logger.warning(f"DICOM archive directory not found: {archive_dir}")
+        return 0, 0, 0
+
+    archives = sorted(archive_dir.glob("*.tar.gz"))
+    if not archives:
+        logger.info(f"No .tar.gz archives found in {archive_dir}")
+        return 0, 0, 0
+
+    extracted = skipped = failed = 0
+    for archive in archives:
+        scan_id = archive.name.removesuffix(".tar.gz")
+        dest = output_dir / scan_id
+        if skip_existing and dest.is_dir() and any(dest.glob("*.dcm")):
+            skipped += 1
+            continue
+
+        try:
+            with tarfile.open(archive, "r:gz") as tf:
+                if hasattr(tarfile, "data_filter"):
+                    tf.extractall(output_dir, filter="data")
+                else:
+                    tf.extractall(output_dir)
+            extracted += 1
+            logger.debug(f"Extracted {archive.name} -> {dest}")
+        except Exception as exc:
+            failed += 1
+            logger.warning(f"Failed to extract {archive.name}: {exc}")
+
+    logger.info(
+        f"DICOM extraction: {extracted} extracted, {skipped} skipped, {failed} failed "
+        f"(from {len(archives)} archives in {archive_dir})"
+    )
+    return extracted, skipped, failed
+
+
+def _save_slice_last_nifti(
+    volume: np.ndarray,
+    out_path: Union[str, Path],
+    plane: str,
+    spacing: Sequence[float] = (1.0, 1.0, 1.0),
+    *,
+    from_d_first: bool = True,
+) -> tio.ScalarImage:
+    img = tio.ScalarImage(
+        tensor=np.asarray(volume, dtype=np.float32)[None],
+        affine=build_slice_last_affine(plane, spacing),
+    )
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return img
 
 def load_annotations(ann_dir: Path) -> pd.DataFrame:
     """Load train/val/test annotation JSONs and build a per-scan label DataFrame.
@@ -160,9 +246,8 @@ def dcm_to_nifti(task: dict) -> list[dict] | None:
             # pydicom pixel_array is (Rows, Cols) = (H, W).
             # torchio expects (C, W, H, D), swap H and W before adding channel dim.
             vol = np.swapaxes(vol, 0, 1)  # (H, W, D) → (W, H, D)
-            img = tio.ScalarImage(tensor=vol[None])  # (1, W, H, D)
             save_path.parent.mkdir(parents=True, exist_ok=True)
-            img.save(str(save_path))
+            _save_slice_last_nifti(vol, save_path, plane="sagittal")
 
             results.append({
                 "scan_id": scan_id,
@@ -196,14 +281,40 @@ def main():
         help="Output directory for NIfTI and metadata CSVs",
     )
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers")
+    parser.add_argument(
+        "--extract-archive",
+        action="store_true",
+        help="Extract DICOM tarballs before preprocessing.",
+    )
+    parser.add_argument(
+        "--extract-archive-dir",
+        type=str,
+        default=None,
+        help="Directory with {scan_id}.tar.gz DICOM archives "
+             "(default: {data_dir}/dicoms when --extract-archive is set).",
+    )
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
+    setup_logging(args.verbose)
 
     data_dir = Path(args.data_dir)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     raw_images_dir = data_dir / "raw_images"
     ann_dir = data_dir / "annotations" / "v1.0.0"
+
+    # ── Step 0: Extract DICOM tarballs (optional one-time setup) ───
+    if args.extract_archive:
+        archive_dir = (
+            Path(args.extract_archive_dir)
+            if args.extract_archive_dir is not None
+            else data_dir / "dicoms"
+        )
+        logger.info("=" * 60)
+        logger.info("Step 0: Extracting DICOM tarballs")
+        logger.info("=" * 60)
+        extract_dicom_archives(archive_dir, raw_images_dir)
 
     # ── Step 1: Load annotations ──────────────────────────────────
     logger.info("=" * 60)

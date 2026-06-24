@@ -11,6 +11,10 @@ scripts/debug
 scripts/plot_data_scaling.py
 scripts/precompute_slice_feature/parallel_launch.sh
 scripts/precompute_slice_feature/submit_all_variants.sh
+scripts/precompute_slice_feature/audit_feat_cache_shapes.*
+scripts/precompute_slice_feature/rerun_from_audit.*
+scripts/preprocess_dataset/patch_all_spacing.sh
 figures
 *.log
 plans
+reports

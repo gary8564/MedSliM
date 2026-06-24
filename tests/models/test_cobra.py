@@ -381,8 +381,8 @@ def test_cobra_cross_attention_post_embed_pooling_target():
 
     with torch.no_grad():
         y = model(x, seq_lengths=seq_lengths)
-        logits = model._embed_inference_forward(x)
-        mask = model._build_mask(seq_lengths, logits.shape[1])
+        logits, token_lengths, _ = model._prepare_inference_fm_set(x, seq_lengths=seq_lengths)
+        mask = model._build_mask(token_lengths, logits.shape[1])
         h = model.seq_enc(logits, src_key_padding_mask=~mask)
         h = model.norm(h)
         expected = model._cross_attention_pooling(h, mask=mask, values=logits)
@@ -560,9 +560,12 @@ def test_cobra_parameter_count_vs_original():
         f"Attention parameter count mismatch! HF model: {hf_attn:,}, Ours: {our_attn:,}, Expected: {expected_attn:,}"
 
 
-def _build_tiled_cobra(mode="train", region_embedding=False, regional_tokens=4,
-                       embed_dim=64, contrast_dim=32, slice_pooling="abmil",
-                       pooling_target="post_encoder"):
+# Subset SSL multi-FM fusion (router / avg_pool)
+NUM_FMS = 4
+SUBSET_DIMS = [64, 128]  # raw feature dims of the two FMs
+
+def _build_subset_cobra(fm_pooling="router", num_fms=NUM_FMS,
+                        embed_dim=64, contrast_dim=32, **kwargs):
     return Cobra(
         embed_dim=embed_dim,
         contrast_dim=contrast_dim,
@@ -570,94 +573,50 @@ def _build_tiled_cobra(mode="train", region_embedding=False, regional_tokens=4,
         num_heads=4,
         num_layers=1,
         dropout=0.0,
-        mode=mode,
-        sequence_encoder="transformer",  # avoid Mamba causal-conv CPU/stride constraints
-        slice_pooling=slice_pooling,
-        pooling_target=pooling_target,
-        regional_tokens=regional_tokens,
-        region_embedding=region_embedding,
-        att_dim=32,
-    ).to(DEVICE).eval()
-
-def test_cobra_train_within_slice_aggregation():
-    """Tiled input is collapsed from per-region tokens to one embedding per slice."""
-    batch_size, num_slices, regions, feat_dim = 2, 6, 5, 64  # num_tiled_regions = 1 global + 2x2
-    model = _build_tiled_cobra(mode="train", regional_tokens=4)
-
-    x = torch.randn(batch_size, num_slices, regions, feat_dim, device=DEVICE)
-    with torch.no_grad():
-        y = model(x)
-    assert y.shape == (batch_size, 32)
-    assert torch.isfinite(y).all()
-    # Region attention is cached after the within-slice aggregation
-    assert model.region_attention.shape == (batch_size, num_slices, 1, regions - 1)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
-
-
-def test_resolve_pooling_target_cobra_tiled_train():
-    """pooling_target is None for tiled SSL pretraining."""
-    batch_size, num_slices, regions, feat_dim = 2, 4, 5, 64
-    model = Cobra(
-        embed_dim=64, contrast_dim=32, input_dims=[64], num_heads=4, num_layers=1,
-        dropout=0.0, mode="train", sequence_encoder="transformer",
-        slice_pooling="abmil", regional_tokens=4, att_dim=32,
-    ).to(DEVICE).eval()
-    assert model.pooling_target is None
-
-    x = torch.randn(batch_size, num_slices, regions, feat_dim, device=DEVICE)
-    with torch.no_grad():
-        y = model(x)
-    assert y.shape == (batch_size, 32)
-    assert torch.isfinite(y).all()
-
-
-def test_resolve_pooling_target_cobra_tiled_inference():
-    """Omitted inference pooling_target defaults to raw for global-only and post_embed for tiled."""
-    global_model = Cobra(
-        embed_dim=64,
-        contrast_dim=32,
-        input_dims=[64],
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        mode="inference",
+        mode="train",
         sequence_encoder="transformer",
         slice_pooling="abmil",
-        raw_output_dim=64,
+        fm_pooling=fm_pooling,
+        num_fms=num_fms,
         att_dim=32,
+        **kwargs,
     ).to(DEVICE).eval()
-    assert global_model.pooling_target == "raw"
-
-    tiled_model = Cobra(
-        embed_dim=64,
-        contrast_dim=32,
-        input_dims=[64],
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        mode="inference",
-        sequence_encoder="transformer",
-        slice_pooling="abmil",
-        regional_tokens=4,
-        att_dim=32,
-    ).to(DEVICE).eval()
-    assert tiled_model.pooling_target == "post_embed"
 
 
-def test_cobra_tiled_packed_train_forward():
-    """Packed tiled input runs through the real Transformer varlen sequence encoder."""
-    if not torch.cuda.is_available():
-        pytest.skip("Packed Transformer uses FlashAttention varlen, which requires CUDA.")
+def _generate_subset_inputs(batch_size, k_sub, num_slices, max_feature_dim=128, num_regions=None):
+    """Return (x, input_feature_dims, fm_ids) for a subset-mode forward pass."""
+    dims = [SUBSET_DIMS[i % len(SUBSET_DIMS)] for i in range(k_sub)]
+    if num_regions is None:
+        x = torch.randn(batch_size, k_sub, num_slices, max_feature_dim, device=DEVICE)
+    else:
+        x = torch.randn(batch_size, k_sub, num_slices, num_regions, max_feature_dim, device=DEVICE)
+    input_feature_dims = torch.tensor([dims] * batch_size, dtype=torch.long, device=DEVICE)
+    fm_ids = torch.tensor([list(range(k_sub))] * batch_size, dtype=torch.long, device=DEVICE)
+    return x, input_feature_dims, fm_ids
 
-    device = torch.device("cuda")
-    seq_lens = torch.tensor([3, 5], dtype=torch.int32, device=device)
-    cu_seqlens = torch.zeros(3, dtype=torch.int32, device=device)
-    cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
-    total_slices = int(cu_seqlens[-1].item())
-    max_seqlen = int(seq_lens.max().item())
-    seq_idx = torch.repeat_interleave(torch.arange(2, dtype=torch.int32, device=device), seq_lens)
 
+def test_cobra_subset_router_global():
+    batch_size, k_sub, num_slices = 2, 2, 6
+    model = _build_subset_cobra(fm_pooling="router")
+    assert model.fm_router is not None
+
+    x, dims, fm_ids = _generate_subset_inputs(batch_size, k_sub, num_slices)
+    with torch.no_grad():
+        y = model(x, input_feature_dims=dims, fm_ids=fm_ids)
+
+    assert y.shape == (batch_size, 32)
+    assert torch.isfinite(y).all()
+    stats = model._last_fm_stats
+    assert stats is not None
+    assert stats["router_logits"] is not None
+    assert stats["fm_weights_local"].shape == (batch_size, num_slices, k_sub)
+    sums = stats["fm_weights_local"].sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4)
+
+
+def test_cobra_train_flattened_regional_tokens():
+    batch_size, num_slices, regional_tokens = 2, 5, 4
+    num_regions = 1 + regional_tokens
     model = Cobra(
         embed_dim=64,
         contrast_dim=32,
@@ -668,168 +627,288 @@ def test_cobra_tiled_packed_train_forward():
         mode="train",
         sequence_encoder="transformer",
         slice_pooling="abmil",
-        regional_tokens=4,
+        regional_tokens=regional_tokens,
         att_dim=32,
-    ).to(device).eval()
-    x = torch.randn(total_slices, 5, 64, device=device)
+    ).to(DEVICE).eval()
+    x = torch.randn(batch_size, num_slices, num_regions, 64, device=DEVICE)
+    seq_lengths = torch.tensor([num_slices, 3], dtype=torch.long, device=DEVICE)
 
     with torch.no_grad():
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            y = model(
-                x,
-                use_packed=True,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                seq_idx=seq_idx,
-            )
+        h = model(x, seq_lengths=seq_lengths, return_slice_embeddings=True)
+        attn = model(x, seq_lengths=seq_lengths, get_attention=True)
 
-    assert y.shape == (2, 32)
-    assert torch.isfinite(y).all()
-    assert model.region_attention.shape == (1, total_slices, 1, 4)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
+    assert h.shape == (batch_size, num_slices * num_regions, 64)
+    assert attn.shape == (batch_size, 1, num_slices * num_regions)
+    assert torch.allclose(
+        attn[1, 0, 3 * num_regions:],
+        torch.zeros_like(attn[1, 0, 3 * num_regions:]),
+        atol=1e-6,
+        rtol=0.0,
+    )
 
 
-def test_cobra_tiled_inference_avg_pool_multi_fm():
-    """Inference mode ensembles a list of tiled FM tensors via avg_pool."""
-    batch_size, num_slices, regions = 2, 5, 5
-    model = _build_tiled_cobra(mode="inference", regional_tokens=4)
+def test_cobra_subset_router_flattened_regional_tokens():
+    batch_size, k_sub, num_slices, regional_tokens = 2, 2, 5, 4
+    num_regions = 1 + regional_tokens
+    model = _build_subset_cobra(fm_pooling="router", regional_tokens=regional_tokens)
 
-    # Two FMs with different raw feature dims (64 and 128), both tiled.
-    x = [
-        torch.randn(batch_size, num_slices, regions, 64, device=DEVICE),
-        torch.randn(batch_size, num_slices, regions, 128, device=DEVICE),
-    ]
+    x, dims, fm_ids = _generate_subset_inputs(
+        batch_size, k_sub, num_slices, num_regions=num_regions
+    )
     seq_lengths = torch.tensor([num_slices, 3], dtype=torch.long, device=DEVICE)
     with torch.no_grad():
-        y = model(x, seq_lengths=seq_lengths)
-    assert y.shape == (batch_size, 64)  # embed_dim
-    assert torch.isfinite(y).all()
-    assert model.region_attention.shape == (batch_size, num_slices, 1, regions - 1)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
+        y = model(x, input_feature_dims=dims, fm_ids=fm_ids, seq_lengths=seq_lengths)
+
+    assert y.shape == (batch_size, 32)
+    stats = model._last_fm_stats
+    assert stats["fm_weights_local"].shape == (
+        batch_size,
+        num_slices * num_regions,
+        k_sub,
+    )
+    assert torch.equal(
+        stats["slice_mask"],
+        model._build_mask(seq_lengths * num_regions, num_slices * num_regions),
+    )
 
 
-def test_cobra_tiled_inference_attention_pool_multi_fm():
-    """FM attention pooling works after per-FM within-slice aggregation."""
-    batch_size, num_slices, regions = 2, 5, 5
+def test_cobra_variable_k_router_transfer():
+    """The same router runs with K_sub=2 (train-like) and K_total=4 (inference-like)."""
+    batch_size, num_slices = 2, 5
+    model = _build_subset_cobra(fm_pooling="router", num_fms=4)
+
+    with torch.no_grad():
+        x2, dims2, ids2 = _generate_subset_inputs(batch_size, 2, num_slices)
+        y2 = model(x2, input_feature_dims=dims2, fm_ids=ids2)
+        x4, dims4, ids4 = _generate_subset_inputs(batch_size, 4, num_slices)
+        y4 = model(x4, input_feature_dims=dims4, fm_ids=ids4)
+
+    assert y2.shape == (batch_size, 32)
+    assert y4.shape == (batch_size, 32)
+    assert model._last_fm_stats["fm_weights_local"].shape == (batch_size, num_slices, 4)
+
+
+def test_cobra_router_inference_uses_global_fm_ids():
+    """Router inference must preserve checkpoint-global FM IDs, not local list positions."""
+    batch_size, num_slices, feat_dim = 2, 5, 64
     model = Cobra(
+        embed_dim=64,
+        contrast_dim=32,
+        input_dims=[feat_dim],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        sequence_encoder="transformer",
+        slice_pooling="abmil",
+        fm_pooling="router",
+        num_fms=4,
+        pooling_target="post_encoder",
+        att_dim=32,
+    ).to(DEVICE).eval()
+    x = [
+        torch.randn(batch_size, num_slices, feat_dim, device=DEVICE),
+        torch.randn(batch_size, num_slices, feat_dim, device=DEVICE),
+    ]
+    fm_ids = torch.tensor([2, 3], dtype=torch.long, device=DEVICE)
+
+    with torch.no_grad():
+        y = model(x, fm_ids=fm_ids)
+
+    assert y.shape == (batch_size, 64)
+    expected_ids = fm_ids.unsqueeze(0).expand(batch_size, -1)
+    assert torch.equal(model._last_fm_stats["fm_ids"], expected_ids)
+
+
+def test_cobra_router_requires_num_fms():
+    with pytest.raises(ValueError, match="num_fms"):
+        Cobra(
+            embed_dim=64, contrast_dim=32, input_dims=[64], num_heads=4, num_layers=1,
+            mode="train", sequence_encoder="transformer", slice_pooling="abmil",
+            fm_pooling="router", att_dim=32,
+        )
+
+
+def test_cobra_subset_packed_router_raises():
+    model = _build_subset_cobra(fm_pooling="router")
+    x, dims, fm_ids = _generate_subset_inputs(2, 2, 4)
+    with pytest.raises(NotImplementedError, match="Packed subset"):
+        model(x, input_feature_dims=dims, fm_ids=fm_ids, use_packed=True)
+
+
+def test_cobra_inference_packed_raises():
+    """Packed inference is unsupported; use padded [B, D, F] inputs plus seq_lengths."""
+    batch_size, num_slices, feat_dim = 2, 5, 64
+    model = Cobra(
+        embed_dim=64,
+        contrast_dim=32,
+        input_dims=[64],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        sequence_encoder="transformer",
+        slice_pooling="abmil",
+        pooling_target="post_encoder",
+        att_dim=32,
+    ).to(DEVICE).eval()
+
+    x = torch.randn(num_slices + 3, feat_dim, device=DEVICE)  # packed [total_slices, F]
+    cu_seqlens = torch.tensor([0, num_slices, num_slices + 3], dtype=torch.int32, device=DEVICE)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.int32, device=DEVICE),
+        torch.tensor([num_slices, 3], dtype=torch.int32, device=DEVICE),
+    )
+    with pytest.raises(NotImplementedError, match="Packed inference"):
+        model(
+            [x],
+            use_packed=True,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=num_slices,
+            seq_idx=seq_idx,
+        )
+
+
+# Single-FM inference mode
+def test_cobra_single_fm_inference_tensor_matches_list_global():
+    """Single-FM inference accepts a bare tensor and matches a one-element list."""
+    batch_size, num_slices, feat_dim = 2, 5, 64
+    model = Cobra(
+        embed_dim=64,
+        contrast_dim=32,
+        input_dims=[64],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        sequence_encoder="transformer",
+        slice_pooling="abmil",
+        pooling_target="post_encoder",
+        att_dim=32,
+    ).to(DEVICE).eval()
+
+    x = torch.randn(batch_size, num_slices, feat_dim, device=DEVICE)
+    seq_lengths = torch.tensor([num_slices, 3], dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        y_tensor = model(x, seq_lengths=seq_lengths)
+        y_list = model([x], seq_lengths=seq_lengths)
+
+    assert y_tensor.shape == (batch_size, 64)
+    assert torch.allclose(y_tensor, y_list, atol=1e-6)
+
+
+# Per-FM projection adapters (per_fm_adapter_mode='per_fm_id')
+def _build_per_fm_cobra(mode="train", fm_input_dims=(64, 128, 128), num_fms=3):
+    return Cobra(
         embed_dim=64,
         contrast_dim=32,
         input_dims=[64, 128],
         num_heads=4,
         num_layers=1,
         dropout=0.0,
-        mode="inference",
+        mode=mode,
         sequence_encoder="transformer",
-        fm_pooling="attention",
         slice_pooling="abmil",
-        pooling_target="post_encoder",
-        regional_tokens=4,
+        pooling_target="post_encoder" if mode == "inference" else None,
+        fm_pooling="router",
+        num_fms=num_fms,
+        per_fm_adapter_mode="per_fm_id",
+        fm_input_dims=list(fm_input_dims),
         att_dim=32,
     ).to(DEVICE).eval()
 
-    x = [
-        torch.randn(batch_size, num_slices, regions, 64, device=DEVICE),
-        torch.randn(batch_size, num_slices, regions, 128, device=DEVICE),
-    ]
-    seq_lengths = torch.tensor([num_slices, 3], dtype=torch.long, device=DEVICE)
-    with torch.no_grad():
-        y = model(x, seq_lengths=seq_lengths)
 
-    assert y.shape == (batch_size, 64)
-    assert torch.isfinite(y).all()
-    assert model.region_attention.shape == (batch_size, num_slices, 1, regions - 1)
-    region_sums = model.region_attention.squeeze(2).sum(dim=-1)
-    assert torch.allclose(region_sums, torch.ones_like(region_sums), atol=1e-4)
-
-
-def test_cobra_tiled_inference_post_embed_pooling():
-    """Tiled inference supports post_embed pooling after within-slice aggregation."""
-    batch_size, num_slices, regions, feat_dim = 2, 5, 5, 64
-    model = _build_tiled_cobra(mode="inference", regional_tokens=4, pooling_target="post_embed")
-
-    x = [torch.randn(batch_size, num_slices, regions, feat_dim, device=DEVICE)]
-    seq_lengths = torch.tensor([num_slices, 3], dtype=torch.long, device=DEVICE)
-    with torch.no_grad():
-        y = model(x, seq_lengths=seq_lengths)
-    assert y.shape == (batch_size, 64)
-    assert torch.isfinite(y).all()
+def test_cobra_builds_one_embed_per_fm():
+    model = _build_per_fm_cobra(fm_input_dims=(64, 128, 128), num_fms=3)
+    assert model.per_fm_adapter_mode == "per_fm_id"
+    assert set(model.embed_fm.keys()) == {"0", "1", "2"}
+    # Each adapter projects from its FM's true input dim (head[1] is Linear(dim, embed_dim)).
+    assert model.embed_fm["0"].head[1].in_features == 64
+    assert model.embed_fm["1"].head[1].in_features == 128
+    assert model.embed_fm["2"].head[1].in_features == 128
+    # Per-FM mode does not instantiate unused dim-keyed adapters/checkpoint params.
+    assert model.embed is None
+    assert not any(k.startswith("embed.") for k in model.state_dict())
+    assert any(k.startswith("embed_fm.") for k in model.state_dict())
 
 
-def test_cobra_tiled_region_attention_query():
-    """get_region_attention returns the global->region attention distribution per slice."""
-    batch_size, num_slices, regions, feat_dim = 2, 4, 5, 64
-    model = _build_tiled_cobra(mode="inference", regional_tokens=4)
-
-    x = [torch.randn(batch_size, num_slices, regions, feat_dim, device=DEVICE)]
-    seq_lengths = torch.tensor([num_slices, num_slices], dtype=torch.long, device=DEVICE)
-    with torch.no_grad():
-        region_attn = model(x, seq_lengths=seq_lengths, get_region_attention=True)
-    assert region_attn.shape == (batch_size, num_slices, 1, regions - 1)
-    # Attention is a softmax distribution over the regional tokens
-    summed = region_attn.squeeze(2).sum(dim=-1)
-    assert torch.allclose(summed, torch.ones_like(summed), atol=1e-4)
-
-
-def test_cobra_tiled_region_embedding_adds_params():
-    """Enabling region_embedding creates a learned embedding over (global + regional) tokens."""
-    model = _build_tiled_cobra(mode="train", region_embedding=True, regional_tokens=4)
-    assert model.within_slice_agg.region_embed is not None
-    assert model.within_slice_agg.region_embed.weight.shape[0] == 5  # 1 global + 4 regions
-
-    model_no_embed = _build_tiled_cobra(mode="train", region_embedding=False, regional_tokens=4)
-    assert model_no_embed.within_slice_agg.region_embed is None
-
-
-def test_cobra_tiled_raw_pooling_target_raises():
-    """raw pooling is ill-defined for tiled features and must raise at construction."""
-    with pytest.raises(ValueError):
+def test_cobra_per_fm_id_requires_fm_input_dims():
+    with pytest.raises(ValueError, match="requires fm_input_dims"):
         Cobra(
             embed_dim=64,
             contrast_dim=32,
-            input_dims=[64],
+            input_dims=[64, 128],
             num_heads=4,
             num_layers=1,
-            mode="inference",
+            mode="train",
             sequence_encoder="transformer",
-            slice_pooling="abmil",
-            pooling_target="raw",
-            regional_tokens=4,
-            raw_output_dim=64,
+            fm_pooling="router",
+            num_fms=3,
+            per_fm_adapter_mode="per_fm_id",
+            fm_input_dims=None,
+            att_dim=32,
         )
 
 
-def test_cobra_tiled_shape_layout_mismatch_raises():
-    """Layout/model mismatches between tiled and global-only must fail loudly."""
-    # Tiled features fed to a non-tiled model
-    plain = Cobra(
-        embed_dim=64, contrast_dim=32, input_dims=[64], num_heads=4, num_layers=1,
-        dropout=0.0, mode="train", sequence_encoder="transformer", slice_pooling="abmil",
-        att_dim=32,
-    ).to(DEVICE).eval()
-    x_tiled = torch.randn(2, 4, 5, 64, device=DEVICE)
-    with pytest.raises(ValueError):
-        plain(x_tiled)
+def test_cobra_per_fm_id_length_mismatch_raises():
+    with pytest.raises(ValueError, match="must equal num_fms"):
+        Cobra(
+            embed_dim=64,
+            contrast_dim=32,
+            input_dims=[64, 128],
+            num_heads=4,
+            num_layers=1,
+            mode="train",
+            sequence_encoder="transformer",
+            fm_pooling="router",
+            num_fms=3,
+            per_fm_adapter_mode="per_fm_id",
+            fm_input_dims=[64, 128],
+            att_dim=32,
+        )
 
-    # Global-only features fed to a tiled model
-    tiled = _build_tiled_cobra(mode="train", regional_tokens=4)
-    x_plain = torch.randn(2, 4, 64, device=DEVICE)
-    with pytest.raises(ValueError):
-        tiled(x_plain)
 
+def test_cobra_per_fm_id_pretrain_subset_embed_selects_adapter_by_fm_id():
+    """_embed_subset_fm_set must route each (sample, FM) through its FM-id adapter."""
+    model = _build_per_fm_cobra(fm_input_dims=(64, 128, 128), num_fms=3)
+    batch_size, k_sub, num_slices, max_dim = 2, 2, 4, 128
+    x = torch.randn(batch_size, k_sub, num_slices, max_dim, device=DEVICE)
+    # Subset position 0 -> FM id 0 (dim 64), position 1 -> FM id 2 (dim 128).
+    fm_ids = torch.tensor([[0, 2]] * batch_size, dtype=torch.long, device=DEVICE)
+    dims = torch.tensor([[64, 128]] * batch_size, dtype=torch.long, device=DEVICE)
 
-def test_cobra_zero_padded_slices_masks_batch_padding():
-    """Within-slice aggregation must ignore batch-padded slice positions."""
-    model = _build_tiled_cobra(mode="inference", regional_tokens=4)
-    batch_size, max_slices, regions, feat_dim = 2, 6, 5, 64
-    x = torch.randn(batch_size, max_slices, regions, feat_dim, device=DEVICE)
-    seq_lengths = torch.tensor([4, 6], device=DEVICE)
-
-    padded = x.clone()
-    padded[0, 4:] = 999.0
     with torch.no_grad():
-        emb_clean = model([x], seq_lengths=seq_lengths)
-        emb_padded = model([padded], seq_lengths=seq_lengths)
+        out = model._embed_subset_fm_set(x, dims, fm_ids=fm_ids)  # [K, B, D, E]
+        # Reference: apply each FM's adapter explicitly.
+        ref0 = model.embed_fm["0"](x[:, 0, :, :64])
+        ref1 = model.embed_fm["2"](x[:, 1, :, :128])
 
-    assert torch.allclose(emb_clean, emb_padded, atol=1e-5)
+    assert out.shape == (k_sub, batch_size, num_slices, 64)
+    assert torch.allclose(out[0], ref0, atol=1e-6)
+    assert torch.allclose(out[1], ref1, atol=1e-6)
+
+
+def test_cobra_per_fm_id_pretrain_subset_embed_requires_fm_ids():
+    model = _build_per_fm_cobra(fm_input_dims=(64, 128, 128), num_fms=3)
+    x = torch.randn(2, 2, 4, 128, device=DEVICE)
+    dims = torch.tensor([[64, 128]] * 2, dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        with pytest.raises(ValueError, match="requires fm_ids"):
+            model._embed_subset_fm_set(x, dims, fm_ids=None)
+
+
+def test_cobra_per_fm_id_inference_embed_selects_adapter_by_fm_id():
+    model = _build_per_fm_cobra(mode="inference", fm_input_dims=(64, 128, 128), num_fms=3)
+    batch_size, num_slices = 2, 4
+    x = [
+        torch.randn(batch_size, num_slices, 64, device=DEVICE),
+        torch.randn(batch_size, num_slices, 128, device=DEVICE),
+    ]
+    fm_ids = torch.tensor([0, 2], dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        out = model._embed_inference_fm_set(x, fm_ids=fm_ids)  # [K, B, D, E]
+        ref0 = model.embed_fm["0"](x[0])
+        ref1 = model.embed_fm["2"](x[1])
+    assert out.shape == (2, batch_size, num_slices, 64)
+    assert torch.allclose(out[0], ref0, atol=1e-6)
+    assert torch.allclose(out[1], ref1, atol=1e-6)

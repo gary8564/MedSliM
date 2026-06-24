@@ -170,6 +170,19 @@ def test_feat_classification_dataset_multi_encoder():
         assert feat.shape == (seq_len, EMBED_DIMS[i])
         
 
+def test_compute_physical_positions_normalized_relative_depth():
+    idx = np.array([0, 17, 34])
+    pos = PrecomputedFeatPairDataset._compute_physical_positions(idx, 35, 32)
+    assert pos.shape == (32,)
+    assert pos[0].item() == 0.0
+    assert abs(pos[1].item() - 17 / 34) < 1e-5
+    assert abs(pos[2].item() - 1.0) < 1e-5
+    assert pos[3:].eq(0).all()
+
+    single = PrecomputedFeatPairDataset._compute_physical_positions(np.array([0]), 1, 4)
+    assert single[0].item() == 0.0
+
+
 def test_linear_classifier_collate_includes_physical_positions():
     ds = FeatClassificationDataset(
         feat_dir=str(FEAT_ROOT),

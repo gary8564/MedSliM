@@ -154,13 +154,13 @@ def main():
     parser.add_argument(
         "--ann-dir",
         type=str,
-        default="/hpcwork/rwth1833/datasets/SKM-TEA/qdess/v1-release/annotations/v1.0.0",
+        required=True,
         help="Directory containing {train,val,test}.json annotation files",
     )
     parser.add_argument(
         "--csv-dir",
         type=str,
-        default="/hpcwork/rwth1833/datasets/preprocessed/SKM-TEA",
+        required=True,
         help="Directory containing the preprocessed {train,val,test}.csv files",
     )
     parser.add_argument(
