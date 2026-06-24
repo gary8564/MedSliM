@@ -46,17 +46,37 @@ def _resolve_config(checkpoint: Path, config_arg: str | None) -> dict:
 
 
 def _apply_checkpoint_metadata(cfg: dict, ckpt: dict) -> list[str]:
-    """Prefer fm_id_order stored in the checkpoint over config model_name."""
+    """Prefer fm_id_order and router hyperparams stored in the checkpoint over config."""
     fm_names = ckpt.get("fm_id_order") or cfg["feat_dataset"]["model_name"]
     cfg["feat_dataset"]["model_name"] = fm_names
     fm_choices = {m["name"]: m["embed_dim"] for m in cfg["model"]["slice_encoder_models"]}
-    cfg["model"]["cobra"]["input_dims"] = sorted(set(fm_choices[m] for m in fm_names))
+    cobra_cfg = cfg["model"]["cobra"]
+    cobra_cfg["input_dims"] = sorted(set(fm_choices[m] for m in fm_names))
     if ckpt.get("fm_pooling"):
-        cfg["model"]["cobra"]["fm_pooling"] = ckpt["fm_pooling"]
+        cobra_cfg["fm_pooling"] = ckpt["fm_pooling"]
     if ckpt.get("per_fm_adapter_mode"):
-        cfg["model"]["cobra"]["per_fm_adapter_mode"] = ckpt["per_fm_adapter_mode"]
+        cobra_cfg["per_fm_adapter_mode"] = ckpt["per_fm_adapter_mode"]
     if ckpt.get("fm_input_dims"):
-        cfg["model"]["cobra"]["fm_input_dims"] = ckpt["fm_input_dims"]
+        cobra_cfg["fm_input_dims"] = ckpt["fm_input_dims"]
+    if ckpt.get("regional_tokens") is not None:
+        cobra_cfg["regional_tokens"] = ckpt["regional_tokens"]
+    if ckpt.get("physical_pe") is not None:
+        cobra_cfg["physical_pe"] = ckpt["physical_pe"]
+    if ckpt.get("sequence_encoder"):
+        cfg["sequence_encoder"] = ckpt["sequence_encoder"]
+    if ckpt.get("pooling"):
+        cfg["pooling"] = ckpt["pooling"]
+    for key in (
+        "router_mode",
+        "router_top_k",
+        "router_temperature",
+        "router_learnable_temperature",
+        "router_use_fm_embedding",
+        "router_use_fm_logit_bias",
+        "router_use_fm_logit_scale",
+    ):
+        if key in ckpt:
+            cobra_cfg[key] = ckpt[key]
     return fm_names
 
 
@@ -81,7 +101,7 @@ def _build_moco(cfg: dict, device: torch.device) -> MoCo:
         encoder_kwargs["dim_feedforward"] = cobra_cfg.get(
             "transformer_dim_feedforward", 4 * cobra_cfg["embed_dim"]
         )
-    if cfg.get("pooling", "abmil") in ("abmil", "cross_attention"):
+    if cfg.get("pooling", "abmil") == "abmil":
         encoder_kwargs["att_dim"] = cobra_cfg.get("attn_dim", 256)
 
     return MoCo(
@@ -95,6 +115,7 @@ def _build_moco(cfg: dict, device: torch.device) -> MoCo:
         sequence_encoder=cfg.get("sequence_encoder", "mamba2"),
         pooling=cfg.get("pooling", "abmil"),
         physical_pe=cobra_cfg.get("physical_pe", False),
+        regional_tokens=cobra_cfg.get("regional_tokens", 0),
         fm_pooling=cobra_cfg.get("fm_pooling", "avg_pool"),
         num_fms=num_fms,
         per_fm_adapter_mode=cobra_cfg.get("per_fm_adapter_mode", "per_dim"),

@@ -117,7 +117,6 @@ def main():
                         help="Use automatic mixed precision: 'fp16' or 'bf16' (recommended)")
     parser.add_argument("--model-name", type=str, default="dinov2",
                         choices=["ark", "curia", "dinov2", "dinov3", "rad-dino", "medsiglip",
-                        choices=["ark", "curia", "dinov2", "dinov3", "rad-dino", "medsiglip",
                                  "biomedclip", "mri-core", "medimageinsight"],
                         help="Slice encoder backbone.")
     parser.add_argument("--model-repo", type=str, default=None,

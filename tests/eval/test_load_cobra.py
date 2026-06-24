@@ -38,6 +38,8 @@ def _testcase_experiment(
     (exp_dir / "config.yml").write_text(yaml.dump(config))
 
     state = {"cobra.attn.weight": torch.randn(1, 16, 32)}
+    if include_within_slice_weights:
+        state["cobra.within_slice_agg.query.weight"] = torch.randn(1, 16)
     torch.save(state, ckpt_dir / "classifier.pt")
     return exp_dir
 

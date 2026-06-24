@@ -18,10 +18,7 @@ from .mamba2 import Mamba2Enc
 from .transformer import TransformerEncoderLayer, VarlenTransformerEncoder
 from .fm_router import FMRouter
 from .positional_encoding import sinusoidal_position_encoding
-from med_slim.model.attention_pooling import (
-    BatchedABMIL,
-    InterSliceAggregator,
-)
+from med_slim.model.attention_pooling import BatchedABMIL
 from med_slim.logging.setup import init_logging
 
 init_logging()
@@ -616,6 +613,24 @@ class Cobra(nn.Module):
         if physical_positions is None:
             return None
         return physical_positions.repeat_interleave(num_regions, dim=-1)
+
+    def _get_num_tiled_regions(self, x, *, packed: bool = False) -> int:
+        """Return number of tiled regions from the shape of the input tensor."""
+        if isinstance(x, list):
+            return x[0].shape[2] if x[0].dim() == 4 else 1
+        if packed:
+            return x.shape[1] if x.dim() == 3 else 1
+        return x.shape[2] if x.dim() == 4 else 1
+
+    def _flatten_raw_tiled_regions(self, raw_x: torch.Tensor, *, packed: bool = False) -> torch.Tensor:
+        """Flatten raw tiled FM features to match ABMIL token attention length."""
+        if packed:
+            if raw_x.dim() == 3:
+                return raw_x.reshape(raw_x.shape[0] * raw_x.shape[1], raw_x.shape[2])
+            return raw_x
+        if raw_x.dim() == 4:
+            return raw_x.reshape(raw_x.shape[0], raw_x.shape[1] * raw_x.shape[2], raw_x.shape[3])
+        return raw_x
 
     def _flatten_regional_tokens(
         self,

@@ -31,16 +31,6 @@ from med_slim.data.feat_dataset import ssl_packed_collate_fn
 CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
 
 
-def _build_wandb_name(feat_dataset_cfg: dict) -> str:
-    datasets = feat_dataset_cfg.get("datasets") or []
-    names = [
-        str(ds["name"]).strip()
-        for ds in datasets
-        if isinstance(ds, dict) and ds.get("name")
-    ]
-    return "-".join(names) if names else "unknown"
-
-
 def _apply_cli_overrides(cfg: dict, args) -> None:
     """Override CLI flags into cfg so that the saved config.yaml matches the actual run."""
     feat_cfg = cfg.setdefault("feat_dataset", {})
@@ -62,23 +52,13 @@ def _apply_cli_overrides(cfg: dict, args) -> None:
 
     cobra_cfg["pooling"] = args.pooling
     cobra_cfg["sequence_encoder"] = args.sequence_encoder
-    if args.regional_tokens is not None:
-        cobra_cfg["regional_tokens"] = args.regional_tokens
-    cobra_cfg["region_embedding"] = bool(
-        args.region_embedding or cobra_cfg.get("region_embedding", False)
-    )
     cobra_cfg["physical_pe"] = bool(
         args.physical_pe or cobra_cfg.get("physical_pe", False)
     )
-    if args.num_epochs is not None:
-        if args.num_epochs < 1:
-            raise ValueError(f"--num-epochs must be >= 1, got {args.num_epochs}")
-        cfg["train"]["num_epochs"] = args.num_epochs
-        print(f"CLI override: train.num_epochs={args.num_epochs}")
     if args.regional_tokens is not None:
         if args.regional_tokens < 0:
             raise ValueError(f"--regional-tokens must be >= 0, got {args.regional_tokens}")
-        cfg["model"]["cobra"]["regional_tokens"] = args.regional_tokens
+        cobra_cfg["regional_tokens"] = args.regional_tokens
         print(f"CLI override: model.cobra.regional_tokens={args.regional_tokens}")
     
     # FM fusion / subset / router CLI overrides
@@ -121,7 +101,6 @@ def _apply_cli_overrides(cfg: dict, args) -> None:
 def _build_pretrain_run_name(cfg: dict, timestamp: str = CURR_TIME) -> str:
     """Compose the wandb run name from resolved config."""
     cobra_cfg = cfg["model"]["cobra"]
-    msp_tag = "-msp" if cfg.get("msp", {}).get("enabled", False) else ""
     datasets = cfg.get("feat_dataset", {}).get("datasets") or []
     names = [
         str(ds["name"]).strip()
@@ -131,7 +110,7 @@ def _build_pretrain_run_name(cfg: dict, timestamp: str = CURR_TIME) -> str:
     dataset_tag = "-".join(names) if names else "unknown"
     return (
         f"{dataset_tag}-{cobra_cfg['sequence_encoder']}-{cobra_cfg['pooling']}"
-        f"{msp_tag}-{timestamp}"
+        f"-{timestamp}"
     )
 
 
@@ -174,8 +153,9 @@ def main(args, cfg):
         )
 
     cobra_cfg = cfg["model"]["cobra"]
-    sequence_encoder = cobra_cfg["sequence_encoder"]
-    physical_pe = getattr(args, "physical_pe", False) or cobra_cfg.get("physical_pe", False)
+    sequence_encoder = cobra_cfg.get("sequence_encoder", args.sequence_encoder)
+    pooling = cobra_cfg.get("pooling", args.pooling)
+    physical_pe = cobra_cfg.get("physical_pe", False)
     regional_tokens = cobra_cfg.get("regional_tokens", 0)
 
     # FM fusion / router

@@ -6,7 +6,8 @@ feat_dataset:
     # Uncomment to use SupCon loss for labeled MRNet samples alongside InfoNCE.
     # Labeled samples get additional same-class positives; unlabeled samples use standard InfoNCE.
     - name: mrnet
-      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop_tiled_2x2" #"/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop_tiled_2x2"
+      feat_dir: "/hpcwork/rwth1833/feat_caches/MRNet/slices_raw/crop"
+      # Tiled caches (regional_tokens=4): .../slices_raw/crop_tiled_2x2
       # annotations_path: "/hpcwork/rwth1833/datasets/preprocessed/MRNet/train.csv"
       # target_columns: ["abnormal", "acl", "meniscus"]
     # Unlabeled (pure InfoNCE)
@@ -94,6 +95,8 @@ model:
     num_heads: 8
     num_layers: 2 # 2, 6, 12
     dropout: 0.2
+    # Sequence encoder and slice pooling are set by scripts/pretrain/pretrain.sh
+    # via --sequence-encoder and --pooling. Defaults there are mamba2 + abmil.
     # Mamba2-specific
     mamba_d_state: 128
     # Transformer-specific
@@ -109,7 +112,6 @@ model:
     # 0 = global CLS only. A positive perfect square (e.g. 4 for 2x2 tiles)
     # expects feature caches with 1 global + regional_tokens per-slice CLS tokens
     # and flattens [B, D, 1+regional_tokens, E] to [B, D*(1+regional_tokens), E].
-    # This does not use MSP or WithinSliceAggregator.
     regional_tokens: 0
     # FM fusion: how to combine foundation-model embeddings per slice.
     fm_pooling: router          # avg_pool | router

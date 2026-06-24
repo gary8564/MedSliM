@@ -111,7 +111,7 @@ REGIONAL_TOKENS="${REGIONAL_TOKENS:-0}"  # 0 = global CLS; 4 = global + 2x2 regi
 
 # FM fusion: how to combine FM embeddings per slice.
 FM_POOLING="router"               # avg_pool | router
-PER_FM_ADAPTER_MODE="per_dim"   # per_dim | per_fm_id (leave empty to use config default)
+PER_FM_ADAPTER_MODE="per_fm_id"   # per_dim | per_fm_id (leave empty to use config default)
 SSL_FM_MODE="subset"              # pair (cross-FM baseline) | subset (FM-set router/avg_pool SSL)
 FM_SUBSET_SIZE=4                  # FMs per view in subset mode (must be < num FMs)
 FM_SUBSET_MIN_OVERLAP=0           # min shared FMs between the two views
