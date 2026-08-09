@@ -238,6 +238,71 @@ class ZNormalization(tio.ZNormalization):
             raise RuntimeError(message)
         return standardized
 
+
+class ClipIntensity(tio.Transform):
+    """
+    Optionally clamp intensity values to a fixed range.
+
+    Either bound may be left open by passing ``None``. Intended for
+    model-specific medical preprocessing:
+
+    - CT foundation models often expect Hounsfield units clamped to a physical
+      range such as `[-1000, 1000]` before normalization.
+    - Curia's `clip_below_air` option only clamps the lower bound to air
+      (`min_value=-1000`) for CT. For MRI, set `enabled=False` so this transform acts as a no-op.
+    """
+
+    def __init__(
+        self,
+        min_value: Optional[float] = None,
+        max_value: Optional[float] = None,
+        enabled: bool = True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if enabled and min_value is None and max_value is None:
+            raise ValueError("ClipIntensity requires at least one of min_value or max_value.")
+        self.min_value = min_value
+        self.max_value = max_value
+        self.enabled = enabled
+        self.args_names = ['min_value', 'max_value', 'enabled']
+
+    def apply_transform(self, subject: Subject) -> Subject:
+        if not self.enabled:
+            return subject
+        for image in subject.get_images_dict().values():
+            data = image.data.float()
+            data = torch.clamp(data, min=self.min_value, max=self.max_value)
+            image.set_data(data)
+        return subject
+
+
+class PerSliceZScore(tio.Transform):
+    """
+    Z-score each in-plane slice independently, per channel.
+
+    Operates on TorchIO data shaped ``(C, W, H, D)`` and normalizes over the
+    in-plane axes ``(W, H)`` while keeping every slice along ``D`` independent.
+    Apply after ``EnsureSliceAxisLast`` so the slice axis is last. Matches
+    ``CuriaImageProcessor._zscore_per_image`` (unbiased std, blank slices left
+    mean-subtracted only).
+    """
+
+    def __init__(self, eps: float = 1e-6, **kwargs):
+        super().__init__(**kwargs)
+        self.eps = eps
+        self.args_names = ['eps']
+
+    def apply_transform(self, subject: Subject) -> Subject:
+        for image in subject.get_images_dict().values():
+            data = image.data.float()  # (C, W, H, D)
+            mean = data.mean(dim=(1, 2), keepdim=True)
+            std = data.std(dim=(1, 2), keepdim=True)
+            std = torch.where(std < self.eps, torch.ones_like(std), std)
+            image.set_data((data - mean) / std)
+        return subject
+
+
 class EnsureShapeMultiple(tio.EnsureShapeMultiple):
     """
     Ensure that all values in the image shape are divisible by :math:`n`.

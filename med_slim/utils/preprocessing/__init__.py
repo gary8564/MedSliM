@@ -1,4 +1,4 @@
-from .augmentation import ImageOrSubjectToTensor, ZNormalization, CropOrPad, CropOrPad2D, CropOrPad3D, EnsureShapeMultiple, ResizeInPlane, ResampleInPlane, AdaptivePreprocessing, EnsureSliceAxisLast, CropEmptySlices
+from .augmentation import ImageOrSubjectToTensor, ZNormalization, CropOrPad, CropOrPad2D, CropOrPad3D, EnsureShapeMultiple, ResizeInPlane, ResampleInPlane, AdaptivePreprocessing, EnsureSliceAxisLast, CropEmptySlices, ClipIntensity, PerSliceZScore
 from .slice_axis_resolver import (
     PLANE_NORMALS_RAS,
     PLANE_TO_AXIS,
