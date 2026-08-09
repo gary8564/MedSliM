@@ -34,9 +34,8 @@ class CuriaFeatureExtractor(nn.Module):
 
     Normalization:
         Curia does NOT use fixed dataset statistics (no ImageNet mean/std).
-        Per-slice z-score normalization — (x - mean_slice) / std_slice —
-        is applied inside forward(), matching CuriaImageProcessor exactly.
-        Do NOT apply any additional normalization in the dataloader.
+        Per-slice z-score normalization and optional CT air clipping, mirroring CuriaImageProcessor, are applied
+        by MedSliM's preprocessing transforms. 
 
     Notes:
         - The model weights are frozen by default (freeze=True in build_slice_encoder).
@@ -97,25 +96,6 @@ class CuriaFeatureExtractor(nn.Module):
             f"{sum(p.numel() for p in self.model.parameters()):,}",
         )
 
-    @staticmethod
-    def _zscore_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        """
-        Per-slice z-score normalization: (x - mean) / std.
-
-        Matches CuriaImageProcessor._zscore_per_image() exactly.
-        Slices with near-zero std (blank slices) are left mean-subtracted only.
-
-        Args:
-            x: [(B*D), 1, H, W] grayscale slices.
-
-        Returns:
-            Normalized tensor, same shape.
-        """
-        mean = x.mean(dim=(-2, -1), keepdim=True)
-        std  = x.std(dim=(-2, -1), keepdim=True)
-        std  = torch.where(std < eps, torch.ones_like(std), std)
-        return (x - mean) / std
-
     def _pool_patch_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         if self.spatial_pool_kernel_size is None or self.spatial_pool_kernel_size == 1:
             return patch_tokens
@@ -153,7 +133,6 @@ class CuriaFeatureExtractor(nn.Module):
         assert C == 1, f"Expected grayscale input (C=1), got C={C}"
 
         x = rearrange(x, "b c d h w -> (b d) c h w")      # [(B*D), 1, H, W]
-        x = self._zscore_normalize(x)                      # per-slice z-score
 
         outputs = self.model(pixel_values=x, return_dict=True)
 

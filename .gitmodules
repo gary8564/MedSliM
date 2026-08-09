@@ -1,3 +1,9 @@
 [submodule "med_slim/model/slice_encoder/mri_foundation"]
 	path = med_slim/model/slice_encoder/mri_foundation
 	url = https://github.com/mazurowski-lab/mri_foundation.git
+[submodule "med_slim/model/slice_encoder/MedDINOv3"]
+	path = med_slim/model/slice_encoder/MedDINOv3
+	url = https://github.com/ricklisz/MedDINOv3.git
+[submodule "med_slim/model/slice_encoder/FlexiCT"]
+	path = med_slim/model/slice_encoder/FlexiCT
+	url = https://github.com/ricklisz/FlexiCT.git

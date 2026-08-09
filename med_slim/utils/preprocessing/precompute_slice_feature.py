@@ -27,8 +27,46 @@ from med_slim.utils.model_config import get_slice_encoder_config
 
 load_dotenv()
 SPATIAL_MODES = ["resize", "resample", "crop", "adaptive"]
+MODALITIES = ["ct", "mri"]
+CT_ONLY_MODELS = ("med-dinov3", "flexict-2d")
+MRI_ONLY_MODELS = ("mri-core",)
+MODALITY_REQUIRED_MODELS = ("curia",)
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_modality(model_name: str, modality: Optional[str]) -> Optional[str]:
+    """
+    Resolve the effective CT/MRI modality for a model, validating combinations.
+
+    - `curia` is the only model whose preprocessing branches on modality (CT
+      air clipping on/off before per-slice z-score), so it requires an
+      explicit `--modality`.
+    - `med-dinov3` and `flexict-2d` always apply their fixed CT policy, and
+      `mri-core` always applies its fixed MRI policy, regardless of
+      `--modality`. Passing a conflicting value (e.g. `mri` for `med-dinov3`)
+      only logs a warning since it has no effect on the actual preprocessing.
+    - All other models return `None` by default. When an explicit `--modality`
+      value is specified, it is passed through unchanged but ignored by transform construction.
+    """
+    if model_name in MODALITY_REQUIRED_MODELS and modality is None:
+        raise ValueError(
+            f"Model '{model_name}' requires --modality to be specified. "
+            "Choose from ['ct', 'mri']."
+        )
+    if model_name in CT_ONLY_MODELS and modality == "mri":
+        logger.warning(
+            "Model '%s' always applies its fixed CT preprocessing policy; "
+            "--modality mri has no effect and is likely a mistake.",
+            model_name,
+        )
+    if model_name in MRI_ONLY_MODELS and modality == "ct":
+        logger.warning(
+            "Model '%s' always applies its fixed MRI preprocessing policy; "
+            "--modality ct has no effect and is likely a mistake.",
+            model_name,
+        )
+    return modality
 
 
 def _parse_mri_sequences(raw: Optional[list[str]] = None) -> Optional[str | list[str]]:
@@ -53,13 +91,15 @@ def get_num_slices(data_dir: str, split: str, plane: str) -> int:
 
 
 def build_transform(model_name: str, spatial_mode: str, plane: str,
-                    num_slices: int = None, crop_empty_slices: bool = False):
+                    num_slices: int = None, crop_empty_slices: bool = False,
+                    modality: Optional[str] = None):
     """Build the standard FM preprocessing transform."""
     if spatial_mode == "adaptive":
         return get_adaptive_transform(
             model_name=model_name,
             num_slices=num_slices,
             crop_empty_slices=crop_empty_slices,
+            modality=modality,
             to_tensor=False,
             plane=plane,
         )
@@ -69,6 +109,7 @@ def build_transform(model_name: str, spatial_mode: str, plane: str,
             num_slices=num_slices,
             spatial_mode=spatial_mode,
             crop_empty_slices=crop_empty_slices,
+            modality=modality,
             to_tensor=False,
             plane=plane,
         )
@@ -117,8 +158,13 @@ def main():
                         help="Use automatic mixed precision: 'fp16' or 'bf16' (recommended)")
     parser.add_argument("--model-name", type=str, default="dinov2",
                         choices=["ark", "curia", "dinov2", "dinov3", "rad-dino", "medsiglip",
-                                 "biomedclip", "mri-core", "medimageinsight"],
+                                 "biomedclip", "mri-core", "medimageinsight", "med-dinov3",
+                                 "flexict-2d"],
                         help="Slice encoder backbone.")
+    parser.add_argument("--modality", type=str, default=None, choices=MODALITIES,
+                        help="Acquisition modality of the dataset. Required only for curia, "
+                             "which uses it to decide whether to apply CT below-air HU clipping. "
+                             "Not required for other models.")
     parser.add_argument("--model-repo", type=str, default=None,
                         help="Optional HF repo override for DINO/MedSigLIP/CLIP.")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -167,6 +213,9 @@ def main():
     mri_sequences = _parse_mri_sequences(args.mri_sequences)
     if spatial_mode not in SPATIAL_MODES:
         raise ValueError(f"Unknown spatial_mode: {spatial_mode}. Choose from {SPATIAL_MODES}")
+
+    # Resolve CT/MRI modality (required for modality-aware models only).
+    modality = resolve_modality(args.model_name, args.modality)
 
     # Validate tiled multi-crop configuration
     regional_tokens = args.regional_tokens
@@ -221,6 +270,7 @@ def main():
             spatial_mode=spatial_mode,
             num_slices=num_slices,
             crop_empty_slices=False,
+            modality=modality,
             plane=args.plane,
         )
     else:
@@ -229,6 +279,7 @@ def main():
             spatial_mode=spatial_mode,
             num_slices=num_slices,
             crop_empty_slices=args.crop_empty_slices,
+            modality=modality,
             plane=args.plane,
         )
 
@@ -244,7 +295,7 @@ def main():
 
     logger.info(
         "Configuration: spatial_mode=%s, num_slices=%s, crop_empty_slices=%s, "
-        "batch_size=%d, plane=%s, split=%s, model_name=%s",
+        "batch_size=%d, plane=%s, split=%s, model_name=%s, modality=%s",
         spatial_mode,
         num_slices_for_logging,
         args.crop_empty_slices,
@@ -252,6 +303,7 @@ def main():
         args.plane,
         args.split,
         args.model_name,
+        modality,
     )
     if mri_sequences is not None:
         logger.info("  mri_sequences: %s", mri_sequences)
@@ -273,7 +325,6 @@ def main():
             "  curia_spatial_pool_kernel_size: %s",
             args.curia_spatial_pool_kernel_size,
         )
-
     folder_name = spatial_mode
     if tiled_mode:
         folder_name = f"{spatial_mode}_tiled_{grid_size}x{grid_size}"

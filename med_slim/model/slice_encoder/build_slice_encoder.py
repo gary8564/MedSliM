@@ -18,7 +18,7 @@ def build_slice_encoder(
     Factory to construct a pretrained 2D slice feature extractor.
 
     Args:
-        name: Name of the foundation model. ['ark', 'dinov2', 'dinov3', 'rad-dino', 'medsiglip', 'biomedclip', 'mri-core', 'medimageinsight']
+        name: Name of the foundation model. ['ark', 'dinov2', 'dinov3', 'rad-dino', 'medsiglip', 'biomedclip', 'mri-core', 'medimageinsight', 'curia', 'med-dinov3', 'flexict-2d']
         model_repo: Optional HF repo to override defaults for DINO/MedSigLIP/CLIP.
         checkpoint: Path to model checkpoint. Required for name='ark' and name='mri-core'.
         local_cache_dir: Local cache directory to store the model. If None, the default Hugging Face cache directory "~/.cache/huggingface/hub" will be used.
@@ -29,7 +29,7 @@ def build_slice_encoder(
     Returns:
         nn.Module: feature extractor model.
     """
-    valid_names = ["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core", "medimageinsight", "curia"]
+    valid_names = ["ark", "dinov2", "dinov3", "rad-dino", "medsiglip", "biomedclip", "mri-core", "medimageinsight", "curia", "med-dinov3", "flexict-2d"]
     assert name in valid_names, f"Slice encoder '{name}' not supported. Choose from {valid_names}."
     config = get_slice_encoder_config(name)
 
@@ -92,6 +92,20 @@ def build_slice_encoder(
             token_mode=curia_token_mode,
             spatial_pool_kernel_size=curia_spatial_pool_kernel_size,
         )
+
+    elif config["name"] == "med-dinov3":
+        from .med_dinov3 import MedDINOv3FeatureExtractor
+        repo = model_repo or config.get("repo", MedDINOv3FeatureExtractor.DEFAULT_HF_REPO)
+        model = MedDINOv3FeatureExtractor(
+            checkpoint_path=checkpoint,
+            hf_repo=repo,
+            local_cache_dir=local_cache_dir,
+        )
+
+    elif config["name"] == "flexict-2d":
+        from .flexict_2d import FlexiCT2DFeatureExtractor
+        ckpt = checkpoint or config.get("repo", FlexiCT2DFeatureExtractor.DEFAULT_CHECKPOINT)
+        model = FlexiCT2DFeatureExtractor(checkpoint_path=ckpt)
 
     else:
         raise ValueError(f"Unknown slice encoder name: {name}")
