@@ -29,13 +29,14 @@ from med_slim.data.feat_dataset import (
     FeatClassificationDataset,
     linear_classifier_collate_fn,
 )
-from med_slim.eval.load_cobra import load_pretrained_cobra, resolve_eval_fm_ids
+from med_slim.eval.load_cobra import load_pretrained_cobra, resolve_eval_fm_ids, resolve_raw_aggregation_fm
 from med_slim.utils.metrics.linear import get_num_classes
 from med_slim.utils.viz.linear import compute_and_visualize_metrics
 from med_slim.utils.label_metadata import (
     get_dataset_metadata,
     get_annotation_paths_by_split,
     build_multiclass_label_names,
+    build_run_label_tag,
 )
 from med_slim.logging.setup import init_logging
 
@@ -436,11 +437,11 @@ def main(args):
         raise ValueError("Only single-view KNN is supported.")
     view_plane = view_planes[0]
 
-    target_labels_str = "_".join(cfg["target_labels"])
+    run_label_tag = build_run_label_tag(cfg["task"], cfg["target_labels"], view_plane)
     k_str = "_".join(str(k) for k in args.nb_knn)
     output_dir = os.path.join(
         cfg["output_dir"],
-        f"knn_{target_labels_str}_{view_plane}_k{k_str}_{CURR_TIME}",
+        f"knn_{run_label_tag}_k{k_str}_{CURR_TIME}",
     )
 
     checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg["checkpoint_path"]
@@ -471,18 +472,19 @@ def main(args):
         slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
     )
 
-    # Determine raw FM output dimension when pooling_target='raw'
-    raw_output_dim = None
-    if resolved_pooling_target == "raw":
-        if fm_pooling == "router":
-            raise ValueError(
-                f"pooling_target='raw' bypasses FM fusion and is not valid with fm_pooling='{fm_pooling}'. "
-                "Use pooling_target='post_embed' or 'post_encoder'."
-            )
-        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
-        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
+    # Determine raw FM output dimension and aggregation FM when pooling_target='raw'
+    raw_aggregation_index, raw_output_dim, raw_aggregation_fm = resolve_raw_aggregation_fm(
+        resolved_pooling_target, model_names, pretrain_cfg, args.raw_aggregation_fm
+    )
+    if accelerator.is_main_process and raw_aggregation_fm is not None:
+        logger.info(
+            f"pooling_target='raw': aggregating raw features from FM '{raw_aggregation_fm}' "
+            f"(index {raw_aggregation_index} of {model_names})"
+        )
     cfg["pooling_target"] = resolved_pooling_target
     cfg["raw_output_dim"] = raw_output_dim
+    cfg["raw_aggregation_index"] = raw_aggregation_index
+    cfg["raw_aggregation_fm"] = raw_aggregation_fm
     cfg["fm_pooling"] = fm_pooling
     cfg["fm_id_order"] = fm_id_order
     cfg["eval_fm_ids"] = eval_fm_ids
@@ -491,7 +493,7 @@ def main(args):
     if accelerator.is_main_process:
         wandb.init(
             project="medslim-knn",
-            name=f"{dataset_name}_{target_labels_str}_knn",
+            name=f"{dataset_name}_{run_label_tag}_knn",
             config={**cfg, "nb_knn": args.nb_knn, "temperature": args.temperature},
             dir=output_dir,
         )
@@ -515,6 +517,7 @@ def main(args):
         slice_pooling=args.slice_pooling,
         pooling_target=resolved_pooling_target,
         raw_output_dim=raw_output_dim,
+        raw_aggregation_index=raw_aggregation_index,
     )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
@@ -598,7 +601,13 @@ if __name__ == "__main__":
         "--pooling-target", type=str, choices=["post_encoder", "post_embed", "raw"], default=None,
         help="Which representation level ABMIL attention weights aggregate. "
              "Raw pooling uses original FM embeddings and flattens tiled tokens when present. "
+             "With multiple eval FMs, shared multi-FM attention is transferred to the FM explicitly specified by --raw-aggregation-fm. "
              "If using default None, Cobra resolves to raw for global-only FM caches and post_embed for tiled multi-crop CLS caches.",
+    )
+    parser.add_argument(
+        "--raw-aggregation-fm", type=str, default=None,
+        help="Name of the evaluated FM whose raw features are aggregated when --pooling-target=raw. "
+             "Required when more than one FM is evaluated (i.e., --fm-model-names has more than one entry).",
     )
     parser.add_argument(
         "--fm-pooling", type=str, choices=["avg_pool", "router"], default=None,

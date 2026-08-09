@@ -727,6 +727,152 @@ def test_cobra_per_fm_id_pretrain_subset_embed_requires_fm_ids():
             model._embed_subset_fm_set(x, dims, fm_ids=None)
 
 
+# Explicit raw aggregation FM (pooling_target='raw')
+def test_cobra_raw_pooling_requires_raw_aggregation_index():
+    with pytest.raises(ValueError, match="raw_aggregation_index is required"):
+        Cobra(
+            embed_dim=64,
+            contrast_dim=32,
+            input_dims=[64],
+            num_heads=4,
+            num_layers=1,
+            dropout=0.0,
+            mode="inference",
+            sequence_encoder="transformer",
+            slice_pooling="abmil",
+            pooling_target="raw",
+            raw_output_dim=64,
+            att_dim=32,
+        )
+
+
+def test_cobra_raw_pooling_single_fm_matches_manual_bmm():
+    """K=1: raw pooling aggregates the sole FM's raw features regardless of raw_aggregation_index."""
+    batch_size, num_slices, feat_dim = 2, 6, 64
+    model = Cobra(
+        embed_dim=64,
+        contrast_dim=32,
+        input_dims=[64],
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        sequence_encoder="transformer",
+        slice_pooling="abmil",
+        pooling_target="raw",
+        raw_output_dim=64,
+        raw_aggregation_index=0,
+        att_dim=32,
+    ).to(DEVICE).eval()
+
+    x = torch.randn(batch_size, num_slices, feat_dim, device=DEVICE)
+    with torch.no_grad():
+        y_list = model([x])
+        y_tensor = model(x)  # bare tensor is normalized to a length-1 list
+        A = model([x], get_attention=True)
+        expected = torch.bmm(A, x).squeeze(1)
+
+    assert y_list.shape == (batch_size, feat_dim)
+    assert torch.allclose(y_list, expected, atol=1e-6)
+    assert torch.allclose(y_tensor, expected, atol=1e-6)
+
+
+def _build_multi_fm_raw_cobra(fm_pooling="avg_pool", raw_aggregation_index=0, num_fms=None, raw_output_dim=None, **kwargs):
+    dims = [64, 96]
+    if raw_output_dim is None:
+        raw_output_dim = dims[raw_aggregation_index] if 0 <= raw_aggregation_index < len(dims) else 64
+    return Cobra(
+        embed_dim=64,
+        contrast_dim=32,
+        input_dims=dims,
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        mode="inference",
+        sequence_encoder="transformer",
+        slice_pooling="abmil",
+        fm_pooling=fm_pooling,
+        num_fms=num_fms,
+        pooling_target="raw",
+        raw_output_dim=raw_output_dim,
+        raw_aggregation_index=raw_aggregation_index,
+        att_dim=32,
+        **kwargs,
+    ).to(DEVICE).eval()
+
+
+def test_cobra_raw_pooling_multi_fm_avg_pool_selects_named_index():
+    """K=2 heterogeneous-dim FMs, avg_pool fusion: raw pooling aggregates only the selected FM."""
+    batch_size, num_slices = 2, 5
+    x = [
+        torch.randn(batch_size, num_slices, 64, device=DEVICE),
+        torch.randn(batch_size, num_slices, 96, device=DEVICE),
+    ]
+
+    model0 = _build_multi_fm_raw_cobra(raw_aggregation_index=0)
+    with torch.no_grad():
+        y0 = model0(x)
+        A0 = model0(x, get_attention=True)
+    assert y0.shape == (batch_size, 64)
+    assert torch.allclose(y0, torch.bmm(A0, x[0]).squeeze(1), atol=1e-6)
+
+    model1 = _build_multi_fm_raw_cobra(raw_aggregation_index=1)
+    model1.load_state_dict(model0.state_dict())  # share weights for a like-for-like attention map
+    with torch.no_grad():
+        y1 = model1(x)
+        A1 = model1(x, get_attention=True)
+    assert y1.shape == (batch_size, 96)
+    assert torch.allclose(y1, torch.bmm(A1, x[1]).squeeze(1), atol=1e-6)
+
+    # Shared multi-FM attention (from the fused, sequence-encoded representation) is
+    # identical regardless of which FM's raw features it is ultimately applied to.
+    assert torch.allclose(A0, A1, atol=1e-6)
+
+
+def test_cobra_raw_pooling_multi_fm_router_allowed():
+    """Router SSL checkpoints may now use pooling_target='raw' via an explicit raw_aggregation_index."""
+    batch_size, num_slices = 2, 5
+    model = _build_multi_fm_raw_cobra(fm_pooling="router", raw_aggregation_index=1, num_fms=4)
+    assert model.fm_router is not None
+
+    x = [
+        torch.randn(batch_size, num_slices, 64, device=DEVICE),
+        torch.randn(batch_size, num_slices, 96, device=DEVICE),
+    ]
+    fm_ids = torch.tensor([0, 2], dtype=torch.long, device=DEVICE)
+
+    with torch.no_grad():
+        y = model(x, fm_ids=fm_ids)
+        A = model(x, fm_ids=fm_ids, get_attention=True)
+
+    assert y.shape == (batch_size, 96)
+    assert torch.allclose(y, torch.bmm(A, x[1]).squeeze(1), atol=1e-6)
+
+
+def test_cobra_raw_pooling_out_of_range_index_raises():
+    batch_size, num_slices = 2, 5
+    model = _build_multi_fm_raw_cobra(raw_aggregation_index=5)  # only 2 FMs will be passed
+    x = [
+        torch.randn(batch_size, num_slices, 64, device=DEVICE),
+        torch.randn(batch_size, num_slices, 96, device=DEVICE),
+    ]
+    with pytest.raises(ValueError, match="raw_aggregation_index=5 is invalid"):
+        model(x)
+
+
+def test_select_raw_aggregation_fm_helper():
+    """Unit-test the selection helper directly, including the non-list passthrough case."""
+    model = _build_multi_fm_raw_cobra(raw_aggregation_index=1)
+    single_tensor = torch.randn(2, 4, 64, device=DEVICE)
+    assert model._select_raw_aggregation_fm(single_tensor) is single_tensor
+
+    one_fm = [torch.randn(2, 4, 64, device=DEVICE)]
+    assert model._select_raw_aggregation_fm(one_fm) is one_fm[0]
+
+    two_fms = [torch.randn(2, 4, 64, device=DEVICE), torch.randn(2, 4, 96, device=DEVICE)]
+    assert model._select_raw_aggregation_fm(two_fms) is two_fms[1]
+
+
 def test_cobra_per_fm_id_inference_embed_selects_adapter_by_fm_id():
     model = _build_per_fm_cobra(mode="inference", fm_input_dims=(64, 128, 128), num_fms=3)
     batch_size, num_slices = 2, 4

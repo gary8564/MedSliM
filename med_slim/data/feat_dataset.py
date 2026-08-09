@@ -456,12 +456,14 @@ class PrecomputedFeatPairDataset(Dataset):
                     f"fm_subset_min_overlap must satisfy 0 <= overlap <= fm_subset_size "
                     f"({fm_subset_size}); got {fm_subset_min_overlap}."
                 )
+            min_possible_overlap = max(0, 2 * fm_subset_size - self.num_fms)
             fm_max_overlap = (
                 fm_subset_max_overlap
                 if fm_subset_max_overlap is not None
                 else fm_subset_size - 1
             )
-            # Cap at fm_subset_size - 1 so the two views can never be forced identical.
+            # Cap at fm_subset_size - 1 so the two views can never be forced identical,
+            # then lift to the finite-population minimum if zero overlap is impossible.
             fm_max_overlap = min(fm_max_overlap, fm_subset_size - 1)
             if fm_max_overlap < fm_subset_min_overlap:
                 raise ValueError(
@@ -517,42 +519,71 @@ class PrecomputedFeatPairDataset(Dataset):
         
     def _get_feat_path_dict_by_study_id(self):
         """
-        Build a dictionary mapping study_id -> view_plane -> list of MRI sequence UIDs.
-        
+        Build a dictionary mapping `study_id` -> `view_plane` -> list of MRI sequence UIDs.
+
+        Planes listed in `view_planes` but missing under a dataset (e.g. OAI has no
+        axial caches) are skipped for that dataset. `__getitem__` then samples only
+        from each study's available planes.
+
         Returns:
             Dict[str, Dict[str, List[str]]]:
-                study_id -> plane -> [uid1, uid2, ...]
+                `study_id` -> `view_plane` -> [uid1, uid2, ...]
         """
         logger.info(f'Selected slice encoder models: {self.slice_encoder_models}')
         logger.info(f'Selected view planes: {self.view_planes}')
         
         ref_fm = self.slice_encoder_models[0]
         feat_path_dict = defaultdict(lambda: defaultdict(list))
+        # (dataset_name, view_plane) pairs that exist for the reference FM.
+        indexed_planes: set[tuple[str, str]] = set()
         
         for dataset in tqdm(self.feat_dirs, desc="Loading precomputed feature datasets...", leave=False):
             dataset_name = dataset["name"]
             feat_dir = dataset["feat_dir"]
+            planes_found = 0
             
             for view_plane in self.view_planes:
                 feat_path = os.path.join(feat_dir, ref_fm, self.split, view_plane)
                 
                 if not os.path.exists(feat_path):
-                    raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
+                    logger.warning(
+                        "Skipping missing plane cache for dataset '%s': %s "
+                        "(other planes for this dataset are still used).",
+                        dataset_name,
+                        feat_path,
+                    )
+                    continue
                 
                 feat_files = glob(os.path.join(feat_path, "*.safetensors"))
-                assert len(feat_files) > 0, f"Couldn't find any feat files in path {feat_path}!"
-                
+                if len(feat_files) == 0:
+                    raise FileNotFoundError(
+                        f"Couldn't find any feat files in path {feat_path}!"
+                    )
+
+                planes_found += 1
+                indexed_planes.add((dataset_name, view_plane))
                 for feat_file in feat_files:
                     uid = os.path.basename(feat_file).split(".")[0]
                     exam_id = self._extract_exam_id(uid)
                     study_id = f"{dataset_name}_{exam_id}"
                     feat_path_dict[study_id][view_plane].append(uid)
                     self.feat_dir_map[study_id] = feat_dir
+
+            if planes_found == 0:
+                raise FileNotFoundError(
+                    f"Dataset '{dataset_name}' has no feature caches under {feat_dir} "
+                    f"for reference FM '{ref_fm}' and any of planes={list(self.view_planes)} "
+                    f"(split='{self.split}')."
+                )
         
         # Validate all FMs have consistent feature files with the reference FM
         for dataset in self.feat_dirs:
+            dataset_name = dataset["name"]
             feat_dir = dataset["feat_dir"]
             for view_plane in self.view_planes:
+                if (dataset_name, view_plane) not in indexed_planes:
+                    continue
+
                 ref_path = os.path.join(feat_dir, ref_fm, self.split, view_plane)
                 ref_uids = {os.path.basename(f).split(".")[0] 
                             for f in glob(os.path.join(ref_path, "*.safetensors"))}

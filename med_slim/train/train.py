@@ -28,13 +28,17 @@ from med_slim.model.ssl import MoCo
 from med_slim.data import PrecomputedFeatPairDataset
 from med_slim.data.feat_dataset import ssl_packed_collate_fn
 
-CURR_TIME = datetime.now().strftime("%Y-%m-%d-%H:%M")
+JOB_ID = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+CURR_TIME = f"{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}_{JOB_ID}"
 
 
 def _apply_cli_overrides(cfg: dict, args) -> None:
     """Override CLI flags into cfg so that the saved config.yaml matches the actual run."""
     feat_cfg = cfg.setdefault("feat_dataset", {})
     cobra_cfg = cfg.setdefault("model", {}).setdefault("cobra", {})
+
+    if args.num_epochs is not None:
+        cfg.setdefault("train", {})["num_epochs"] = args.num_epochs
 
     if args.model_names:
         fm_choices = {m["name"]: m["embed_dim"] for m in cfg["model"]["slice_encoder_models"]}
@@ -112,6 +116,19 @@ def _build_pretrain_run_name(cfg: dict, timestamp: str = CURR_TIME) -> str:
         f"{dataset_tag}-{cobra_cfg['sequence_encoder']}-{cobra_cfg['pooling']}"
         f"-{timestamp}"
     )
+
+
+def _reset_router_log_temperature(model: MoCo, temperature: float) -> None:
+    """Reinitialize router softmax temperature after curriculum weight transfer."""
+    log_t = torch.log(torch.tensor(float(temperature)))
+    for encoder_name in ("base_encoder", "momentum_encoder"):
+        encoder = getattr(model, encoder_name, None)
+        router = getattr(encoder, "fm_router", None) if encoder is not None else None
+        if router is None or not hasattr(router, "log_temperature"):
+            continue
+        router.log_temperature.copy_(
+            log_t.to(device=router.log_temperature.device, dtype=router.log_temperature.dtype)
+        )
 
 
 def validate_args(args) -> None:
@@ -272,6 +289,13 @@ def main(args, cfg):
             f"min_overlap={ssl_cfg.get('fm_subset_min_overlap', 1)}, "
             f"max_overlap={ssl_cfg.get('fm_subset_max_overlap')}"
         )
+    cache_in_memory = args.cache_in_memory
+    if cache_in_memory:
+        print("Feature loading: cache_in_memory=True (full dataset preload into RAM)")
+    else:
+        print(
+            "Feature loading: cache_in_memory=False (read from disk each batch; prefer staging to local NVMe on node's SSD)"
+        )
     dataset = PrecomputedFeatPairDataset(
         feat_dirs=feat_dirs,
         slice_encoder_models=slice_encoder_models,
@@ -279,7 +303,7 @@ def main(args, cfg):
         split="train",
         max_feature_dim=max_feature_dim,
         num_target_slices=num_target_slices,
-        cache_in_memory=True,
+        cache_in_memory=cache_in_memory,
         use_packed=use_packed,
         ssl_fm_mode=ssl_fm_mode,
         fm_subset_size=ssl_cfg.get("fm_subset_size"),
@@ -298,16 +322,22 @@ def main(args, cfg):
     per_device_batch_size = max(1, int(global_batch_size / max(1, accelerator.num_processes)))
     print(f"Batch size per device: {per_device_batch_size}")
     print(f"Sequence mode: {'packed' if use_packed else 'random subsampling'}")
-    
+
+    # When CACHE_IN_MEMORY=false (required under 120G/1-GPU), fewer workers / less prefetch to avoid pushing over the limit.
+    num_workers = cfg["train"]["num_workers"]
+    prefetch_factor = 4 if cache_in_memory else 2
+    num_workers = min(num_workers, 8) if not cache_in_memory else num_workers
+    print(f"DataLoader: num_workers={num_workers}, prefetch_factor={prefetch_factor}")
+
     loader = DataLoader(
         dataset,
         batch_size=per_device_batch_size,
         shuffle=True,
-        num_workers=cfg["train"]["num_workers"],
+        num_workers=num_workers,
         drop_last=True,
         pin_memory=True,
-        persistent_workers=True,  # Keep workers alive between epochs
-        prefetch_factor=4,  # Prefetch 4 batches per worker
+        persistent_workers=num_workers > 0, # Keep workers alive between epochs when num_workers > 0
+        prefetch_factor=prefetch_factor if num_workers > 0 else None, # Prefetch factor for the DataLoader
         collate_fn=ssl_packed_collate_fn if use_packed else None,
     )
 
@@ -342,6 +372,13 @@ def main(args, cfg):
             # Use this when changing datasets (e.g., MRNet -> MRNet+fastMRI)
             print("Curriculum learning mode: loaded model weights, reset optimizer and epoch counter")
             print("Starting fresh training from epoch 0 with new dataset configuration")
+            if args.router_temperature is not None:
+                _reset_router_log_temperature(
+                    accelerator.unwrap_model(model), args.router_temperature
+                )
+                print(
+                    f"Curriculum: reset router log_temperature to {args.router_temperature}"
+                )
         else:
             # Standard resume: continue training from saved state
             start_epoch = checkpoint.get("epoch", 0)
@@ -673,6 +710,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--router-confidence-weight", type=float, default=None,
         help="Weight for router confidence (low-entropy) loss. Overrides config router.confidence_weight.",
+    )
+    parser.add_argument(
+        "--cache-in-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Preload all feature tensors into RAM at init (default). "
+            "Use --no-cache-in-memory when the dataset exceeds the host-RAM budget "
+            "(e.g. large pretraining datasets under the GPU memory quota limits)."
+        ),
     )
     args = parser.parse_args()
     

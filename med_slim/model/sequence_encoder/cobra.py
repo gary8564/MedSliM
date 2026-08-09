@@ -115,6 +115,7 @@ class Cobra(nn.Module):
         slice_pooling: str = "abmil",
         pooling_target: Optional[str] = None,
         raw_output_dim: int = None,
+        raw_aggregation_index: Optional[int] = None,
         physical_pe: bool = False,
         regional_tokens: int = 0,
         num_fms: Optional[int] = None,
@@ -151,11 +152,25 @@ class Cobra(nn.Module):
                 - 'abmil': ABMIL attention weights come from encoder output; pooling_target
                   selects which features they aggregate ('raw', 'post_embed', or
                   'post_encoder'). For tiled features, 'raw' pools flattened global
-                  and regional FM tokens.
+                  and regional FM tokens. With K>1 inference FMs, 'raw' applies the
+                  shared multi-FM attention (computed from the avg_pool- or
+                  router-fused, sequence-encoded representation of all K FMs) to
+                  exactly one FM's raw features, selected by ``raw_aggregation_index``.
+                  This mirrors the weighting-FM/aggregation-FM split used by the
+                  original COBRA at inference time (see
+                  https://github.com/KatherLab/COBRA/blob/main/cobra/inference/extract_feats.py),
+                  generalized from one weighting FM to K.
                 - 'cls': not applicable, volume embedding is always the
                   sequence-encoder CLS token. Resolved pooling_target is None
             raw_output_dim: FM embedding dimension for the 'raw' pooling target.
                 Required in inference mode when the resolved pooling_target is 'raw'.
+                Must equal the embedding dimension of the FM selected by
+                ``raw_aggregation_index``.
+            raw_aggregation_index: Index into the inference FM-set list (the ``x``
+                passed to ``forward``) of the FM whose raw features are aggregated
+                when pooling_target='raw'. Required in inference mode when the
+                resolved pooling_target is 'raw'. For single-FM inference (K=1)
+                this is simply 0.
             physical_pe: If True, add sinusoidal positional encoding based on normalized relative slice depth in [0, 1] before the sequence encoder.
                 Requires ``physical_positions`` to be passed during forward.
             regional_tokens: Number of regional crop tokens per slice for tiled multi-crop CLS (e.g. 4 for a 2x2 grid). 0 (default) disables tiled
@@ -207,18 +222,29 @@ class Cobra(nn.Module):
             regional_tokens,
             slice_pooling=slice_pooling,
         )
-        if (
-            mode == "inference"
-            and resolved_pooling_target == "raw"
-            and slice_pooling != "cls"
-            and raw_output_dim is None
-        ):
-            raise ValueError("raw_output_dim is required when pooling_target='raw' in inference mode.")
+        if mode == "inference" and resolved_pooling_target == "raw" and slice_pooling != "cls":
+            if raw_output_dim is None:
+                raise ValueError("raw_output_dim is required when pooling_target='raw' in inference mode.")
+            if raw_aggregation_index is None:
+                raise ValueError(
+                    "raw_aggregation_index is required when pooling_target='raw' in inference mode. "
+                    "It selects which FM (by position in the inference FM list passed to forward()) "
+                    "supplies the raw features that shared multi-FM attention aggregates. "
+                    "Resolve it once per evaluation run, e.g. via "
+                    "med_slim.eval.load_cobra.resolve_raw_aggregation_fm."
+                )
+            if raw_aggregation_index < 0:
+                raise ValueError(f"raw_aggregation_index must be >= 0, got {raw_aggregation_index}.")
+            logger.info(
+                f"pooling_target='raw': shared multi-FM attention will aggregate raw features "
+                f"from inference FM index {raw_aggregation_index} (raw_output_dim={raw_output_dim})."
+            )
 
         self.mode = mode
         self.embed_dim = embed_dim
         self.pooling_target = resolved_pooling_target
         self._raw_output_dim = raw_output_dim
+        self.raw_aggregation_index = raw_aggregation_index
         self.sequence_encoder = sequence_encoder
         self.fm_pooling = fm_pooling
         self.num_fms = num_fms
@@ -621,6 +647,35 @@ class Cobra(nn.Module):
         if packed:
             return x.shape[1] if x.dim() == 3 else 1
         return x.shape[2] if x.dim() == 4 else 1
+
+    def _select_raw_aggregation_fm(self, x) -> torch.Tensor:
+        """
+        Select the raw FM tensor that pooling_target='raw' aggregates.
+
+        Shared multi-FM attention (fused across all inference FMs via avg_pool or
+        router, then sequence-encoded) is transferred to exactly one named FM's raw
+        features via ``raw_aggregation_index`` -- the multi-FM generalization of the
+        original COBRA weighting/aggregation-FM split at inference time (see
+        https://github.com/KatherLab/COBRA/blob/main/cobra/inference/extract_feats.py).
+
+        Args:
+            x: List of K inference FM tensors, or a single tensor for pair-SSL-style
+               single-FM inputs that never go through the FM-set list path.
+
+        Returns:
+            The selected raw FM tensor.
+        """
+        if not isinstance(x, list):
+            return x
+        if len(x) == 1:
+            return x[0]
+        if self.raw_aggregation_index is None or self.raw_aggregation_index >= len(x):
+            raise ValueError(
+                f"raw_aggregation_index={self.raw_aggregation_index} is invalid for an "
+                f"inference FM set of size {len(x)}. It must be a valid index into the "
+                "FM list selecting which FM's raw features to aggregate."
+            )
+        return x[self.raw_aggregation_index]
 
     def _flatten_raw_tiled_regions(self, raw_x: torch.Tensor, *, packed: bool = False) -> torch.Tensor:
         """Flatten raw tiled FM features to match ABMIL token attention length."""
@@ -1121,11 +1176,7 @@ class Cobra(nn.Module):
         if self.pooling_target == "post_encoder":
             return torch.bmm(A, h_padded).squeeze(1)        # [B, embed_dim]
         elif self.pooling_target == "raw":
-            if isinstance(x, list):
-                logger.info("Multi-FM mode: using first FM embedding dimension for raw pooling")
-                raw_x = x[0]
-            else:
-                raw_x = x
+            raw_x = self._select_raw_aggregation_fm(x)
             raw_x = self._flatten_raw_tiled_regions(raw_x, packed=True)
             raw_padded, _ = self._packed_to_padded(raw_x, cu_seqlens, max_seqlen)
             return torch.bmm(A, raw_padded).squeeze(1)    # [B, raw_output_dim]
@@ -1230,11 +1281,7 @@ class Cobra(nn.Module):
         if self.pooling_target == "post_encoder":
             return torch.bmm(A, h).squeeze(1)  # [B, embed_dim]
         elif self.pooling_target == "raw":
-            if isinstance(x, list):
-                logger.info("Multi-FM mode: using first FM embedding dimension for raw pooling")
-                raw_x = x[0]
-            else:
-                raw_x = x
+            raw_x = self._select_raw_aggregation_fm(x)
             raw_x = self._flatten_raw_tiled_regions(raw_x, packed=False)
             return torch.bmm(A, raw_x).squeeze(1)  # [B, raw_output_dim]
         else:  # post_embed

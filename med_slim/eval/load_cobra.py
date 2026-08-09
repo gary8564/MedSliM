@@ -44,6 +44,70 @@ def resolve_eval_fm_ids(
     return [name_to_id[name] for name in model_names]
 
 
+def resolve_raw_aggregation_fm(
+    pooling_target: Optional[str],
+    model_names: list[str],
+    pretrain_cfg: Dict,
+    raw_aggregation_fm: Optional[str] = None,
+) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    Resolve which evaluated FM supplies raw features for pooling_target='raw'.
+
+    Shared multi-FM attention (fused across all evaluated FMs via avg_pool or
+    router, then sequence-encoded) is applied to selected FM's raw features. 
+    This is the multi-FM generalization of the original COBRA weighting/aggregation-FM split
+    at inference time (see https://github.com/KatherLab/COBRA/blob/main/cobra/inference/extract_feats.py).
+
+    Args:
+        pooling_target: Resolved pooling target. Returns (None, None, None) when
+            this is not 'raw'.
+        model_names: Ordered names of the FMs evaluated -- the same order Cobra
+            receives as the ``x`` list at inference.
+        pretrain_cfg: Pretraining config, used to look up each FM's raw embedding
+            dimension in ``model.slice_encoder_models``.
+        raw_aggregation_fm: Name of the FM whose raw features should be
+            aggregated. Required when ``len(model_names) > 1``; inferred
+            automatically as the sole evaluated FM when ``len(model_names) == 1``.
+
+    Returns:
+        (raw_aggregation_index, raw_output_dim, raw_aggregation_fm_name) or
+        (None, None, None) when pooling_target != 'raw'.
+    """
+    if pooling_target != "raw":
+        return None, None, None
+
+    if len(model_names) == 1:
+        resolved_name = model_names[0]
+        if raw_aggregation_fm is not None and raw_aggregation_fm != resolved_name:
+            raise ValueError(
+                f"raw_aggregation_fm='{raw_aggregation_fm}' does not match the only "
+                f"evaluated FM '{resolved_name}'."
+            )
+    else:
+        if raw_aggregation_fm is None:
+            raise ValueError(
+                "pooling_target='raw' with multiple evaluated FMs requires an explicit "
+                "raw_aggregation_fm naming which FM's raw features shared multi-FM "
+                f"attention should aggregate. Evaluated FMs: {model_names}."
+            )
+        if raw_aggregation_fm not in model_names:
+            raise ValueError(
+                f"raw_aggregation_fm='{raw_aggregation_fm}' must be one of the evaluated "
+                f"FMs {model_names}."
+            )
+        resolved_name = raw_aggregation_fm
+
+    fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
+    if resolved_name not in fm_configs:
+        raise ValueError(
+            f"raw_aggregation_fm='{resolved_name}' not found in pretrain config "
+            "model.slice_encoder_models."
+        )
+    raw_aggregation_index = model_names.index(resolved_name)
+    raw_output_dim = fm_configs[resolved_name]["embed_dim"]
+    return raw_aggregation_index, raw_output_dim, resolved_name
+
+
 def _build_cobra(
     model_config: Dict,
     sequence_encoder: str,
@@ -51,6 +115,7 @@ def _build_cobra(
     fm_pooling: str,
     pooling_target: Optional[str] = None,
     raw_output_dim: Optional[int] = None,
+    raw_aggregation_index: Optional[int] = None,
     physical_pe: Optional[bool] = None,
     regional_tokens: Optional[int] = None,
     num_fms: Optional[int] = None,
@@ -98,6 +163,7 @@ def _build_cobra(
         slice_pooling=slice_pooling,
         pooling_target=pooling_target,
         raw_output_dim=raw_output_dim,
+        raw_aggregation_index=raw_aggregation_index,
         physical_pe=physical_pe,
         regional_tokens=regional_tokens,
         num_fms=num_fms,
@@ -150,6 +216,7 @@ def load_pretrained_cobra(
     slice_pooling: Optional[str] = None,
     pooling_target: Optional[str] = None,
     raw_output_dim: Optional[int] = None,
+    raw_aggregation_index: Optional[int] = None,
     physical_pe: Optional[bool] = None,
 ) -> Cobra:
     """
@@ -166,6 +233,9 @@ def load_pretrained_cobra(
     - pooling_target (str, optional): Which representation to pool at inference ('post_encoder', 'post_embed', 'raw'). 
      If None, Cobra resolves a safe default from mode and slice pooling.
     - raw_output_dim (int, optional): FM embedding dimension, required when pooling_target='raw'.
+    - raw_aggregation_index (int, optional): Index into the evaluated FM list of the FM whose raw
+     features are aggregated, required when pooling_target='raw'. Resolve via
+     ``resolve_raw_aggregation_fm``.
 
     Returns:
     - Cobra: The loaded COBRA model in inference mode.
@@ -253,8 +323,8 @@ def load_pretrained_cobra(
 
     model = _build_cobra(
         model_config, sequence_encoder, slice_pooling, fm_pooling, pooling_target,
-        raw_output_dim, physical_pe, regional_tokens, num_fms=num_fms, per_fm_adapter_mode=per_fm_adapter_mode,
-        fm_input_dims=fm_input_dims, router_kwargs=router_kwargs,
+        raw_output_dim, raw_aggregation_index, physical_pe, regional_tokens, num_fms=num_fms,
+        per_fm_adapter_mode=per_fm_adapter_mode, fm_input_dims=fm_input_dims, router_kwargs=router_kwargs,
     )
     logger.info(f"Inference pooling_target={model.pooling_target}")
 
@@ -342,6 +412,7 @@ def load_cobra_from_experiment(
     regional_tokens = int(cobra_cfg.get("regional_tokens", cfg.get("regional_tokens", 0)))
     pooling_target = cfg.get("pooling_target")
     raw_output_dim = cfg.get("raw_output_dim")
+    raw_aggregation_index = cfg.get("raw_aggregation_index")
 
     has_within_slice = any(k.startswith("cobra.within_slice_agg.") for k in raw.keys())
     if has_within_slice:
@@ -369,6 +440,7 @@ def load_cobra_from_experiment(
         fm_pooling,
         pooling_target=pooling_target,
         raw_output_dim=raw_output_dim,
+        raw_aggregation_index=raw_aggregation_index,
         physical_pe=physical_pe,
         regional_tokens=regional_tokens,
         num_fms=num_fms,

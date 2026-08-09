@@ -3,7 +3,11 @@ import pytest
 import torch
 from accelerate import Accelerator
 
-from med_slim.eval.load_cobra import load_cobra_from_experiment, _resolve_per_fm_adapter
+from med_slim.eval.load_cobra import (
+    load_cobra_from_experiment,
+    _resolve_per_fm_adapter,
+    resolve_raw_aggregation_fm,
+)
 
 
 def _testcase_cobra_config():
@@ -61,6 +65,80 @@ def test_load_cobra_from_experiment_rejects_removed_within_slice_weights(tmp_pat
     exp_dir = _testcase_experiment(tmp_path, include_within_slice_weights=True)
     with pytest.raises(ValueError, match="removed within_slice_agg"):
         load_cobra_from_experiment(str(exp_dir), Accelerator())
+
+
+def test_load_cobra_from_experiment_restores_raw_aggregation_index(tmp_path):
+    """A saved 'raw' experiment config restores its explicit raw_aggregation_index/dim."""
+    exp_dir = tmp_path / "exp_raw"
+    ckpt_dir = exp_dir / "ckpt"
+    ckpt_dir.mkdir(parents=True)
+
+    config = {
+        "cobra_config": {**_testcase_cobra_config()},
+        "sequence_encoder": "transformer",
+        "pooling_target": "raw",
+        "raw_output_dim": 96,
+        "raw_aggregation_index": 1,
+        "raw_aggregation_fm": "fm-b",
+    }
+    (exp_dir / "config.yml").write_text(yaml.dump(config))
+    state = {"cobra.attn.weight": torch.randn(1, 16, 32)}
+    torch.save(state, ckpt_dir / "classifier.pt")
+
+    model, cfg = load_cobra_from_experiment(str(exp_dir), Accelerator())
+    assert model.pooling_target == "raw"
+    assert model.raw_aggregation_index == 1
+    assert model._raw_output_dim == 96
+    assert cfg["raw_aggregation_fm"] == "fm-b"
+
+
+# resolve_raw_aggregation_fm
+def _pretrain_cfg_with_fms(fm_dims: dict) -> dict:
+    return {
+        "model": {
+            "slice_encoder_models": [
+                {"name": name, "embed_dim": dim} for name, dim in fm_dims.items()
+            ]
+        }
+    }
+
+
+def test_resolve_raw_aggregation_fm_returns_none_when_not_raw():
+    cfg = _pretrain_cfg_with_fms({"mri-core": 768})
+    result = resolve_raw_aggregation_fm("post_embed", ["mri-core"], cfg, None)
+    assert result == (None, None, None)
+
+
+def test_resolve_raw_aggregation_fm_single_fm_infers_automatically():
+    cfg = _pretrain_cfg_with_fms({"mri-core": 768})
+    index, dim, name = resolve_raw_aggregation_fm("raw", ["mri-core"], cfg, None)
+    assert (index, dim, name) == (0, 768, "mri-core")
+
+
+def test_resolve_raw_aggregation_fm_single_fm_mismatch_raises():
+    cfg = _pretrain_cfg_with_fms({"mri-core": 768})
+    with pytest.raises(ValueError, match="does not match the only evaluated FM"):
+        resolve_raw_aggregation_fm("raw", ["mri-core"], cfg, "curia")
+
+
+def test_resolve_raw_aggregation_fm_multi_fm_requires_explicit_name():
+    cfg = _pretrain_cfg_with_fms({"mri-core": 768, "curia": 1024})
+    with pytest.raises(ValueError, match="requires an explicit raw_aggregation_fm"):
+        resolve_raw_aggregation_fm("raw", ["mri-core", "curia"], cfg, None)
+
+
+def test_resolve_raw_aggregation_fm_multi_fm_unknown_name_raises():
+    cfg = _pretrain_cfg_with_fms({"mri-core": 768, "curia": 1024})
+    with pytest.raises(ValueError, match="must be one of the evaluated FMs"):
+        resolve_raw_aggregation_fm("raw", ["mri-core", "curia"], cfg, "dinov2")
+
+
+def test_resolve_raw_aggregation_fm_multi_fm_resolves_index_and_dim():
+    cfg = _pretrain_cfg_with_fms({"mri-core": 768, "curia": 1024})
+    index, dim, name = resolve_raw_aggregation_fm(
+        "raw", ["mri-core", "curia"], cfg, "curia"
+    )
+    assert (index, dim, name) == (1, 1024, "curia")
 
 
 def test_resolve_per_fm_adapter_defaults_to_per_dim():

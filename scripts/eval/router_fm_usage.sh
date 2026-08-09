@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120G
 #SBATCH --partition=c23g
-#SBATCH --time=02:00:00
+#SBATCH --time=01:00:00
 #SBATCH --job-name=router_fm_usage_%j
 #SBATCH --output=logs/eval/stdout_router_fm_usage_%j.txt
 #SBATCH --account=p0021834
@@ -18,18 +18,22 @@ source .venv/bin/activate
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
-CHECKPOINT_PATH="/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K/2026-06-21-18:27/medslim-epoch2000.pth.tar"
+CHECKPOINT_PATH="/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet/2026-06-16-17:51/medslim-epoch2000.pth.tar"
 # CONFIG=""                 # Optional: override pretrain config (default: beside checkpoint or pretrain.yml)
-OUTPUT="reports/fm_usage/router_T_0.5_confidence_0.001.png"
-NUM_BATCHES=200
-BATCH_SIZE=""               # Leave empty to use train.batch_size from config
-NUM_WORKERS=16              # More workers speed up on-demand safetensors reads
-CACHE_IN_MEMORY=false       # true: preload all features into RAM; useful for many batches
+ENCODER="momentum"          # momentum (LP/COBRA default) | base
+OUTPUT="reports/fm_usage/router_usage_2026-06-16-17:51.png"
+NUM_BATCHES=100
+BATCH_SIZE=""               # Leave empty for script default (min(64, train.batch_size))
+NUM_WORKERS=16
+# FM_NAMES=""               # Optional: space-separated subset; default = all pretrain FMs
 
 ### Build extra args
 EXTRA_ARGS=""
 if [[ -n "${CONFIG}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --config ${CONFIG}"
+fi
+if [[ -n "${ENCODER}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --encoder ${ENCODER}"
 fi
 if [[ -n "${BATCH_SIZE}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --batch-size ${BATCH_SIZE}"
@@ -37,17 +41,19 @@ fi
 if [[ -n "${NUM_WORKERS}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --num-workers ${NUM_WORKERS}"
 fi
-if [[ "${CACHE_IN_MEMORY}" == "true" ]]; then
-  EXTRA_ARGS="${EXTRA_ARGS} --cache-in-memory"
+if [[ -n "${FM_NAMES}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --fm-names ${FM_NAMES}"
 fi
 if [[ -n "${OUTPUT}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --output ${OUTPUT}"
 fi
 
 ### Run
-mkdir -p logs/eval
+set -euo pipefail
+mkdir -p logs/eval reports/fm_usage
 echo "Starting router FM usage analysis ..."
 echo "Checkpoint: ${CHECKPOINT_PATH}"
+echo "Encoder: ${ENCODER}"
 
 python -m med_slim.eval.router_fm_usage \
   --checkpoint "${CHECKPOINT_PATH}" \

@@ -44,11 +44,16 @@ from med_slim.data.feat_dataset import (
     linear_classifier_collate_fn,
     multiview_classifier_collate_fn,
 )
-from med_slim.eval.load_cobra import load_pretrained_cobra, resolve_eval_fm_ids
+from med_slim.eval.load_cobra import load_pretrained_cobra, resolve_eval_fm_ids, resolve_raw_aggregation_fm
 from med_slim.utils.callbacks.early_stopping import EarlyStopping
 from med_slim.utils.metrics.linear import get_loss_criterion, get_eval_metrics, get_num_classes, compute_class_weights_for_weighted_loss
 from med_slim.utils.viz.linear import compute_and_visualize_metrics, compute_youden_thresholds
-from med_slim.utils.label_metadata import get_dataset_metadata, get_annotation_paths_by_split, build_multiclass_label_names
+from med_slim.utils.label_metadata import (
+    get_dataset_metadata,
+    get_annotation_paths_by_split,
+    build_multiclass_label_names,
+    build_run_label_tag,
+)
 from codecarbon import EmissionsTracker
 from med_slim.logging.setup import init_logging
 
@@ -2782,17 +2787,16 @@ def main(args):
     use_multiview = len(view_planes) > 1
 
     # Create output directory
-    target_labels = "_".join(cfg["target_labels"])
+    run_label_tag = build_run_label_tag(cfg["task"], cfg["target_labels"], view_planes)
     fewshot_tag = ""
     if train_fraction < 1.0:
         fewshot_tag += f"_frac{train_fraction:g}"
     if num_repeats > 1:
         fewshot_tag += f"_repeats{num_repeats}"
-    if use_multiview:
-        planes_str = "_".join(view_planes)
-        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_multiview_{planes_str}{fewshot_tag}_{CURR_TIME}_{JOB_ID}")
-    else:
-        output_dir = os.path.join(cfg["output_dir"], f"{target_labels}_{view_planes[0]}{fewshot_tag}_{CURR_TIME}_{JOB_ID}")
+    output_dir = os.path.join(
+        cfg["output_dir"],
+        f"{run_label_tag}{fewshot_tag}_{CURR_TIME}_{JOB_ID}",
+    )
     
     checkpoint_path = args.checkpoint_path if args.checkpoint_path else cfg.get("checkpoint_path")
     pretrain_config_path = (
@@ -2856,11 +2860,6 @@ def main(args):
         regional_tokens=cobra_cfg.get("regional_tokens", 0),
         slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
     )
-    if fm_pooling == "router" and resolved_pooling_target == "raw":
-        raise ValueError(
-            f"pooling_target='raw' bypasses FM fusion and is not valid with fm_pooling='{fm_pooling}'. "
-            "Use pooling_target='post_embed' or 'post_encoder'."
-        )
     cfg["fm_pooling"] = fm_pooling
     cfg["pooling_target"] = resolved_pooling_target
     cfg["sequence_encoder"] = (
@@ -2870,14 +2869,20 @@ def main(args):
     )
     cfg["slice_pooling"] = args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil")
 
-    # Determine raw FM output dimension for 'raw' pooling target.
+    # Determine raw FM output dimension and aggregation FM for 'raw' pooling target.
     # Tiled caches are [B, num_slices, num_tiled_regions, input_embed_dim], so
     # raw ABMIL pooling over [B, num_slices, input_embed_dim] is not defined.
-    raw_output_dim = None
-    if resolved_pooling_target == "raw":
-        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
-        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
+    raw_aggregation_index, raw_output_dim, raw_aggregation_fm = resolve_raw_aggregation_fm(
+        resolved_pooling_target, model_names, pretrain_cfg, args.raw_aggregation_fm
+    )
+    if accelerator.is_main_process and raw_aggregation_fm is not None:
+        logger.info(
+            f"pooling_target='raw': aggregating raw features from FM '{raw_aggregation_fm}' "
+            f"(index {raw_aggregation_index} of {model_names})"
+        )
     cfg["raw_output_dim"] = raw_output_dim
+    cfg["raw_aggregation_index"] = raw_aggregation_index
+    cfg["raw_aggregation_fm"] = raw_aggregation_fm
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
@@ -2889,7 +2894,7 @@ def main(args):
         mode_str = "multiview_ensemble" if use_multiview else "single_view"
         wandb.init(
             project="medslim-linear-probing",
-            name=f"{cfg['feat_dataset']['dataset_name']}_{target_labels}_{mode_str}",
+            name=f"{cfg['feat_dataset']['dataset_name']}_{run_label_tag}_{mode_str}",
             config=cfg,
             dir=output_dir,
         )
@@ -2911,6 +2916,7 @@ def main(args):
         slice_pooling=args.slice_pooling,
         pooling_target=resolved_pooling_target,
         raw_output_dim=raw_output_dim,
+        raw_aggregation_index=raw_aggregation_index,
     )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
@@ -3213,7 +3219,16 @@ if __name__ == "__main__":
              "'post_encoder': after sequence encoder (Mamba-2/Transformer), "
              "'post_embed': after Embed MLP; tiled multi-crop CLS tokens are flattened before pooling. "
              "'raw': original FM embeddings; tiled tokens are flattened before pooling. "
+             "With multiple eval FMs, shared multi-FM attention is transferred to the FM explicitly named by --raw-aggregation-fm."
              "If omitted, Cobra resolves to 'raw' for global-only caches and 'post_embed' for tiled multi-crop CLS caches."
+    )
+    parser.add_argument(
+        "--raw-aggregation-fm",
+        type=str,
+        default=None,
+        help="Name of the evaluated FM whose raw features are aggregated when "
+             "--pooling-target=raw. Required when more than one FM is evaluated "
+             "(i.e., --fm-model-names has more than one entry).",
     )
     parser.add_argument(
         "--n-folds",

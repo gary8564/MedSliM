@@ -39,6 +39,7 @@ from med_slim.utils.label_metadata import (
     get_dataset_metadata,
     get_annotation_paths_by_split,
     build_multiclass_label_names,
+    build_run_label_tag,
 )
 from med_slim.utils.metrics.linear import (
     get_loss_criterion,
@@ -440,12 +441,14 @@ def main(args):
 
     # Transforms
     spatial_mode = cfg.get("spatial_mode", "adaptive")
+    modality = cfg.get("modality", "mri")
     if spatial_mode == "adaptive":
         val_transform = get_adaptive_transform(
             model_name="curia",
             plane=plane,
             num_slices=cfg.get("num_slices"),
             crop_empty_slices=cfg.get("crop_empty_slices", False),
+            modality=modality,
             to_tensor=False,
         )
     else:
@@ -455,6 +458,7 @@ def main(args):
             num_slices=cfg.get("num_slices"),
             spatial_mode=spatial_mode,
             crop_empty_slices=cfg.get("crop_empty_slices", False),
+            modality=modality,
             to_tensor=False,
         )
 
@@ -541,10 +545,10 @@ def main(args):
     criterion = get_loss_criterion(task, class_weights)
 
     # Output dir
-    label_str = "_".join(target_labels)
+    run_label_tag = build_run_label_tag(task, target_labels, plane)
     output_dir = os.path.join(
         cfg.get("output_dir", "experiments/curia_classifier"),
-        f"{dataset_name}_{label_str}_{plane}_{CURR_TIME}_{JOB_ID}",
+        f"{dataset_name}_{run_label_tag}_{CURR_TIME}_{JOB_ID}",
     )
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
@@ -552,7 +556,7 @@ def main(args):
             yaml.dump(cfg, f)
         wandb.init(
             project="curia-classifier",
-            name=f"{dataset_name}_{label_str}_{plane}",
+            name=f"{dataset_name}_{run_label_tag}",
             config=cfg,
             dir=output_dir,
         )

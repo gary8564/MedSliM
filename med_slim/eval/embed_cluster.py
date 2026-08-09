@@ -48,6 +48,7 @@ from med_slim.eval.load_cobra import (
     load_pretrained_cobra,
     load_cobra_from_experiment,
     resolve_eval_fm_ids,
+    resolve_raw_aggregation_fm,
 )
 from med_slim.utils.viz.cluster import plot_embedding_clustering, compute_silhouette
 from med_slim.utils.label_metadata import (
@@ -234,15 +235,14 @@ def _run_multi_dataset(args, accelerator: Accelerator):
         regional_tokens=cobra_cfg.get("regional_tokens", 0),
         slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
     )
-    raw_output_dim = None
-    if resolved_pooling_target == "raw":
-        if fm_pooling == "router":
-            raise ValueError(
-                f"pooling_target='raw' bypasses FM fusion and is not valid with fm_pooling='{fm_pooling}'. "
-                "Use pooling_target='post_embed' or 'post_encoder'."
-            )
-        fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
-        raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
+    raw_aggregation_index, raw_output_dim, raw_aggregation_fm = resolve_raw_aggregation_fm(
+        resolved_pooling_target, model_names, pretrain_cfg, args.raw_aggregation_fm
+    )
+    if accelerator.is_main_process and raw_aggregation_fm is not None:
+        logger.info(
+            f"pooling_target='raw': aggregating raw features from FM '{raw_aggregation_fm}' "
+            f"(index {raw_aggregation_index} of {model_names})"
+        )
 
     cobra_model = load_pretrained_cobra(
         checkpoint_path=args.checkpoint_path,
@@ -254,6 +254,7 @@ def _run_multi_dataset(args, accelerator: Accelerator):
         slice_pooling=args.slice_pooling,
         pooling_target=resolved_pooling_target,
         raw_output_dim=raw_output_dim,
+        raw_aggregation_index=raw_aggregation_index,
     )
     cobra_model = cobra_model.to(accelerator.device)
     cobra_model.eval()
@@ -431,15 +432,14 @@ def _run_single_dataset(args, accelerator: Accelerator):
             regional_tokens=cobra_cfg.get("regional_tokens", 0),
             slice_pooling=args.slice_pooling or checkpoint_slice_pooling or cobra_cfg.get("pooling", "abmil"),
         )
-        raw_output_dim = None
-        if resolved_pooling_target == "raw":
-            if fm_pooling == "router":
-                raise ValueError(
-                    f"pooling_target='raw' bypasses FM fusion and is not valid with fm_pooling='{fm_pooling}'. "
-                    "Use pooling_target='post_embed' or 'post_encoder'."
-                )
-            fm_configs = {m["name"]: m for m in pretrain_cfg["model"]["slice_encoder_models"]}
-            raw_output_dim = fm_configs[model_names[0]]["embed_dim"]
+        raw_aggregation_index, raw_output_dim, raw_aggregation_fm = resolve_raw_aggregation_fm(
+            resolved_pooling_target, model_names, pretrain_cfg, args.raw_aggregation_fm
+        )
+        if accelerator.is_main_process and raw_aggregation_fm is not None:
+            logger.info(
+                f"pooling_target='raw': aggregating raw features from FM '{raw_aggregation_fm}' "
+                f"(index {raw_aggregation_index} of {model_names})"
+            )
 
         cobra_model = load_pretrained_cobra(
             checkpoint_path=args.checkpoint_path,
@@ -451,6 +451,7 @@ def _run_single_dataset(args, accelerator: Accelerator):
             slice_pooling=args.slice_pooling,
             pooling_target=resolved_pooling_target,
             raw_output_dim=raw_output_dim,
+            raw_aggregation_index=raw_aggregation_index,
         )
         cobra_model = cobra_model.to(accelerator.device)
         cobra_model.eval()
@@ -676,8 +677,15 @@ def main():
         default=None,
         help="Which representation level ABMIL attention weights aggregate: "
              "'post_encoder': encoder output, 'post_embed': after Embed MLP for global-only CLS; after tiled tokens are flattened for tiled multi-crop CLS. "
-             "'raw': original FM embeddings; tiled tokens are flattened before pooling. "
+             "'raw': original FM embeddings; tiled tokens are flattened before pooling. With multiple "
+             "eval FMs, shared multi-FM attention is transferred to one FM's raw features, named by "
+             "--raw-aggregation-fm. "
              "If omitted, Cobra resolves to raw for global-only caches and post_embed for tiled caches."
+    )
+    parser.add_argument(
+        "--raw-aggregation-fm", type=str, default=None,
+        help="Name of the evaluated FM whose raw features are aggregated when --pooling-target=raw. "
+             "Required when more than one FM is evaluated; inferred automatically for a single eval FM.",
     )
     parser.add_argument("--save-embeddings", action="store_true", help="Save embeddings to npz file")
     parser.add_argument("--method", type=str, default="umap", choices=["umap", "tsne"],
