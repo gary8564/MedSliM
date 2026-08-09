@@ -1,7 +1,7 @@
 import os
 import yaml
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 def load_eval_datasets_config() -> Dict[str, Any]:
     """Load the full ``eval_datasets.yaml`` config."""
@@ -36,7 +36,64 @@ def get_dataset_metadata(dataset_name: str) -> Dict[str, Any]:
             f"Dataset '{dataset_name}' not found in eval_datasets.yaml. "
             f"Available: {list(datasets.keys())}"
         )
-    return datasets[dataset_name]
+    meta = datasets[dataset_name]
+    validate_eval_target_labels(meta["task"], meta["target_labels"])
+    return meta
+
+
+def validate_eval_target_labels(task: str, target_labels: List[str]) -> None:
+    """
+    Validate `task` / `target_labels` consistency from `eval_datasets.yaml`.
+
+    Matches `FeatClassificationDataset` rules: binary and multiclass use one
+    column; multilabel requires at least two independent label columns.
+    """
+    if not target_labels:
+        raise ValueError(f"`target_labels` must be non-empty for task '{task}'.")
+    if task in ("binary", "multiclass") and len(target_labels) != 1:
+        raise ValueError(
+            f"Task '{task}' requires exactly one entry in `target_labels`, "
+            f"got {len(target_labels)}: {target_labels}."
+        )
+    if task == "multilabel" and len(target_labels) < 2:
+        raise ValueError(
+            f"Task 'multilabel' requires at least two entries in `target_labels`, "
+            f"got {len(target_labels)}: {target_labels}. Use task 'binary' for a single label."
+        )
+
+
+def build_run_label_tag(
+    task: str,
+    target_labels: List[str],
+    view_planes: Union[str, List[str]],
+) -> str:
+    """
+    Experiment output directories and run names.
+
+    Convention:
+      - multilabel (N >= 2): `multilabel_{N}_{view_plane}`
+      - binary:              `binary_{view_plane}`
+      - multiclass:          `multiclass_{view_plane}`
+
+    Requires ``validate_eval_target_labels`` to have passed (multilabel with
+    N < 2 is a config error, not a valid run tag).
+
+    `view_planes` may be a single plane like `sagittal` or a list, e.g. `sagittal_coronal_axial`.
+    """
+    if isinstance(view_planes, str):
+        plane_tag = view_planes
+    elif len(view_planes) == 1:
+        plane_tag = view_planes[0]
+    else:
+        plane_tag = "_".join(view_planes)
+
+    if task == "multilabel":
+        return f"multilabel_{len(target_labels)}_{plane_tag}"
+    if task == "binary":
+        return f"binary_{plane_tag}"
+    if task == "multiclass":
+        return f"multiclass_{plane_tag}"
+    return f"{task}_{plane_tag}"
 
 
 def _resolve_annotation_path(
@@ -46,12 +103,18 @@ def _resolve_annotation_path(
 ) -> Optional[str]:
     """Resolve a single split name to its annotation CSV path, or None if absent."""
     base_dir = Path(annotations_dir)
-    annot_path = base_dir / f"{split}.csv"
-    if task == "binary" and not os.path.exists(annot_path):
-        annot_path = base_dir / f"{split}_binary.csv"
-    elif task == "multiclass" and not os.path.exists(annot_path):
-        annot_path = base_dir / f"{split}_multiclass.csv"
-    if not os.path.exists(annot_path):
+    default_path = base_dir / f"{split}.csv"
+
+    if task == "binary":
+        binary_path = base_dir / f"{split}_binary.csv"
+        annot_path = binary_path if binary_path.exists() else default_path
+    elif task == "multiclass":
+        multiclass_path = base_dir / f"{split}_multiclass.csv"
+        annot_path = multiclass_path if multiclass_path.exists() else default_path
+    else:
+        annot_path = default_path
+
+    if not annot_path.exists():
         return None
     return str(annot_path)
 

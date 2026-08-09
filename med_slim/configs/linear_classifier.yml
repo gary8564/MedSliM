@@ -11,7 +11,11 @@
 # ------------------------------------------------------------------------------
 # Path to pretrained MedSliM checkpoint
 checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet/2026-02-07-14:10/medslim-epoch2000.pth.tar"
-# Optional when running --no-pretrained-cobra; otherwise inferred from checkpoint_path parent.
+# checkpoint_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/CT-RATE/2026-07-05-04:15/medslim-epoch2000.pth.tar"
+# Optional: path to the MedSliM pretraining config.yaml. If omitted, it is
+# inferred as checkpoint_path's parent directory / "config.yaml" (the default
+# layout written by train.py). checkpoint_path is always required
+# Override with --pretrain-config-path if the checkpoint lives outside its original run directory.
 # pretrain_config_path: "/path/to/pretrain/config.yaml"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
@@ -29,29 +33,52 @@ freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning 
 #     plane: ["sagittal", "coronal", "axial"]   # multi-view channels
 #     model_name: ["mri-core"]
 #
-# Example for multi-sequence ensembling (e.g. SKM-TEA with DESS_E1 and DESS_E2):
+# Example for multi-sequence ensembling (SKM-TEA DESS_E1 + DESS_E2 → logistic ensemble):
 #   feat_dataset:
 #     dataset_name: "SKM-TEA"
-#     sequences: # map each MRI sequence to its own feat_dir
+#     sequences:
 #       DESS_E1: "/path/to/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive"
 #       DESS_E2: "/path/to/feat_caches/SKM-TEA/DESS_E2/slices_raw/adaptive"
 #     plane: ["sagittal"]
 #     model_name: ["dinov2"]
 
 feat_dataset:
-  dataset_name: "kneeMRI"
-  feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
+  dataset_name: "SKM-TEA"
+  # feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
   plane:
     - "sagittal"
     # - "coronal"
     # - "axial"
-  # sequences: 
-    # DESS_E1: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive"
-    # DESS_E2: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E2/slices_raw/adaptive"
+  sequences: 
+    DESS_E1: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E1/slices_raw/adaptive"
+    # DESS_E2: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E2/slices_raw/adaptive" 
   model_name:
     - "mri-core"
 
-annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+# feat_dataset:
+#   dataset_name: "SKM-TEA"
+#   plane: ["sagittal"]
+#   sequences:
+#     DESS_E2: "/hpcwork/rwth1833/feat_caches/SKM-TEA/DESS_E2/slices_raw/adaptive"
+#   model_name: ["mri-core"]
+
+# feat_dataset:
+#   dataset_name: "kneeMRI"
+#   feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
+#   plane: ["sagittal"]
+#   model_name: ["mri-core"]
+
+# feat_dataset:
+#   dataset_name: "LIDC-IDRI"
+#   feat_dir: "/hpcwork/rwth1833/feat_caches/LIDC-IDRI-nodules/slices_raw/adaptive"
+#   plane:
+#     - "axial"
+#   model_name:
+#     - "curia"
+#     - "med-dinov3"
+#     - "flexict-2d"
+
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/SKM-TEA"
 
 # ------------------------------------------------------------------------------
 # Few-shot / repeated-evaluation configuration
@@ -68,14 +95,14 @@ few_shot:
 # ------------------------------------------------------------------------------
 # Output directory configuration
 # ------------------------------------------------------------------------------
-output_dir: "/hpcwork/qj474765/experiments/MedSliM-linear-probing"
+output_dir: "/hpcwork/qj474765/experiments/MedSliM-linear-probing/SKM-TEA"
 
 # ------------------------------------------------------------------------------
 # Hyperparameters
 # ------------------------------------------------------------------------------
 # Note: For fine-tuning, use lower learning rate and enable early stopping
 hyperparams:
-  batch_size: 8
+  batch_size: 4
   base_lr: 1e-5 # Base learning rate for linear heads
   backbone_lr_scale: 0.1 # COBRA backbone learning rate = base_lr * backbone_lr_scale when fine-tuning COBRA
   weight_decay: 0.1 #0.01  # L2 regularization to prevent overfitting

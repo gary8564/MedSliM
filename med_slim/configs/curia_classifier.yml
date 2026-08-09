@@ -11,6 +11,7 @@
 dataset_name: "kneeMRI"
 data_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
 annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+modality: "mri"  # "mri" or "ct"
 plane: "sagittal"
 num_slices: null  # null = keep all slices (no cropping/padding in depth)
 spatial_mode: "adaptive"  # adaptive | resize | resample | crop

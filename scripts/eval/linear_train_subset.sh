@@ -5,8 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-NUM_REPEATS=3
-for frac in 0.10 0.25 0.5 0.75 1.0; do
+NUM_REPEATS=1
+for frac in 0.10 0.25 0.5 0.75; do
   sbatch --export=ALL,TRAIN_FRACTION=${frac},NUM_REPEATS=${NUM_REPEATS} \
     scripts/eval/linear_classifier.sh
 done

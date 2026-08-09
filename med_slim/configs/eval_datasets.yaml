@@ -37,3 +37,44 @@ datasets:
     # target_labels: [acl]
     # label_display_names:
     #   acl: ACL Tear
+
+
+  CT-RATE:
+    task: multilabel
+    target_labels:
+      - Medical material
+      - Arterial wall calcification
+      - Cardiomegaly
+      - Pericardial effusion
+      - Coronary artery wall calcification
+      - Hiatal hernia
+      - Lymphadenopathy
+      - Emphysema
+      - Atelectasis
+      - Lung nodule
+      - Lung opacity
+      - Pulmonary fibrotic sequela
+      - Pleural effusion
+      - Mosaic attenuation pattern
+      - Peribronchial thickening
+      - Consolidation
+      - Bronchiectasis
+      - Interlobular septal thickening
+    label_display_names:
+      # ... (optional; auto-formatted if omitted)
+
+  LIDC-IDRI:
+    task: binary
+    target_labels: [Malignant]
+    label_display_names:
+      Malignant: Malignant Nodule
+    # task: multiclass
+    # target_labels: [malignancy]
+    # label_display_names:
+    #   malignancy: Malignancy
+    # multiclass_label_maps:
+    #   malignancy:
+    #     0: Highly Unlikely
+    #     1: Moderately Unlikely
+    #     2: Moderately Suspicious
+    #     3: Highly Suspicious

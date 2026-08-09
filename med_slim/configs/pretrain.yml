@@ -15,6 +15,10 @@ feat_dataset:
       feat_dir: "/hpcwork/rwth1833/feat_caches/fastMRI/slices_raw/adaptive"
     - name: kmar-50k
       feat_dir: "/hpcwork/rwth1833/feat_caches/KMAR-50K/slices_raw/adaptive"
+    # - name: oai
+    #   feat_dir: "/hpcwork/rwth1833/feat_caches/OAI/slices_raw/adaptive"
+    # - name: CT-RATE
+    #   feat_dir: "/hpcwork/rwth1833/feat_caches/CT-RATE/slices_raw/adaptive"
   model_name:
     - "dinov2"
     - "dinov3"
@@ -25,11 +29,13 @@ feat_dataset:
     - "mri-core"
     - "medimageinsight"
     - "curia"
+    # - "med-dinov3"
+    # - "flexict-2d"
   plane: # "axial", "sagittal", "coronal"
     - "sagittal"
     - "coronal"
     - "axial"
-  num_target_slices: 32
+  num_target_slices: 32  # 128 (CT); 32 (MRI)
 
 model:
   slice_encoder_models:
@@ -83,15 +89,29 @@ model:
       repo: "/hpcwork/rwth1833/models/MedImageInsights"
     - name: curia
       img_size: [512, 512]
-      image_mean: [0.0, 0.0, 0.0]  # Curia applies per-slice z-score normalization internally
+      image_mean: [0.0, 0.0, 0.0]  # Per-slice z-score normalization is applied internally
       image_std: [1.0, 1.0, 1.0]
       embed_dim: 768
       repo: "raidium/curia"
+    - name: med-dinov3
+      img_size: [896, 896]
+      # CT-specific fixed statistics from the official MedDINOv3 inference demo
+      # (clamp to [-1000, 1000] HU, then (x - mean) / std). Demo-derived default. 
+      image_mean: [65.1084213256836, 65.1084213256836, 65.1084213256836]
+      image_std: [178.01663208007812, 178.01663208007812, 178.01663208007812]
+      embed_dim: 768
+      repo: "ricklisz123/MedDINOv3-ViTB-16-CT-3M"
+    - name: flexict-2d
+      img_size: [512, 512]
+      image_mean: [0.0, 0.0, 0.0] # Per-slice z-score normalization is applied internally
+      image_std: [1.0, 1.0, 1.0]
+      embed_dim: 864
+      repo: "/hpcwork/rwth1833/models/FlexiCT-2D.pth"
 
   cobra:
     embed_dim: 1024 # 768, 1024, 1536
     contrast_dim: 256
-    input_dims: [768, 1024, 1536, 1152, 512, 1376]
+    input_dims: [768, 1024, 1536, 1152, 512, 1376, 864]
     num_heads: 8
     num_layers: 2 # 2, 6, 12
     dropout: 0.2
@@ -118,7 +138,7 @@ model:
     # Projection-adapter keying for the FM-set paths (subset SSL / FM-set inference).
     # per_dim: share one Embed MLP across FMs of the same input dim (legacy router/paired/packed SSL default).
     # per_fm_id: one Embed MLP per FM so each FM is a distinct expert (recommended for router).
-    per_fm_adapter_mode: per_fm_id   # per_dim | per_fm_id
+    per_fm_adapter_mode: per_dim   # per_dim | per_fm_id
     router_use_fm_embedding: true
     router_use_fm_logit_bias: true
     router_use_fm_logit_scale: false
@@ -131,8 +151,8 @@ model:
 ssl:
   fm_mode: subset                 # pair | subset
   fm_subset_size: 4
-  fm_subset_min_overlap: 0       # disjoint FM subsets for stronger cross-FM augmentation
-  fm_subset_max_overlap: 0
+  fm_subset_min_overlap: 1       # disjoint FM subsets for stronger cross-FM augmentation
+  fm_subset_max_overlap: 2
 
 # Router auxiliary losses (only active when model.cobra.fm_pooling == router).
 router:
@@ -144,13 +164,12 @@ router:
 train:
   momentum: 0.99
   temperature: 0.2
-  batch_size: 512 #256
+  batch_size: 512
   num_epochs: 2000
-  learning_rate: 5e-4 #2e-4 
+  learning_rate: 5e-4 
   warmup_epochs: 50 #100
   weight_decay: 0.1
   num_workers: 20
   early_stopping: 
     patience: 10
-  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K" #"MRNet"
-
+  save_ckpt_path: "/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet-fastMRI-KMAR50K" #"MRNet-fastMRI-KMAR50K"
