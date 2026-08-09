@@ -9,7 +9,15 @@ Source layout:
   {data_dir}/multi_abnormality_labels/{train,valid}_predicted_labels.csv
 
 Output layout:
-  {save_dir}/{split}/{volume_name}.nii.gz + metadata.csv
+  {save_dir}/train/axial/{volume_name}.nii.gz
+  {save_dir}/test/axial/{volume_name}.nii.gz
+  {save_dir}/metadata.csv   -- full provenance record (ID, patient/scan ids,
+                               nifti_path, split, all 18 abnormality labels).
+                               Not read by MedSliM training/eval directly;
+                               kept for traceability and debugging.
+  {save_dir}/train.csv, {save_dir}/test.csv
+                            -- ID and all abnormality label columns.
+                            (valid_fixed -> test.csv; volumes live under test/axial)
 """
 import argparse
 import logging
@@ -24,7 +32,12 @@ logger = logging.getLogger(__name__)
 
 SPLITS = {
     "train_fixed": "train",
-    "valid_fixed": "valid",
+    "valid_fixed": "test",
+}
+
+SPLIT_DIRS = {
+    "train": Path("train") / "axial",
+    "test": Path("test") / "axial",
 }
 
 
@@ -122,14 +135,14 @@ def main():
         logger.info(f"Label entries loaded: {len(label_map)}")
 
     logger.info("=" * 60)
-    logger.info("Step 3: Organizing files into split directories ...")
+    logger.info("Step 3: Organizing files into train/axial and test/axial ...")
     logger.info("=" * 60)
 
     metadata_rows = []
     for task in tqdm(tasks, desc="Organizing"):
         split = task["split"]
         volume_name = task["volume_name"]
-        out_dir = save_dir / split
+        out_dir = save_dir / SPLIT_DIRS[split]
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / volume_name
 
@@ -161,11 +174,50 @@ def main():
     df.to_csv(save_dir / "metadata.csv", index=False)
 
     logger.info("=" * 60)
+    logger.info("Step 4: Writing per-split annotation CSVs (train.csv / test.csv) ...")
+    logger.info("=" * 60)
+    meta_cols = {"ID", "volume_name", "split", "patient_id", "scan_id", "nifti_path"}
+    label_cols = [c for c in df.columns if c not in meta_cols]
+
+    if not label_cols:
+        logger.warning(
+            "No abnormality label columns found (multi_abnormality_labels CSVs "
+            "missing/empty); skipping train.csv/test.csv generation."
+        )
+    else:
+        for split_name in sorted(set(SPLITS.values())):
+            df_split = df[df["split"] == split_name]
+            if df_split.empty:
+                logger.warning(f"No rows found for split '{split_name}'; skipping {split_name}.csv")
+                continue
+
+            # Rows must have every label populated to be usable for training/eval;
+            # unmatched volumes (no entry in the label CSVs) would otherwise leak
+            # NaN labels into train.csv/test.csv.
+            labeled_mask = df_split[label_cols].notna().all(axis=1)
+            n_unlabeled = len(df_split) - int(labeled_mask.sum())
+            if n_unlabeled > 0:
+                logger.warning(
+                    f"Dropping {n_unlabeled}/{len(df_split)} '{split_name}' rows with missing "
+                    "abnormality labels (no match in multi_abnormality_labels CSVs)."
+                )
+            df_split = df_split.loc[labeled_mask, ["ID"] + label_cols].copy()
+            df_split[label_cols] = df_split[label_cols].astype(int)
+
+            out_csv = save_dir / f"{split_name}.csv"
+            df_split.to_csv(out_csv, index=False)
+            logger.info(f"{split_name}.csv written with {len(df_split)} entries.")
+            for col in label_cols:
+                prevalence = df_split[col].mean() if len(df_split) else float("nan")
+                logger.info(f"  {col}: {prevalence:.1%} positive")
+
+    logger.info("=" * 60)
     logger.info("Summary")
     logger.info("=" * 60)
     for split in sorted(df["split"].unique()):
         count = len(df[df["split"] == split])
-        logger.info(f"  {split}/: {count} files")
+        rel = SPLIT_DIRS.get(split, Path(split))
+        logger.info(f"  {rel}/: {count} files (split={split})")
     matched = len([r for r in metadata_rows if len(r) > 6])
     logger.info(f"Label-matched: {matched}/{len(metadata_rows)}")
     logger.info("=" * 60)

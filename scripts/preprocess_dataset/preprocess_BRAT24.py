@@ -9,7 +9,14 @@ Source:
   BraTS-MEN-RT/{Train-v2,...}/{subject_id}/{subject_id}_{modality}.nii.gz
 
 Output:
-  {save_dir}/{modality}/{subject_id}.nii.gz + metadata.csv
+  {save_dir}/{t1c,t1n,t2w,t2f}/train/axial/{subject_id}.nii.gz
+  {save_dir}/{seg,gtv}/{subject_id}.nii.gz
+  {save_dir}/metadata.csv
+
+Only BraTS-GLI and BraTS-MEN-RT are processed: other 2024 Synapse task
+folders (GoAT/MET/PED/Path/SSA) are typically empty stubs ("data moved")
+unless separately downloaded. Imaging tasks are already NIfTI; BraTS-Path
+is whole-slide histopathology and is out of scope for this MRI pipeline.
 """
 import argparse
 import logging
@@ -23,6 +30,14 @@ logger = logging.getLogger(__name__)
 
 GLI_MODALITIES = {"t1c", "t1n", "t2w", "t2f", "seg"}
 MENRT_MODALITIES = {"t1c", "gtv"}
+MASK_MODALITIES = {"seg", "gtv"}
+
+
+def output_path(save_dir: Path, modality: str, subject_id: str) -> Path:
+    """Return on-disk NIfTI path matching the preprocessed BRAT24 layout."""
+    if modality in MASK_MODALITIES:
+        return save_dir / modality / f"{subject_id}.nii.gz"
+    return save_dir / modality / "train" / "axial" / f"{subject_id}.nii.gz"
 
 
 def setup_logging(verbose: bool) -> None:
@@ -162,9 +177,8 @@ def main():
     for task in tqdm(all_tasks, desc="Copying"):
         modality = task["modality"]
         subject_id = task["subject_id"]
-        out_dir = save_dir / modality
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{subject_id}.nii.gz"
+        out_path = output_path(save_dir, modality, subject_id)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
         if not out_path.exists():
             shutil.copy2(task["source"], out_path)

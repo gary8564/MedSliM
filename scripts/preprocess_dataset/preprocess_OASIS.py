@@ -2,22 +2,33 @@
 Preprocess OASIS-1 (Cross-Sectional) dataset for MedSliM.
 
 Converts Analyze75 (.hdr/.img) processed atlas-registered brain MRI volumes
-to NIfTI format.  Uses the T88_111 gain-field-corrected (non-masked) volumes.
+and FSL tissue segmentations to NIfTI. Uses the T88_111 gain-field-corrected
+(non-masked) volumes from PROCESSED/ (preferred over RAW: multi-acquisition
+aligned, intensity-corrected, Talairach-resampled).
 
 Source layout:
   {data_dir}/disc{1-5}/{subject_id}/PROCESSED/MPRAGE/T88_111/
       {subject_id}_mpr_n{3,4}_anon_111_t88_gfc.{hdr,img}
+  {data_dir}/disc{1-5}/{subject_id}/FSL_SEG/
+      {subject_id}_*_masked_gfc_fseg.{hdr,img}
 
 Output layout:
-  {save_dir}/{subject_id}.nii.gz + metadata.csv
+  {save_dir}/train/axial/{subject_id}.nii.gz
+  {save_dir}/train/seg/{subject_id}_fseg.nii.gz
+  {save_dir}/metadata.csv
+  {save_dir}/oasis_cross-sectional*.xlsx|pdf  (copied from raw)
 """
+from __future__ import annotations
+
 import argparse
 import logging
+import shutil
 import sys
+from pathlib import Path
+
 import nibabel as nib
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -27,7 +38,7 @@ def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter(
-        fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     handler.setFormatter(formatter)
     logger.setLevel(level)
@@ -40,11 +51,19 @@ def find_gfc_img(subject_dir: Path) -> Path | None:
     t88_dir = subject_dir / "PROCESSED" / "MPRAGE" / "T88_111"
     if not t88_dir.exists():
         return None
-    # Match *_111_t88_gfc.img (exclude *_masked_gfc.img)
     candidates = [
         f for f in t88_dir.glob("*_gfc.img")
         if "masked" not in f.name
     ]
+    return candidates[0] if candidates else None
+
+
+def find_fseg_img(subject_dir: Path) -> Path | None:
+    """Find the FSL tissue segmentation Analyze75 .img file."""
+    fsl_dir = subject_dir / "FSL_SEG"
+    if not fsl_dir.exists():
+        return None
+    candidates = sorted(fsl_dir.glob("*_fseg.img"))
     return candidates[0] if candidates else None
 
 
@@ -64,40 +83,85 @@ def collect_subjects(data_dir: Path) -> list[dict]:
             tasks.append({
                 "subject_id": subject_dir.name,
                 "img_path": str(img_file),
+                "fseg_path": (
+                    str(p) if (p := find_fseg_img(subject_dir)) is not None else None
+                ),
                 "disc": disc_name.name,
             })
     return tasks
 
 
-def convert_analyze_to_nifti(task: dict, save_dir: Path) -> dict | None:
-    subject_id = task["subject_id"]
-    out_path = save_dir / f"{subject_id}.nii.gz"
+def convert_analyze_to_nifti(
+    img_path: str | Path,
+    out_path: Path,
+    *,
+    force: bool = False,
+) -> tuple[bool, list[int] | None]:
+    """
+    Convert an Analyze75 .img/.hdr pair to NIfTI.
 
-    if out_path.exists():
-        logger.debug(f"Skipping (exists): {out_path.name}")
-        return None
+    Returns (wrote_or_exists, shape). shape is None on failure.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_path.exists() and not force:
+        try:
+            img = nib.load(str(out_path))
+            shape = list(np.asarray(img.dataobj).shape)
+            logger.debug(f"Skipping (exists): {out_path}")
+            return False, shape
+        except Exception as e:
+            logger.warning(f"Existing NIfTI unreadable ({out_path.name}): {e}; reconverting")
 
     try:
-        # nibabel transparently loads .hdr/.img pairs via the .img path
-        img = nib.load(task["img_path"])
+        img = nib.load(str(img_path))
         data = np.asarray(img.dataobj)
         nii = nib.Nifti1Image(data, img.affine, img.header)
         nib.save(nii, str(out_path))
-
-        return {
-            "ID": subject_id,
-            "nifti_path": str(out_path),
-            "disc": task["disc"],
-            "shape": list(data.shape),
-        }
+        return True, list(data.shape)
     except Exception as e:
-        logger.warning(f"Failed converting {subject_id}: {e}")
-        return None
+        logger.warning(f"Failed converting {img_path} -> {out_path.name}: {e}")
+        return False, None
 
 
-def load_demographics(data_dir: Path) -> pd.DataFrame:
-    """Load cross-sectional demographics xlsx if available."""
-    for xlsx in data_dir.glob("oasis_cross-sectional*.xlsx"):
+def copy_demographics_files(data_dir: Path, save_dir: Path) -> list[Path]:
+    """Copy OASIS demographics / fact sheets into the preprocessed root."""
+    copied: list[Path] = []
+    patterns = (
+        "oasis_cross-sectional*.xlsx",
+        "oasis_cross-sectional*.pdf",
+    )
+    for pattern in patterns:
+        for src in sorted(data_dir.glob(pattern)):
+            dst = save_dir / src.name
+            if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+                shutil.copy2(src, dst)
+                logger.info(f"Copied {src.name} -> {dst}")
+            else:
+                logger.debug(f"Already present: {dst.name}")
+            copied.append(dst)
+    return copied
+
+
+def load_demographics(search_dirs: list[Path]) -> pd.DataFrame:
+    """
+    Load main cross-sectional demographics xlsx (prefer non-reliability table).
+
+    Searches save_dir first (copied files), then data_dir.
+    """
+    candidates: list[Path] = []
+    for d in search_dirs:
+        candidates.extend(sorted(d.glob("oasis_cross-sectional*.xlsx")))
+
+    # Prefer the full demographics table over the small reliability sheet.
+    preferred = [
+        p for p in candidates
+        if "reliability" not in p.name.lower()
+    ]
+    ordered = preferred + [p for p in candidates if p not in preferred]
+
+    for xlsx in ordered:
         try:
             df = pd.read_excel(xlsx)
             logger.info(f"Loaded demographics from {xlsx.name} ({len(df)} rows)")
@@ -107,8 +171,26 @@ def load_demographics(data_dir: Path) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def build_metadata_row(
+    task: dict,
+    volume_path: Path,
+    seg_path: Path | None,
+    shape: list[int] | None,
+) -> dict:
+    row = {
+        "ID": task["subject_id"],
+        "nifti_path": str(volume_path),
+        "seg_path": str(seg_path) if seg_path is not None and seg_path.exists() else "",
+        "disc": task["disc"],
+        "shape": shape if shape is not None else "",
+    }
+    return row
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess OASIS-1: Analyze75 to NIfTI")
+    parser = argparse.ArgumentParser(
+        description="Preprocess OASIS-1: Analyze75 MRI + FSL_SEG to NIfTI"
+    )
     parser.add_argument(
         "--data-dir", type=str,
         default="/hpcwork/rwth1833/datasets/OASIS",
@@ -119,41 +201,85 @@ def main():
         default="/hpcwork/rwth1833/datasets/preprocessed/OASIS",
         help="Output directory for NIfTI files and metadata",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Reconvert even if output NIfTI already exists",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
     data_dir = Path(args.data_dir)
     save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    volume_dir = save_dir / "train" / "axial"
+    seg_dir = save_dir / "train" / "seg"
+    volume_dir.mkdir(parents=True, exist_ok=True)
+    seg_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Copying demographics / fact sheets ...")
+    copy_demographics_files(data_dir, save_dir)
 
     logger.info("Collecting subjects ...")
     tasks = collect_subjects(data_dir)
     logger.info(f"Found {len(tasks)} subjects with processed volumes")
 
     logger.info("=" * 60)
-    logger.info("Converting Analyze75 to NIfTI ...")
+    logger.info("Converting MRI (PROCESSED T88_111 gfc) -> train/axial/")
     logger.info("=" * 60)
 
     metadata_rows = []
+    n_vol_new = n_seg_new = 0
     for task in tqdm(tasks, desc="Converting"):
-        md = convert_analyze_to_nifti(task, save_dir)
-        if md is not None:
-            metadata_rows.append(md)
+        subject_id = task["subject_id"]
+        vol_out = volume_dir / f"{subject_id}.nii.gz"
+        wrote, shape = convert_analyze_to_nifti(
+            task["img_path"], vol_out, force=args.force
+        )
+        if wrote:
+            n_vol_new += 1
+        if shape is None and not vol_out.exists():
+            logger.warning(f"Skipping metadata for failed volume {subject_id}")
+            continue
 
-    # Merge demographics if available
-    df_demo = load_demographics(data_dir)
+        seg_out: Path | None = None
+        if task["fseg_path"] is not None:
+            seg_out = seg_dir / f"{subject_id}_fseg.nii.gz"
+            wrote_seg, _ = convert_analyze_to_nifti(
+                task["fseg_path"], seg_out, force=args.force
+            )
+            if wrote_seg:
+                n_seg_new += 1
+        else:
+            logger.warning(f"No FSL_SEG for {subject_id}")
+
+        metadata_rows.append(
+            build_metadata_row(task, vol_out, seg_out, shape)
+        )
+
     df_meta = pd.DataFrame(metadata_rows)
+    df_demo = load_demographics([save_dir, data_dir])
 
     if not df_demo.empty and not df_meta.empty:
-        # The xlsx typically has an "ID" column matching subject_id
         id_col = "ID" if "ID" in df_demo.columns else df_demo.columns[0]
-        df_meta = df_meta.merge(df_demo, left_on="ID", right_on=id_col, how="left", suffixes=("", "_demo"))
+        # Avoid duplicate ID column from a right-side rename collision.
+        demo = df_demo.copy()
+        if id_col != "ID":
+            demo = demo.rename(columns={id_col: "ID"})
+        overlap = [c for c in demo.columns if c in df_meta.columns and c != "ID"]
+        if overlap:
+            demo = demo.drop(columns=overlap)
+        df_meta = df_meta.merge(demo, on="ID", how="left")
+        n_matched = int(df_meta["ID"].isin(demo["ID"]).sum())
+        logger.info(f"Merged demographics: {n_matched}/{len(df_meta)} IDs matched")
 
-    df_meta.to_csv(save_dir / "metadata.csv", index=False)
+    meta_path = save_dir / "metadata.csv"
+    df_meta.to_csv(meta_path, index=False)
 
-    num_files = len(list(save_dir.glob("*.nii.gz")))
-    logger.info(f"Finished. NIfTI files written: {num_files}")
+    n_vol = len(list(volume_dir.glob("*.nii.gz")))
+    n_seg = len(list(seg_dir.glob("*.nii.gz")))
+    logger.info(f"Wrote {n_vol_new} new volumes; total volumes: {n_vol}")
+    logger.info(f"Wrote {n_seg_new} new segs; total segs: {n_seg}")
+    logger.info(f"metadata.csv -> {meta_path} ({len(df_meta)} rows)")
     logger.info("=" * 60)
     logger.info("Preprocessing completed.")
     logger.info("=" * 60)
