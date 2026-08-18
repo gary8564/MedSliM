@@ -1,6 +1,6 @@
-# MedSliM
+# MedSliM: Medical Slice-wise Mamba for Contrastive Multi-Instance Volumetric Representation Learning
 
-**Med**ical **Sli**ce-wise **M**amba — Self-supervised pretraining for volumetric medical images from 2D foundation model features.
+A self-supervised pretraining framework for volumetric medical images from 2D foundation model features.
 
 MedSliM extracts per-slice features from frozen 2D foundation models, then pretrains a [COBRA](#references) encoder (Mamba2 sequence encoder + ABMIL pooling) via cross-foundation-model contrastive learning (MoCo). The resulting volume-level representations transfer to downstream classification via linear probing or k-NN evaluation.
 
