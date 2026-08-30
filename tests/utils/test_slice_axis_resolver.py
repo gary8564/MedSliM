@@ -78,6 +78,28 @@ VOLUME_CASES = [
         26,
     ),
     VolumeCase(
+        "RSNA-Knee-2D-axial",
+        Path(
+            "/hpcwork/rwth1833/datasets/preprocessed/RSNA-Knee/test/non_fluid_sensitive/axial/"
+            "1.2.826.0.1.3680043.8.498.10047035057544427318018579121635276191_"
+            "MR0_1.2.826.0.1.3680043.8.498.11580656442259111255675562605155903947"
+            ".nii.gz"
+        ),
+        "axial",
+        34,
+    ),
+    VolumeCase(
+        "RSNA-Knee-3D-sagittal",
+        Path(
+            "/hpcwork/rwth1833/datasets/preprocessed/RSNA-Knee/train/fluid_sensitive_fs/sagittal/"
+            "1.2.826.0.1.3680043.8.498.10085187975213640798228717119613397941_"
+            "MR1_1.2.826.0.1.3680043.8.498.30612781365806999657709742696576857451"
+            ".nii.gz"
+        ),
+        "sagittal",
+        320,
+    ),
+    VolumeCase(
         "SKM-TEA",
         Path(
             "/hpcwork/rwth1833/datasets/preprocessed/SKM-TEA/DESS_E1/train/sagittal/"
