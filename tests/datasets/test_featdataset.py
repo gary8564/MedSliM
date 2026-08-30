@@ -12,6 +12,7 @@ from med_slim.data.feat_dataset import (
     MultiViewFeatClassificationDataset,
     linear_classifier_collate_fn,
     multiview_classifier_collate_fn,
+    _candidate_slice_range,
 )
 from torch.utils.data import DataLoader
 
@@ -181,6 +182,90 @@ def test_compute_physical_positions_normalized_relative_depth():
 
     single = PrecomputedFeatPairDataset._compute_physical_positions(np.array([0]), 1, 4)
     assert single[0].item() == 0.0
+
+
+def _slice_policy(
+    *,
+    num_target_slices: int = 32,
+    use_central_crop_slice: bool = False,
+    central_keep_fraction: float = 0.8,
+    central_min_depth: int = 48,
+) -> PrecomputedFeatPairDataset:
+    """Minimal unbound instance for testing slice-index helpers."""
+    obj = PrecomputedFeatPairDataset.__new__(PrecomputedFeatPairDataset)
+    obj.num_target_slices = num_target_slices
+    obj.use_central_crop_slice = use_central_crop_slice
+    obj.central_keep_fraction = central_keep_fraction
+    obj.central_min_depth = central_min_depth
+    return obj
+
+
+def test_candidate_slice_range_window_math():
+    """Module-level window helper: full stack vs central 80%/70%."""
+    assert _candidate_slice_range(160, use_central_crop=False) == (0, 160)
+    assert _candidate_slice_range(160, use_central_crop=True, keep_fraction=0.8) == (16, 144)
+    assert _candidate_slice_range(160, use_central_crop=True, keep_fraction=0.7) == (24, 136)
+    # Short volumes: no margin when D <= min_depth
+    assert _candidate_slice_range(48, use_central_crop=True, keep_fraction=0.8, min_depth=48) == (0, 48)
+
+
+def test_compute_subsample_indices_full_vs_central():
+    """Central 80% trims equal margins; PE stays relative to original D."""
+    D, T = 160, 32
+    full = _slice_policy(num_target_slices=T)._compute_subsample_indices(D)
+    assert len(full) == T
+    assert full[0] == 0 and full[-1] == D - 1
+
+    central_ds = _slice_policy(
+        num_target_slices=T,
+        use_central_crop_slice=True,
+        central_keep_fraction=0.8,
+        central_min_depth=48,
+    )
+    central = central_ds._compute_subsample_indices(D)
+    assert len(central) == T
+    start, end = _candidate_slice_range(D, use_central_crop=True, keep_fraction=0.8, min_depth=48)
+    assert start == 16 and end == 144  # central 80% of 160
+    assert central[0] == start and central[-1] == end - 1
+
+    # Short volumes: no margin when D <= central_min_depth
+    short = central_ds._compute_subsample_indices(48)
+    assert short[0] == 0 and short[-1] == 47
+
+    # Physical PE relative to original D (not renormalized to the window)
+    pos = PrecomputedFeatPairDataset._compute_physical_positions(central, D, T)
+    assert abs(pos[0].item() - start / (D - 1)) < 1e-5
+    assert abs(pos[-1].item() - (end - 1) / (D - 1)) < 1e-5
+    assert 0.05 < pos[0].item() < 0.15
+    assert 0.85 < pos[-1].item() < 0.95
+
+    # Stronger central 70%
+    central70 = _slice_policy(
+        num_target_slices=T,
+        use_central_crop_slice=True,
+        central_keep_fraction=0.7,
+        central_min_depth=48,
+    )._compute_subsample_indices(D)
+    s70, e70 = _candidate_slice_range(D, use_central_crop=True, keep_fraction=0.7, min_depth=48)
+    assert s70 == 24 and e70 == 136
+    assert central70[0] == s70 and central70[-1] == e70 - 1
+
+
+def test_central_crop_indices_for_packed_keep_all_window_slices():
+    """Packed mode should keep every slice in the central window (no linspace to 32)."""
+    D = 160
+    ds = _slice_policy(
+        use_central_crop_slice=True,
+        central_keep_fraction=0.8,
+        central_min_depth=48,
+    )
+    indices = ds._resolve_central_crop_indices(D)
+    assert len(indices) == 128
+    assert indices[0] == 16 and indices[-1] == 143
+    pos = PrecomputedFeatPairDataset._compute_physical_positions(indices, D, len(indices))
+    assert pos.shape == (128,)
+    assert abs(pos[0].item() - 16 / 159) < 1e-5
+    assert abs(pos[-1].item() - 143 / 159) < 1e-5
 
 
 def test_linear_classifier_collate_includes_physical_positions():

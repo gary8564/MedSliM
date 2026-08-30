@@ -63,6 +63,37 @@ datasets:
     label_display_names:
       # ... (optional; auto-formatted if omitted)
 
+  RSNA-Knee:
+    # RSNA Knee Abnormality Detection (Kaggle). 
+    # https://www.kaggle.com/competitions/rsna-knee-abnormality-detection
+    task: multilabel
+    target_labels:
+      - ACL
+      - MCL
+      - Medial Meniscus
+      - Lateral Meniscus
+      - Medial OA
+      - Lateral OA
+      - PF OA
+      - Effusion
+      - Synovitis
+      - "Baker's"
+      - Contusion
+      - Fracture
+    label_display_names:
+      ACL: ACL Tear
+      MCL: MCL Tear
+      Medial Meniscus: Medial Meniscus Tear
+      Lateral Meniscus: Lateral Meniscus Tear
+      Medial OA: Medial OA
+      Lateral OA: Lateral OA
+      PF OA: Patellofemoral OA
+      Effusion: Effusion
+      Synovitis: Synovitis
+      "Baker's": Baker's Cyst
+      Contusion: Contusion
+      Fracture: Fracture
+
   LIDC-IDRI:
     task: binary
     target_labels: [Malignant]

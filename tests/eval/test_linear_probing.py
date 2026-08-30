@@ -1,6 +1,7 @@
 """
 Smoke tests for linear probing helpers in ``linear_classifier.py``.
 """
+import pytest
 import torch
 import torch.nn as nn
 
@@ -10,6 +11,9 @@ from med_slim.eval.linear_classifier import (
     MultiViewClassifier,
     _compute_loss,
     _compute_metrics,
+    apply_trainable_layers,
+    normalize_trainable_layers,
+    resolve_unfreeze_layers,
 )
 from med_slim.eval.load_cobra import resolve_eval_fm_ids
 from med_slim.utils.metrics.linear import get_loss_criterion
@@ -153,3 +157,60 @@ def test_compute_metrics_binary():
     labels = torch.randint(0, 2, (16,), device=DEVICE).long()
     metrics = _compute_metrics(logits, labels, "binary", 2, DEVICE)
     assert "auroc" in metrics
+
+
+def test_apply_trainable_layers():
+    class DummyCobraWithAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seq_enc = nn.Linear(4, 4)
+            self.attn = nn.Linear(4, 1)
+            self.fm_router = nn.Linear(4, 2)
+
+    cobra = DummyCobraWithAttn()
+    applied = apply_trainable_layers(cobra, ["attn"])
+    assert applied == ["attn"]
+    assert cobra.seq_enc.weight.requires_grad is False
+    assert cobra.attn.weight.requires_grad is True
+    assert cobra.fm_router.weight.requires_grad is False
+
+    apply_trainable_layers(cobra, [])
+    assert cobra.attn.weight.requires_grad is False
+
+    apply_trainable_layers(cobra, ["all"])
+    assert cobra.seq_enc.weight.requires_grad is True
+    assert cobra.attn.weight.requires_grad is True
+    assert cobra.fm_router.weight.requires_grad is True
+
+
+def test_apply_trainable_layers_catch_error_for_missing_layer():
+    class DummyClsOnlyCobra(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seq_enc = nn.Linear(4, 4)
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, 4))
+
+    cobra = DummyClsOnlyCobra()
+    with pytest.raises(ValueError, match="attn"):
+        apply_trainable_layers(cobra, ["attn"])
+
+
+def test_normalize_trainable_layers():
+    assert normalize_trainable_layers(None) == []
+    assert normalize_trainable_layers([]) == []
+
+
+def test_normalize_trainable_layers_catch_error_for_invalid_layer():
+    with pytest.raises(ValueError, match="abmil"):
+        normalize_trainable_layers(["abmil"])
+    with pytest.raises(ValueError, match="none"):
+        normalize_trainable_layers("none")
+
+
+def test_resolve_unfreeze_layers():
+    assert resolve_unfreeze_layers() == []
+    assert resolve_unfreeze_layers(fine_tune=True) == ["all"]
+    assert resolve_unfreeze_layers(["attn"]) == ["attn"]
+    assert resolve_unfreeze_layers(["attn"], fine_tune=True) == ["attn"]
+    assert resolve_unfreeze_layers(freeze_cobra=False) == ["all"]
+    assert resolve_unfreeze_layers(["fm_router"], freeze_cobra=False) == ["fm_router"]

@@ -254,6 +254,113 @@ class ClassifierHead(nn.Module):
         return self.classifier(x)
 
 
+# Top-level COBRA modules as stored in SSL checkpoints (base_encoder.<name>.*).
+# `all` unfreezes every COBRA parameter. Omitted flag = freeze COBRA (linear probing).
+COBRA_TRAINABLE_LAYER_CHOICES = (
+    "attn",
+    "embed",
+    "seq_enc",
+    "fm_router",
+    "proj",
+    "norm",
+    "all",
+)
+DEFAULT_FINETUNE_LAYERS = ("all",)
+
+
+def normalize_trainable_layers(value) -> List[str]:
+    """Coerce YAML/CLI layer specs to a list. Empty/None means freeze COBRA."""
+    if value is None:
+        return []
+    layers = [value] if isinstance(value, str) else list(value)
+    unknown = [name for name in layers if name not in COBRA_TRAINABLE_LAYER_CHOICES]
+    if unknown:
+        raise ValueError(
+            f"Invalid trainable layer(s) {unknown}. "
+            f"Choose from: {list(COBRA_TRAINABLE_LAYER_CHOICES)}."
+        )
+    return layers
+
+
+def resolve_unfreeze_layers(
+    trainable_layers=None,
+    *,
+    fine_tune: bool = False,
+    freeze_cobra: bool = True,
+) -> List[str]:
+    """
+    Decide which COBRA modules to unfreeze.
+
+    Precedence:
+      1. Explicit `trainable_layers` (CLI or YAML)
+      2. `--fine-tune` or `freeze_cobra=False` → `all`
+      3. Otherwise, linear probing
+    """
+    layers = normalize_trainable_layers(trainable_layers)
+    if layers:
+        return layers
+    if fine_tune or not freeze_cobra:
+        return list(DEFAULT_FINETUNE_LAYERS)
+    return []
+
+
+def extract_cobra_layers(cobra: nn.Module) -> List[str]:
+    """Top-level parameter prefixes on a Cobra module."""
+    top_layers = {name.split(".", 1)[0] for name, _ in cobra.named_parameters()}
+    return sorted(top_layers)
+
+
+def apply_trainable_layers(cobra: nn.Module, unfreeze_layers) -> List[str]:
+    """Freeze COBRA, then unfreeze parameters based on `unfreeze_layers`."""
+    trainable_layers = normalize_trainable_layers(unfreeze_layers)
+    for param in cobra.parameters():
+        param.requires_grad = False
+    if not trainable_layers:
+        return []
+    if "all" in trainable_layers:
+        for param in cobra.parameters():
+            param.requires_grad = True
+        return ["all"]
+
+    cobra_layers = set(extract_cobra_layers(cobra))
+    missing = [trainable_layer for trainable_layer in trainable_layers if trainable_layer not in cobra_layers]
+    if missing:
+        raise ValueError(
+            f"COBRA checkpoint has no parameter(s) for {missing}. "
+            f"Available modules: {sorted(cobra_layers)}."
+        )
+    for name, param in cobra.named_parameters():
+        cobra_layer = name.split(".", 1)[0]
+        if cobra_layer in trainable_layers:
+            param.requires_grad = True
+    return trainable_layers
+
+
+def set_cobra_runtime_mode(cobra: nn.Module, unfreeze_layers, training: bool) -> None:
+    """Keep frozen modules in eval; train only the selected COBRA submodules."""
+    trainable_layers = list(unfreeze_layers or [])
+    if not training or not trainable_layers:
+        cobra.eval()
+        return
+    if "all" in trainable_layers:
+        cobra.train()
+        return
+    cobra.eval()
+    modules = dict(cobra.named_modules())
+    for trainable_layer in trainable_layers:
+        if trainable_layer in modules:
+            modules[trainable_layer].train()
+
+
+def print_cobra_eval_mode(unfreeze_layers) -> str:
+    trainable_layers = list(unfreeze_layers or [])
+    if not trainable_layers:
+        return "Linear Probing (frozen COBRA)"
+    if "all" in trainable_layers:
+        return "Fine-tuning (full COBRA)"
+    return "Fine-tuning COBRA layers: " + ", ".join(trainable_layers)
+
+
 class MultiViewAttentionAggregator(nn.Module):
     """
     Attention-based aggregator for multi-view embeddings.
@@ -302,19 +409,19 @@ class SingleViewClassifier(nn.Module):
         classifier_hidden_dim: int = 512,
         classifier_dropout: float = 0.5,
         freeze_cobra: bool = True,
+        trainable_layers: Optional[List[str]] = None,
         fm_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
-        self.freeze_cobra = freeze_cobra
+        layers = resolve_unfreeze_layers(trainable_layers, freeze_cobra=freeze_cobra)
+        self.trainable_layers = apply_trainable_layers(cobra_model, layers)
+        self.freeze_cobra = len(self.trainable_layers) == 0
         fm_id_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long)
         self.register_buffer("fm_ids", fm_id_tensor, persistent=False)
         
         # COBRA encoder
         self.cobra = cobra_model
-        if freeze_cobra:
-            for param in self.cobra.parameters():
-                param.requires_grad = False
         
         # Classifier head
         self.classifier = ClassifierHead(
@@ -341,9 +448,7 @@ class SingleViewClassifier(nn.Module):
         Returns:
             Dict with logits and embedding
         """
-        # Keep COBRA in eval mode when frozen to disable dropout
-        if self.freeze_cobra:
-            self.cobra.eval()
+        set_cobra_runtime_mode(self.cobra, self.trainable_layers, self.training)
         
         # Cast features to model dtype
         features = [f.to(dtype=next(self.cobra.parameters()).dtype) for f in features]
@@ -387,21 +492,21 @@ class MultiViewClassifier(nn.Module):
         attention_hidden_dim: int = 128,
         attention_dropout: float = 0.1,
         freeze_cobra: bool = True,
+        trainable_layers: Optional[List[str]] = None,
         fm_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.view_planes = view_planes
         self.num_views = len(view_planes)
         self.num_classes = num_classes
-        self.freeze_cobra = freeze_cobra
+        layers = resolve_unfreeze_layers(trainable_layers, freeze_cobra=freeze_cobra)
+        self.trainable_layers = apply_trainable_layers(cobra_model, layers)
+        self.freeze_cobra = len(self.trainable_layers) == 0
         fm_id_tensor = None if fm_ids is None else torch.as_tensor(fm_ids, dtype=torch.long)
         self.register_buffer("fm_ids", fm_id_tensor, persistent=False)
         
-        # COBRA encoder (shared across views, typically frozen)
+        # COBRA encoder (shared across views)
         self.cobra = cobra_model
-        if freeze_cobra:
-            for param in self.cobra.parameters():
-                param.requires_grad = False
         
         # Attention-based view aggregation
         self.attention_aggregator = MultiViewAttentionAggregator(
@@ -435,9 +540,7 @@ class MultiViewClassifier(nn.Module):
         Returns:
             Dict with logits, attention_weights, and view_embeddings
         """
-        # Keep COBRA in eval mode when frozen to disable dropout
-        if self.freeze_cobra:
-            self.cobra.eval()
+        set_cobra_runtime_mode(self.cobra, self.trainable_layers, self.training)
         
         view_embeddings = {}
         
@@ -498,10 +601,10 @@ def _build_optimizer(
     When COBRA is frozen (linear probing):
         Single LR for all trainable params (classifier head only).
 
-    When COBRA is unfrozen (fine-tuning):
+    When any COBRA params are unfrozen (fine-tuning):
         - base_lr for new / randomly-initialised modules:
             classifier head, attention_aggregator (multi-view only).
-        - base_lr * backbone_lr_scale for the pretrained COBRA backbone.
+        - base_lr * backbone_lr_scale for the trainable COBRA parameters.
 
     Args:
         model: SingleViewClassifier or MultiViewClassifier
@@ -515,7 +618,8 @@ def _build_optimizer(
     weight_decay = float(hyperparams.get("weight_decay", 1e-3))
 
     # Linear probing: COBRA frozen
-    if model.freeze_cobra:
+    cobra_trainable = any(p.requires_grad for p in model.cobra.parameters())
+    if not cobra_trainable:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         return torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=weight_decay)
 
@@ -1087,12 +1191,12 @@ def run_single_view_evaluation(
         classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
         classifier_dropout=linear_hyperparams.get("dropout", 0.5),
         freeze_cobra=freeze_cobra,
+        trainable_layers=cfg.get("trainable_layers"),
         fm_ids=cfg.get("eval_fm_ids"),
     )
     
     if accelerator.is_main_process:
-        mode = "Linear Probing" if freeze_cobra else "Fine-tuning"
-        logger.info(f"Training mode: {mode}")
+        logger.info(f"Training mode: {print_cobra_eval_mode(model.trainable_layers)}")
     _log_trainable_params(model, accelerator)
     
     # Train
@@ -1276,6 +1380,7 @@ def run_single_view_kfold_evaluation(
             classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
             classifier_dropout=linear_hyperparams.get("dropout", 0.5),
             freeze_cobra=freeze_cobra,
+            trainable_layers=cfg.get("trainable_layers"),
             fm_ids=cfg.get("eval_fm_ids"),
         )
         if fold_idx == 0:
@@ -1467,6 +1572,7 @@ def collect_predictions_per_view_classifier(
         classifier_hidden_dim=linear_hyperparams.get("hidden_dim", 512),
         classifier_dropout=linear_hyperparams.get("dropout", 0.5),
         freeze_cobra=freeze_cobra,
+        trainable_layers=cfg.get("trainable_layers"),
         fm_ids=cfg.get("eval_fm_ids"),
     )
     _log_trainable_params(model, accelerator)
@@ -2596,12 +2702,12 @@ def run_multiview_evaluation(
         attention_hidden_dim=attention_hyperparams.get("hidden_dim", 128),
         attention_dropout=attention_hyperparams.get("dropout", 0.1),
         freeze_cobra=freeze_cobra,
+        trainable_layers=cfg.get("trainable_layers"),
         fm_ids=cfg.get("eval_fm_ids"),
     )
     
     if accelerator.is_main_process:
-        mode = "Linear Probing" if freeze_cobra else "Fine-tuning"
-        logger.info(f"Training mode: {mode}")
+        logger.info(f"Training mode: {print_cobra_eval_mode(model.trainable_layers)}")
     _log_trainable_params(model, accelerator)
     
     # Train
@@ -2686,6 +2792,13 @@ def main(args):
     with open(args.linear_classifier_config, "r") as f:
         cfg = yaml.safe_load(f)
 
+    if args.dataset_name:
+        cfg.setdefault("feat_dataset", {})["dataset_name"] = args.dataset_name
+    if args.annotations_dir:
+        cfg["annotations_dir"] = args.annotations_dir
+    if args.output_dir:
+        cfg["output_dir"] = args.output_dir
+
     dataset_name = cfg.get("feat_dataset", {}).get("dataset_name")
     if dataset_name is None:
         raise ValueError("Missing required field `dataset_name` in `linear_classifier.yml`.")
@@ -2717,9 +2830,20 @@ def main(args):
     if "val" in annot_files:
         cfg["val_annots"] = str(annot_files["val"])
 
-    # CLI `--fine-tune` flag overrides `freeze_cobra` in config
-    if args.fine_tune:
-        cfg["freeze_cobra"] = not args.fine_tune
+    # CLI --fine-tune / --trainable-layers override freeze_cobra in config.
+    # Full fine-tuning: --fine-tune with no --trainable-layers. 
+    # Whenever --trainable-layers is set, only those layers are fine-tuned.
+    # Linear probing: neither flag.
+    cli_layers = getattr(args, "trainable_layers", None)
+    if cli_layers is not None or args.fine_tune:
+        layers = resolve_unfreeze_layers(cli_layers, fine_tune=args.fine_tune)
+    else:
+        layers = resolve_unfreeze_layers(
+            cfg.get("trainable_layers"),
+            freeze_cobra=cfg.get("freeze_cobra", True),
+        )
+    cfg["trainable_layers"] = layers
+    cfg["freeze_cobra"] = len(layers) == 0
 
     # Few-shot / repeated-evaluation configuration.
     # CLI overrides config under cfg["few_shot"], which itself overrides defaults.
@@ -2755,6 +2879,9 @@ def main(args):
     planes = cfg["feat_dataset"]["plane"]
     if args.feat_dir:
         cfg["feat_dataset"]["feat_dir"] = args.feat_dir
+    if args.planes:
+        planes = args.planes
+        cfg["feat_dataset"]["plane"] = planes
 
     if args.fm_model_names:
         model_names = args.fm_model_names.split()  
@@ -2843,6 +2970,7 @@ def main(args):
     cfg["regional_tokens"] = cobra_cfg.get("regional_tokens", 0)
     cfg["fm_id_order"] = fm_id_order
     cfg["eval_fm_ids"] = eval_fm_ids
+    cfg["feat_dataset"]["model_name"] = list(model_names)
     if pretrain_state is not None:
         cfg["num_fms"] = pretrain_state.get("num_fms")
         cfg["router_mode"] = pretrain_state.get("router_mode", cobra_cfg.get("router_mode", "soft"))
@@ -2923,6 +3051,7 @@ def main(args):
 
     # Run evaluation
     has_val_annots = "val_annots" in cfg and cfg["val_annots"]
+
 
     train_datasets = test_datasets = val_datasets = None
     train_dataset = test_dataset = val_dataset = None
@@ -3172,6 +3301,30 @@ if __name__ == "__main__":
         help="Override feat_dataset.feat_dir (e.g. .../crop_tiled_2x2 for tiled checkpoints).",
     )
     parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default=None,
+        help="Override feat_dataset.dataset_name (must exist in eval_datasets.yaml).",
+    )
+    parser.add_argument(
+        "--annotations-dir",
+        type=str,
+        default=None,
+        help="Override annotations_dir (directory of train/test CSVs).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Override output_dir for this run.",
+    )
+    parser.add_argument(
+        "--planes",
+        nargs="+",
+        default=None,
+        help="Override feat_dataset.plane (e.g. sagittal coronal axial).",
+    )
+    parser.add_argument(
         "--fm-model-names",
         type=str,
         default=None,
@@ -3191,7 +3344,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fine-tune",
         action="store_true",
-        help="Unfreeze COBRA backbone. Overrides freeze_cobra in config."
+        help=(
+            "Unfreeze the full COBRA backbone (same as --trainable-layers all). "
+            "Optional if --trainable-layers is already set. "
+            "Overrides freeze_cobra in config."
+        ),
+    )
+    parser.add_argument(
+        "--trainable-layers",
+        nargs="+",
+        choices=COBRA_TRAINABLE_LAYER_CHOICES,
+        default=None,
+        help=(
+            "COBRA modules to unfreeze (implies fine-tuning; --fine-tune is optional). "
+            "Omit both this flag and --fine-tune for linear probing. "
+        ),
     )
     parser.add_argument(
         "--fm-pooling",

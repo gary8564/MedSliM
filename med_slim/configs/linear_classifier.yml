@@ -19,6 +19,7 @@ checkpoint_path: "/hpcwork/rwth1833/checkpoints/MedSliM-pretraining/MRNet/2026-0
 # pretrain_config_path: "/path/to/pretrain/config.yaml"
 encoder_type: "momentum"  # "base" or "momentum" encoder for downstream tasks
 freeze_cobra: true  # true = linear probing (frozen COBRA), false = fine-tuning (trainable COBRA)
+# trainable_layers: [attn]  # same names as --trainable-layers (CLI wins when present)
 
 # ------------------------------------------------------------------------------
 # Feature dataset configuration
@@ -56,6 +57,24 @@ feat_dataset:
     - "mri-core"
 
 # feat_dataset:
+#   dataset_name: "RSNA-Knee"
+#   feat_dir: "/hpcwork/rwth1833/feat_caches/RSNA-Knee/slices_raw/adaptive"
+#   plane:
+#     - "sagittal"
+#     - "coronal"
+#     - "axial"
+#   model_name:
+#     - "dinov2"
+#     - "dinov3"
+#     - "rad-dino"
+#     - "medsiglip"
+#     - "biomedclip"
+#     - "ark"
+#     - "mri-core"
+#     - "medimageinsight"
+#     - "curia"
+
+# feat_dataset:
 #   dataset_name: "SKM-TEA"
 #   plane: ["sagittal"]
 #   sequences:
@@ -79,6 +98,7 @@ feat_dataset:
 #     - "flexict-2d"
 
 annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/SKM-TEA"
+# annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/RSNA-Knee"
 
 # ------------------------------------------------------------------------------
 # Few-shot / repeated-evaluation configuration
@@ -96,6 +116,7 @@ few_shot:
 # Output directory configuration
 # ------------------------------------------------------------------------------
 output_dir: "/hpcwork/qj474765/experiments/MedSliM-linear-probing/SKM-TEA"
+# output_dir: "/hpcwork/rwth1833/experiments/MedSliM-linear-probing/RSNA-Knee"
 
 # ------------------------------------------------------------------------------
 # Hyperparameters

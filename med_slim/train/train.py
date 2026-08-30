@@ -279,10 +279,24 @@ def main(args, cfg):
     view_planes = feat_cfg["plane"]
     use_packed = feat_cfg.get("use_packed", False)
     num_target_slices = feat_cfg.get("num_target_slices", 32)
+    use_central_crop_slice = bool(feat_cfg.get("use_central_crop_slice", False))
+    central_keep_fraction = float(feat_cfg.get("central_keep_fraction", 0.8))
+    central_min_depth = int(feat_cfg.get("central_min_depth", 48))
     if use_packed:
-        print("Packed mode: using raw variable-length sequences (no subsampling / zero-padding)")
+        print("Packed mode: using variable-length sequences (no fixed-length subsample / zero-padding)")
+        if use_central_crop_slice:
+            print(
+                f"Central slice crop: enabled "
+                f"(keep_fraction={central_keep_fraction}, min_depth={central_min_depth})"
+            )
     else:
         print(f"Pad-or-sample mode: all sequences will be sampled/padded to {num_target_slices} slices")
+        if use_central_crop_slice:
+            print(
+                f"Enable central slice crop before uniform subsampling (keep_fraction={central_keep_fraction}, min_depth={central_min_depth})."
+            )
+        else:
+            print("Disable central slice crop before uniform subsampling.")
     if ssl_fm_mode == "subset":
         print(
             f"Subset FM SSL: fm_subset_size={ssl_cfg.get('fm_subset_size')}, "
@@ -303,6 +317,9 @@ def main(args, cfg):
         split="train",
         max_feature_dim=max_feature_dim,
         num_target_slices=num_target_slices,
+        use_central_crop_slice=use_central_crop_slice,
+        central_keep_fraction=central_keep_fraction,
+        central_min_depth=central_min_depth,
         cache_in_memory=cache_in_memory,
         use_packed=use_packed,
         ssl_fm_mode=ssl_fm_mode,
@@ -540,6 +557,9 @@ def main(args, cfg):
                     "per_fm_adapter_mode": per_fm_adapter_mode,
                     "fm_input_dims": fm_input_dims,
                     "fm_id_order": cfg["feat_dataset"]["model_name"],
+                    "use_central_crop_slice": use_central_crop_slice,
+                    "central_keep_fraction": central_keep_fraction,
+                    "central_min_depth": central_min_depth,
                     "ssl_fm_mode": ssl_fm_mode,
                     "fm_subset_size": ssl_cfg.get("fm_subset_size"),
                     "fm_subset_min_overlap": ssl_cfg.get("fm_subset_min_overlap", 1),

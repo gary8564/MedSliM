@@ -36,6 +36,11 @@ feat_dataset:
     - "coronal"
     - "axial"
   num_target_slices: 32  # 128 (CT); 32 (MRI)
+  # Feature-space central crop before pad-or-sample / packed sequence construction.
+  # Set true to keep the central keep-fraction (e.g. 0.8) when D > central_min_depth.
+  use_central_crop_slice: false
+  central_keep_fraction: 0.8
+  central_min_depth: 48         # if D <= central_min_depth, sample from the full stack 
 
 model:
   slice_encoder_models:
@@ -137,7 +142,7 @@ model:
     fm_pooling: router          # avg_pool | router
     # Projection-adapter keying for the FM-set paths (subset SSL / FM-set inference).
     # per_dim: share one Embed MLP across FMs of the same input dim (legacy router/paired/packed SSL default).
-    # per_fm_id: one Embed MLP per FM so each FM is a distinct expert (recommended for router).
+    # per_fm_id: one Embed MLP per FM so each FM is a distinct expert 
     per_fm_adapter_mode: per_dim   # per_dim | per_fm_id
     router_use_fm_embedding: true
     router_use_fm_logit_bias: true

@@ -3,6 +3,9 @@ import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+CLASSIFICATION_TASKS = ("binary", "multiclass", "multilabel")
+
+
 def load_eval_datasets_config() -> Dict[str, Any]:
     """Load the full ``eval_datasets.yaml`` config."""
     current_dir = Path(__file__).parent
@@ -48,6 +51,10 @@ def validate_eval_target_labels(task: str, target_labels: List[str]) -> None:
     Matches `FeatClassificationDataset` rules: binary and multiclass use one
     column; multilabel requires at least two independent label columns.
     """
+    if task not in CLASSIFICATION_TASKS:
+        raise ValueError(
+            f"Unknown task '{task}'. Expected one of {CLASSIFICATION_TASKS}."
+        )
     if not target_labels:
         raise ValueError(f"`target_labels` must be non-empty for task '{task}'.")
     if task in ("binary", "multiclass") and len(target_labels) != 1:
@@ -93,7 +100,7 @@ def build_run_label_tag(
         return f"binary_{plane_tag}"
     if task == "multiclass":
         return f"multiclass_{plane_tag}"
-    return f"{task}_{plane_tag}"
+    raise ValueError(f"Unknown task '{task}'. Expected one of {CLASSIFICATION_TASKS}.")
 
 
 def _resolve_annotation_path(
@@ -101,22 +108,13 @@ def _resolve_annotation_path(
     task: str,
     split: str,
 ) -> Optional[str]:
-    """Resolve a single split name to its annotation CSV path, or None if absent."""
+    """Resolve ``{split}_{task}.csv`` if present, else ``{split}.csv``."""
+    if task not in CLASSIFICATION_TASKS:
+        raise ValueError(f"Unknown task '{task}'. Expected one of {CLASSIFICATION_TASKS}.")
     base_dir = Path(annotations_dir)
-    default_path = base_dir / f"{split}.csv"
-
-    if task == "binary":
-        binary_path = base_dir / f"{split}_binary.csv"
-        annot_path = binary_path if binary_path.exists() else default_path
-    elif task == "multiclass":
-        multiclass_path = base_dir / f"{split}_multiclass.csv"
-        annot_path = multiclass_path if multiclass_path.exists() else default_path
-    else:
-        annot_path = default_path
-
-    if not annot_path.exists():
-        return None
-    return str(annot_path)
+    preferred = base_dir / f"{split}_{task}.csv"
+    annot_path = preferred if preferred.exists() else base_dir / f"{split}.csv"
+    return str(annot_path) if annot_path.exists() else None
 
 
 def get_annotation_paths_by_split(
@@ -128,7 +126,7 @@ def get_annotation_paths_by_split(
     """
     Resolve annotation CSV paths per split from a dataset annotations directory.
 
-    For multiclass tasks, prefers ``{split}_multiclass.csv`` over ``{split}.csv``.
+    Prefers ``{split}_{task}.csv`` over ``{split}.csv`` when the suffixed file exists.
 
     Args:
         annotations_dir: Root directory containing annotation CSVs

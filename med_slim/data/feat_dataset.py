@@ -5,7 +5,8 @@ import torch
 import random
 import os
 import logging
-from typing import List, Tuple, Dict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from torch.utils.data import Dataset
 from glob import glob
@@ -15,6 +16,100 @@ from collections import defaultdict
 from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
+
+
+# RSNA-Knee (and any multi-series exam) names files ``{study}_MR{k}_{series}``.
+_MR_INDEX_REGEX = re.compile(r"_MR(\d+)_")
+_SAFETENSORS_SUFFIX = ".safetensors"
+
+
+def _feat_stem(filename: str) -> str:
+    name = os.path.basename(filename)
+    if name.endswith(_SAFETENSORS_SUFFIX):
+        return name[: -len(_SAFETENSORS_SUFFIX)]
+    return Path(name).stem
+
+
+def _mr_index(feat_id: str) -> float:
+    match = _MR_INDEX_REGEX.search(feat_id)
+    return int(match.group(1)) if match else float("inf")
+
+
+def _filename_for_annotation_id(
+    sample_id: str,
+    feat_id_to_filename: Dict[str, str],
+) -> Optional[str]:
+    """Exact series stem for a study UID."""
+    if sample_id in feat_id_to_filename:
+        return feat_id_to_filename[sample_id]
+    matches = [feat_id for feat_id in feat_id_to_filename if feat_id.startswith(f"{sample_id}_MR")]
+    if not matches:
+        return None
+    return feat_id_to_filename[min(matches, key=_mr_index)]
+
+
+def resolve_classification_id_map(
+    labels: pd.DataFrame,
+    feat_id_to_filename: Dict[str, str],
+    target_columns: List[str],
+) -> Dict[str, str]:
+    """
+    Map labeled annotation IDs to feature filenames on one plane.
+    """
+    labeled = labels.loc[~labels[target_columns].isna().any(axis=1)]
+    labeled = labeled[~labeled.index.duplicated(keep="first")]
+    resolved: Dict[str, str] = {}
+    for sample_id in labeled.index.astype(str):
+        filename = _filename_for_annotation_id(sample_id, feat_id_to_filename)
+        if filename is not None:
+            resolved[sample_id] = filename
+    return resolved
+
+
+def index_plane_feat_files(
+    feat_dir: str,
+    model_name: str,
+    view_plane: str,
+    preferred_split: str,
+) -> Dict[str, Tuple[str, str]]:
+    """
+    Index ``*.safetensors`` for one encoder/plane.
+
+    Prefers ``{feat_dir}/{model}/{preferred_split}/{plane}``. Annotation CSVs
+    define train/test membership; cache folders may not match (RSNA-Knee
+    holdout files still live under ``train/``). Sibling split folders fill
+    only IDs that are missing from the preferred folder.
+
+    Returns ``feat_id -> (cache_split, filename)``.
+    """
+    model_root = os.path.join(feat_dir, model_name)
+    if not os.path.isdir(model_root):
+        raise FileNotFoundError(f"Feature path {model_root} does not exist!")
+
+    search_dirs: List[Tuple[str, str]] = []
+    preferred_dir = os.path.join(model_root, preferred_split, view_plane)
+    if os.path.isdir(preferred_dir):
+        search_dirs.append((preferred_split, preferred_dir))
+    for split_name in sorted(os.listdir(model_root)):
+        if split_name == preferred_split:
+            continue
+        candidate = os.path.join(model_root, split_name, view_plane)
+        if os.path.isdir(candidate):
+            search_dirs.append((split_name, candidate))
+    if not search_dirs:
+        raise FileNotFoundError(
+            f"No feature directory for plane '{view_plane}' under "
+            f"{model_root}/<split>/{view_plane}"
+        )
+
+    index: Dict[str, Tuple[str, str]] = {}
+    for cache_split, directory in search_dirs:
+        for path in glob(os.path.join(directory, "*.safetensors")):
+            filename = os.path.basename(path)
+            feat_id = _feat_stem(filename)
+            if feat_id not in index:
+                index[feat_id] = (cache_split, filename)
+    return index
 
 
 class FeatureCache:
@@ -110,6 +205,27 @@ def _read_and_validate_feat(
         metadata,
     )
     return feat, metadata
+
+
+def _candidate_slice_range(
+    num_slices: int,
+    use_central_crop: bool = False,
+    keep_fraction: float = 0.8,
+    min_depth: int = 48,
+) -> Tuple[int, int]:
+    """
+    Return half-open ``[start, end)`` candidate indices in the original volume.
+
+    Full-depth keeps ``[0, D)``. With ``use_central_crop=True``, keeps the central
+    ``keep_fraction`` of depth when ``D > min_depth``, otherwise the full stack.
+    """
+    if num_slices <= 0:
+        return 0, 0
+    if (not use_central_crop) or num_slices <= min_depth or keep_fraction >= 1.0:
+        return 0, num_slices
+    margin = int(round(0.5 * (1.0 - keep_fraction) * num_slices))
+    margin = max(0, min(margin, num_slices // 2))
+    return margin, num_slices - margin
 
 
 def ssl_packed_collate_fn(batch):
@@ -328,6 +444,7 @@ def multiview_classifier_collate_fn(batch: List[Dict]) -> Dict:
         "sample_ids": sample_ids,
     }
 
+
 class PrecomputedFeatPairDataset(Dataset):
     """
     Dataset for constructing cross-FM positive pairs at the patient-study level for contrastive learning.
@@ -351,6 +468,10 @@ class PrecomputedFeatPairDataset(Dataset):
     To handle variable-length slices, we sample or pad to a fixed number of slices ``num_target_slices``:
         - Volumes with more slices than ``num_target_slices`` are uniformly subsampled (preserving anatomical order).
         - Volumes with fewer slices than ``num_target_slices`` are zero-padded.
+        - Optional ``use_central_crop_slice=True`` first restricts candidates to the central keep-fraction of the original depth (e.g. central 80%). 
+          In pad-or-sample mode, ``num_target_slices`` are then evenly spaced inside that window.
+          In packed mode, the full central window is kept as a shorter variable-length sequence.
+          Physical PE stays relative to original D.
     
     Directory structure:
         {feat_dir}/{model}/{split}/{plane}/*.safetensors
@@ -366,6 +487,9 @@ class PrecomputedFeatPairDataset(Dataset):
                  split: str, 
                  max_feature_dim: int,
                  num_target_slices: int = 32,
+                 use_central_crop_slice: bool = False,
+                 central_keep_fraction: float = 0.8,
+                 central_min_depth: int = 48,
                  cache_in_memory: bool = False,
                  use_packed: bool = False,
                  ssl_fm_mode: str = "pair",
@@ -390,9 +514,21 @@ class PrecomputedFeatPairDataset(Dataset):
             num_target_slices: Target number of slices for all outputs. Volumes with more slices 
                                are uniformly subsampled (order-preserving); volumes with fewer are 
                                zero-padded. Default: 32. Ignored when use_packed=True.
+            use_central_crop_slice: If True, discard equal margins so the central
+                ``central_keep_fraction`` of depth remains (avoids feeding edge
+                artifact slices). Volumes with ``D <= central_min_depth`` keep the
+                full stack (no margin). Compatible with ``use_packed``: packed keeps
+                the full central window as a variable-length sequence; pad-or-sample
+                then uniform-samples that window down to ``num_target_slices``.
+            central_keep_fraction: Fraction of original depth retained as candidates
+                when ``use_central_crop_slice=True`` (e.g. 0.8 → central 80%,
+                0.7 → central 70%). Must be in (0, 1].
+            central_min_depth: If ``D <= central_min_depth``, skip central margins
+                and sample from the full stack (avoids over-trimming short volumes).
             cache_in_memory: If True, preload all feature tensors into RAM at init to eliminate per-epoch disk I/O.
-            use_packed: If True, return raw variable-length sequences (no subsampling or
-                        zero-padding). Must be used with ssl_packed_collate_fn in the DataLoader.
+            use_packed: If True, return variable-length sequences (no fixed-length
+                        subsampling or zero-padding). Optional central crop still
+                        applies. Must be used with ssl_packed_collate_fn in the DataLoader.
             ssl_fm_mode: Positive-pair construction strategy.
                 - "pair" (default): cross-FM pair baseline. Each view is exactly one FM;
                   preserves the original outputs/shapes exactly.
@@ -414,6 +550,17 @@ class PrecomputedFeatPairDataset(Dataset):
         self.split = split
         self.max_feature_dim = max_feature_dim
         self.num_target_slices = num_target_slices
+        self.use_central_crop_slice = bool(use_central_crop_slice)
+        self.central_keep_fraction = float(central_keep_fraction)
+        if not (0.0 < self.central_keep_fraction <= 1.0):
+            raise ValueError(
+                f"central_keep_fraction must be in (0, 1], got {central_keep_fraction}."
+            )
+        self.central_min_depth = int(central_min_depth)
+        if self.central_min_depth < 0:
+            raise ValueError(
+                f"central_min_depth must be >= 0, got {central_min_depth}."
+            )
         self.use_packed = use_packed
 
         # FM subset SSL configuration
@@ -563,7 +710,7 @@ class PrecomputedFeatPairDataset(Dataset):
                 planes_found += 1
                 indexed_planes.add((dataset_name, view_plane))
                 for feat_file in feat_files:
-                    uid = os.path.basename(feat_file).split(".")[0]
+                    uid = _feat_stem(feat_file)
                     exam_id = self._extract_exam_id(uid)
                     study_id = f"{dataset_name}_{exam_id}"
                     feat_path_dict[study_id][view_plane].append(uid)
@@ -585,8 +732,9 @@ class PrecomputedFeatPairDataset(Dataset):
                     continue
 
                 ref_path = os.path.join(feat_dir, ref_fm, self.split, view_plane)
-                ref_uids = {os.path.basename(f).split(".")[0] 
-                            for f in glob(os.path.join(ref_path, "*.safetensors"))}
+                ref_uids = {
+                    _feat_stem(f) for f in glob(os.path.join(ref_path, "*.safetensors"))
+                }
                 
                 for fm in self.slice_encoder_models[1:]:
                     fm_path = os.path.join(feat_dir, fm, self.split, view_plane)
@@ -595,8 +743,9 @@ class PrecomputedFeatPairDataset(Dataset):
                             f"Feature path {fm_path} does not exist! "
                             f"Make sure to precompute features for FM '{fm}'."
                         )
-                    fm_uids = {os.path.basename(f).split(".")[0] 
-                               for f in glob(os.path.join(fm_path, "*.safetensors"))}
+                    fm_uids = {
+                        _feat_stem(f) for f in glob(os.path.join(fm_path, "*.safetensors"))
+                    }
                     missing = ref_uids - fm_uids
                     if missing:
                         raise FileNotFoundError(
@@ -756,19 +905,45 @@ class PrecomputedFeatPairDataset(Dataset):
         if self._feat_cache is not None:
             return self._feat_cache.get(feat_path)
         return self._load_feats(feat_path)
-        
-    @staticmethod
-    def _compute_subsample_indices(num_slices: int, num_target: int) -> np.ndarray:
-        """
-        Compute deterministic evenly-spaced indices for subsampling.
 
-        Returns indices into the original [0, num_slices) range.  When
-        ``num_slices <= num_target``, returns ``np.arange(num_slices)``
-        (no subsampling).
+    def _compute_subsample_indices(self, num_slices: int) -> np.ndarray:
         """
-        if num_slices <= num_target:
-            return np.arange(num_slices)
-        return np.round(np.linspace(0, num_slices - 1, num_target)).astype(int)
+        Compute deterministic evenly-spaced indices for pad-or-sample mode.
+
+        Uses this dataset's central-crop settings, then evenly spaces ``num_target_slices`` inside the candidate window. 
+        Returns indices into the original [0, num_slices) range. 
+        When the window length is <= num_target_slices, returns every candidate index (caller pads).
+        Physical PE should use these indices with the original num_slices as denominator so positions stay relative to full depth.
+        """
+        start, end = _candidate_slice_range(
+            num_slices,
+            use_central_crop=self.use_central_crop_slice,
+            keep_fraction=self.central_keep_fraction,
+            min_depth=self.central_min_depth,
+        )
+        candidate_len = end - start
+        if candidate_len <= 0:
+            return np.arange(0)
+        if candidate_len <= self.num_target_slices:
+            return np.arange(start, end)
+        return np.round(
+            np.linspace(start, end - 1, self.num_target_slices)
+        ).astype(int)
+
+    def _resolve_central_crop_indices(self, num_slices: int) -> np.ndarray:
+        """
+        All slice indices in the configured candidate window (no fixed-length subsample).
+
+        Used by packed mode: keep every slice in the central window so sequences stay
+        variable-length while still dropping edge artifacts.
+        """
+        start, end = _candidate_slice_range(
+            num_slices,
+            use_central_crop=self.use_central_crop_slice,
+            keep_fraction=self.central_keep_fraction,
+            min_depth=self.central_min_depth,
+        )
+        return np.arange(start, end)
 
     def _subsample_or_pad_slices(
         self, feats: torch.Tensor, indices: np.ndarray | None = None
@@ -776,14 +951,14 @@ class PrecomputedFeatPairDataset(Dataset):
         """
         Subsample or zero-pad a slice feature tensor to a fixed number of slices.
 
-        Uses deterministic evenly-spaced subsampling (linspace) to preserve
-        anatomical coverage proportionally.  Both FM views in a positive pair
-        share the same indices so that they see identical anatomy.
+        Uses deterministic evenly-spaced subsampling (linspace) over the
+        configured candidate window. Both FM views in a positive pair share the
+        same indices so that they see identical anatomy.
 
         Args:
             feats: Feature tensor [num_slices, embed_dim] (global-only CLS) or
                    [num_slices, num_tiled_regions, embed_dim] (tiled multi-crop CLS).
-            indices: Pre-computed subsampling indices (optional).  
+            indices: Pre-computed subsampling indices (optional).
                      When None, computed via `_compute_subsample_indices`.
 
         Returns:
@@ -794,21 +969,22 @@ class PrecomputedFeatPairDataset(Dataset):
         num_slices = feats.shape[0]
 
         if indices is None:
-            indices = self._compute_subsample_indices(num_slices, self.num_target_slices)
+            indices = self._compute_subsample_indices(num_slices)
 
-        if num_slices <= self.num_target_slices:
-            # Zero-pad to target length
-            pad_size = self.num_target_slices - num_slices
-            if feats.ndim == 2:          # [num_slices, embed_dim]
-                pad = (0, 0, 0, pad_size)
-            elif feats.ndim == 3:        # [num_slices, num_tiled_regions, embed_dim]
-                pad = (0, 0, 0, 0, 0, pad_size)
-            else:
-                raise ValueError(f"Unsupported feature tensor rank {feats.ndim}.")
-            padded = torch.nn.functional.pad(feats, pad, value=0.0)
-            return padded, num_slices, indices
+        selected = feats[indices]
+        n_real = int(selected.shape[0])
+        if n_real >= self.num_target_slices:
+            return selected, self.num_target_slices, indices
+
+        pad_size = self.num_target_slices - n_real
+        if selected.ndim == 2:          # [num_slices, embed_dim]
+            pad = (0, 0, 0, pad_size)
+        elif selected.ndim == 3:        # [num_slices, num_tiled_regions, embed_dim]
+            pad = (0, 0, 0, 0, 0, pad_size)
         else:
-            return feats[indices], self.num_target_slices, indices
+            raise ValueError(f"Unsupported feature tensor rank {selected.ndim}.")
+        padded = torch.nn.functional.pad(selected, pad, value=0.0)
+        return padded, n_real, indices
 
     def _pad_feature_dim(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
@@ -897,14 +1073,14 @@ class PrecomputedFeatPairDataset(Dataset):
                         f"'{fm_name}' has {feats.shape[1]} regions vs {ref_regions}."
                     )
 
-        indices = self._compute_subsample_indices(num_slices, self.num_target_slices)
+        indices = self._compute_subsample_indices(num_slices)
         physical_positions = self._compute_physical_positions(
             indices, num_slices, self.num_target_slices,
         )
 
         feats1, dims1 = self._build_subset_view(fm_ids1, feats_by_id, indices)
         feats2, dims2 = self._build_subset_view(fm_ids2, feats_by_id, indices)
-        seq_len = min(num_slices, self.num_target_slices)
+        seq_len = min(len(indices), self.num_target_slices)
 
         result = {
             "feats1": feats1,                              # [K_sub, num_slices, (regions,) max_feature_dim]
@@ -981,19 +1157,22 @@ class PrecomputedFeatPairDataset(Dataset):
             )
 
         if self.use_packed:
-            seq_len = num_slices
-            indices = np.arange(num_slices)
+            # Optional central crop only (keep all remaining slices; no fixed-length subsample)
+            indices = self._resolve_central_crop_indices(num_slices)
+            feats1 = feats1[indices]
+            feats2 = feats2[indices]
+            seq_len = int(len(indices))
         else:
-            # Compute shared indices once for both views (identical slices)
-            indices = self._compute_subsample_indices(num_slices, self.num_target_slices)
+            # Shared indices once for both views / all FMs (identical slices)
+            indices = self._compute_subsample_indices(num_slices)
             feats1, seq_len, indices = self._subsample_or_pad_slices(feats1, indices)
             feats2, _, _ = self._subsample_or_pad_slices(feats2, indices)
         
-        # Relative depth in [0, 1] for sinusoidal PE
+        # Relative depth in [0, 1] for sinusoidal PE (denom = original D)
         physical_positions = self._compute_physical_positions(
             indices,
             num_slices,
-            num_slices if self.use_packed else self.num_target_slices,
+            seq_len if self.use_packed else self.num_target_slices,
         )
         
         # Pad feature dimension to max_feature_dim to ensure consistent batch size
@@ -1058,7 +1237,8 @@ class FeatClassificationDataset(Dataset):
             slice_encoder_models: List of slice encoder model names (e.g., ["dinov2", "rad-dino"])
                                   If single model, pass as ["dinov2"]
             view_plane: Which view plane to use (e.g., "sagittal", "axial", "coronal")
-            split: Data split ("train" or "test")
+            split: Annotation-split name. Files are taken from
+                   ``{model}/{split}/{plane}`` first, then sibling cache folders.
             annotations_path: Path to the annotation CSV file with columns: ID, target1, target2, ...
             task: Classification task type ("binary", "multiclass", or "multilabel")
             target_columns: List of column names to use as classification targets
@@ -1092,28 +1272,66 @@ class FeatClassificationDataset(Dataset):
                 f"Available columns: {available_cols}"
             )
         
-        self.sample_ids = list(self.df_labels.index)
-        
-        # Build feature paths for all encoders and verify consistency
-        self.feat_paths = {}
-        self.id_filename_map = {}
-        
+        num_annots = len(self.df_labels)
+
+        # CSV split is membership. Cache folders are searched with that split
+        # first, then sibling folders (holdout files may still live under train/).
+        self.id_filename_map: Dict[str, str] = {}
+        self.id_cache_split: Dict[str, str] = {}
+        reference_feat_ids = None
+
         for model_name in self.slice_encoder_models:
-            feat_path = os.path.join(feat_dir, model_name, split, view_plane)
-            if not os.path.exists(feat_path):
-                raise FileNotFoundError(f"Feature path {feat_path} does not exist!")
-            self.feat_paths[model_name] = feat_path
-            
-            feat_files = glob(os.path.join(feat_path, '*.safetensors'))
-            if len(feat_files) != len(self.sample_ids):
-                raise ValueError(f"Expected {len(self.sample_ids)} feature files for {model_name}, but got {len(feat_files)}!")
-            
-            # Build id->filename mapping from first encoder (filenames should match across encoders)
-            if not self.id_filename_map:
-                for f in feat_files:
-                    fname = os.path.basename(f)
-                    fid = fname.split(".")[0]
-                    self.id_filename_map[fid] = fname
+            feat_index = index_plane_feat_files(
+                feat_dir, model_name, view_plane, preferred_split=split
+            )
+            feat_id_to_filename = {
+                feat_id: filename for feat_id, (_, filename) in feat_index.items()
+            }
+            if reference_feat_ids is None:
+                reference_feat_ids = set(feat_id_to_filename)
+                resolved = resolve_classification_id_map(
+                    self.df_labels, feat_id_to_filename, target_columns
+                )
+                for sample_id, filename in resolved.items():
+                    cache_split, _ = feat_index[_feat_stem(filename)]
+                    self.id_filename_map[sample_id] = filename
+                    self.id_cache_split[sample_id] = cache_split
+            else:
+                missing = [
+                    filename
+                    for sample_id, filename in self.id_filename_map.items()
+                    if not os.path.exists(
+                        self._feat_file(model_name, sample_id, filename)
+                    )
+                ]
+                if missing:
+                    raise ValueError(
+                        f"Encoder '{model_name}' is missing {len(missing)} feature "
+                        f"files required by the annotation/feature intersection "
+                        f"(e.g. {missing[0]})."
+                    )
+
+        if not self.id_filename_map:
+            raise ValueError(
+                f"No labeled samples in {annotations_path} have features under "
+                f"{feat_dir}/<model>/<split>/{view_plane}."
+            )
+        self.sample_ids = list(self.id_filename_map)
+        self.df_labels = self.df_labels.loc[self.sample_ids]
+        fallback_n = sum(
+            cache_split != split for cache_split in self.id_cache_split.values()
+        )
+        logger.info(
+            f"FeatClassificationDataset {split}/{view_plane}: "
+            f"{len(self.sample_ids)} labeled samples "
+            f"(from {num_annots} annotation rows, "
+            f"{len(reference_feat_ids or [])} feature files)."
+        )
+        if fallback_n:
+            logger.info(
+                f"Resolved {fallback_n} '{split}' annotation IDs from another "
+                f"cache folder (files were not under .../{split}/{view_plane})."
+            )
 
         self._feat_cache = None
         if cache_in_memory:
@@ -1121,8 +1339,17 @@ class FeatClassificationDataset(Dataset):
             for sample_id in self.sample_ids:
                 filename = self.id_filename_map[sample_id]
                 for model_name in self.slice_encoder_models:
-                    unique_paths.add(os.path.join(self.feat_paths[model_name], filename))
+                    unique_paths.add(self._feat_file(model_name, sample_id, filename))
             self._feat_cache = FeatureCache(unique_paths)
+
+    def _feat_file(self, model_name: str, sample_id: str, filename: str) -> str:
+        return os.path.join(
+            self.feat_dir,
+            model_name,
+            self.id_cache_split[sample_id],
+            self.view_plane,
+            filename,
+        )
 
     def _get_feat(self, feat_path: str) -> Tuple[torch.Tensor, dict]:
         """Return feature tensor and metadata from cache if available, otherwise load from disk."""
@@ -1160,7 +1387,7 @@ class FeatClassificationDataset(Dataset):
         metadata = None
         
         for encoder in self.slice_encoder_models:
-            feat_file = os.path.join(self.feat_paths[encoder], filename)
+            feat_file = self._feat_file(encoder, sample_id, filename)
             if metadata is None:
                 feat, metadata = self._get_feat(feat_file)
             else:
@@ -1236,7 +1463,7 @@ class UnlabeledFeatDataset(Dataset):
         self.id_filename_map = {}
         for f in self.feat_files:
             fname = os.path.basename(f)
-            fid = fname.split(".")[0]
+            fid = _feat_stem(fname)
             self.id_filename_map[fid] = fname
 
         self.sample_ids = list(self.id_filename_map.keys())
@@ -1358,7 +1585,7 @@ class MultiViewFeatClassificationDataset(Dataset):
                     feat_files = glob(os.path.join(feat_path, '*.safetensors'))
                     for f in feat_files:
                         fname = os.path.basename(f)
-                        fid = fname.split(".")[0]
+                        fid = _feat_stem(fname)
                         self.id_filename_map[fid] = fname
 
         self._feat_cache = None
