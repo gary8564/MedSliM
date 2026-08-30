@@ -1,0 +1,7 @@
+# (3) Full-stack CLS control (kneeMRI.yml default)
+model:
+  num_slices: null
+  token_source: [cls]
+  use_avgpool_per_slice: false
+  use_avgpool_on_the_volume: false
+  attention_blocks: [cross]

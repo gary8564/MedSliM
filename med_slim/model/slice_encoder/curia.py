@@ -35,7 +35,7 @@ class CuriaFeatureExtractor(nn.Module):
     Normalization:
         Curia does NOT use fixed dataset statistics (no ImageNet mean/std).
         Per-slice z-score normalization and optional CT air clipping, mirroring CuriaImageProcessor, are applied
-        by MedSliM's preprocessing transforms. 
+        by MedSliM's preprocessing transforms.
 
     Notes:
         - The model weights are frozen by default (freeze=True in build_slice_encoder).
@@ -58,11 +58,11 @@ class CuriaFeatureExtractor(nn.Module):
             model_repo: HuggingFace repo id (default: "raidium/curia").
             local_cache_dir: Directory to cache downloaded weights.
                              Defaults to HuggingFace's ~/.cache/huggingface/hub.
-            token_mode: Which Curia tokens to return. 
+            token_mode: Which Curia tokens to return.
                         "cls" keeps MedSliM's existing slice-embedding convention.
                         "patch" and "cls_patch" expose Curia's spatial patch tokens
                         for attention pooling experiments.
-            spatial_pool_kernel_size: Optional average-pooling kernel over the 2D patch grid before flattening patch tokens. 
+            spatial_pool_kernel_size: Optional average-pooling kernel over the 2D patch grid before flattening patch tokens.
                                       Useful to reduce the sequence length of 512x512 Curia inputs (32x32 patches).
         """
         super().__init__()
@@ -151,20 +151,3 @@ class CuriaFeatureExtractor(nn.Module):
 
         features = rearrange(tokens, "(b d) p e -> b (d p) e", b=B)
         return features
-
-
-if __name__ == "__main__":
-    from transformers import AutoModelForImageClassification
-    import os
-
-    model = AutoModelForImageClassification.from_pretrained(
-        "raidium/curia",
-        subfolder="kneeMRI",
-        trust_remote_code=True,
-        token=os.environ["HF_TOKEN"],
-    )
-    # inspect the attention module config
-    print(model.config.attention_cfg)
-    # inspect the trained attention module weights
-    print(model.attention_module)
-    print(model)

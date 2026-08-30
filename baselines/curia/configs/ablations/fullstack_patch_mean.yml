@@ -1,0 +1,7 @@
+# (2) Full-stack per-slice patch means (scalable self-attn)
+model:
+  num_slices: null
+  token_source: [patch]
+  use_avgpool_per_slice: true
+  use_avgpool_on_the_volume: false
+  attention_blocks: [cross]

@@ -1,0 +1,7 @@
+# (4) CLS + patch mix (sequence-concat, CLS then patches)
+model:
+  num_slices: null
+  token_source: [cls, patch]
+  use_avgpool_per_slice: true
+  use_avgpool_on_the_volume: false
+  attention_blocks: [cross]

@@ -1,0 +1,70 @@
+# Curia classifier: cached frozen tokens + trainable 3D head.
+# First run builds the token cache
+#
+#   python -m baselines.curia.classifier --config baselines/curia/configs/kneeMRI.yml --n-folds 3
+# See baselines/curia/README.md for the matched MedSliM LP protocol.
+
+# Dataset
+dataset_name: "kneeMRI"
+data_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+plane: "sagittal"
+crop_empty_slices: false
+
+# Token cache (frozen Curia features)
+feature_cache_dir: "/hpcwork/rwth1833/feat_caches/curia_official"
+cache:
+  hub_revision: "9657dc56276bc6c9503ef6f8d060879c8bee482f"
+  crop_size: 512
+  # Raw-patch window (~9 MB/volume for 3×1024×768). Overridden by model.num_slices when used.
+  center_num_slices: 3
+  slice_batch_size: 64
+  amp: "bf16"  # null | fp16 | bf16
+  spatial_pool_kernel_size: null
+
+# Model
+model:
+  model_repo: "raidium/curia"
+  local_cache_dir: null
+  embed_dim: 768
+  # 3 = Curia centre window; null = full stack (MedSliM).
+  num_slices: null
+  # [cls] | [patch] | [cls, patch]. Mix is always CLS then patches.
+  token_source: [cls]
+  # Patch reduction (upstream extract_3D_features). per_slice wins over on_the_volume.
+  use_avgpool_per_slice: false
+  use_avgpool_on_the_volume: false
+  add_slice_positional_embedding: true
+  # [self, cross] = released kneeMRI; [cross] = paper query-only ablation.
+  attention_blocks: [self, cross]
+  num_heads: 1
+  num_queries: 1
+  pooling_dropout: 0.0
+  query_init_std: 1.0 
+  classifier: "linear"  # or "mlp"
+  classifier_hidden_dim: 512
+  classifier_dropout: 0.5
+
+# Output
+output_dir: "/hpcwork/rwth1833/experiments/curia-classifier"
+
+# Training
+hyperparams:
+  batch_size: 4
+  optimizer: "sgd"
+  lr: 0.001
+  momentum: 0.9
+  weight_decay: 0.0
+  warmup_ratio: 0.1
+  max_epochs: 50
+  num_workers: 4
+  val_split_ratio: 0.1
+  patience: 10
+  weighted_loss: false
+
+# Token recipes: overlays in configs/ablations/; run all with
+#   bash scripts/eval/curia_classifier_ablation.sh
+# Full FOV only (same volumes as MedSliM LP; no ACL bbox / centre-3 crop).
+# (1) fullstack_patch_mean   full-stack per-slice patch means
+# (2) fullstack_cls          full-stack CLS (this file's default)
+# (3) cls_patch_mix          CLS + patch mix, per-slice patch means
