@@ -18,7 +18,7 @@ source .venv/bin/activate
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ### Configuration
-CHECKPOINT_PATH="/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet/2026-06-16-17:51/medslim-epoch2000.pth.tar"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-/hpcwork/qj474765/checkpoints/MedSliM-pretraining/MRNet/2026-06-16-17:51/medslim-epoch2000.pth.tar}"
 # CONFIG=""                 # Optional: override pretrain config (default: beside checkpoint or pretrain.yml)
 ENCODER="momentum"          # momentum (LP/COBRA default) | base
 OUTPUT="reports/fm_usage/router_usage_2026-06-16-17:51.png"

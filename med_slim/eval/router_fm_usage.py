@@ -470,26 +470,34 @@ def main() -> None:
         "by_study": defaultdict(dict),
     }
     n_batches = 0
+    try:
+        for batch in tqdm(loader, total=min(args.num_batches, len(loader)), desc="Aggregating LP usage"):
+            if n_batches >= args.num_batches:
+                break
+            features = [
+                f.to(device=device, dtype=next(cobra.parameters()).dtype) for f in batch["features"]
+            ]
+            seq_lens = batch["seq_lengths"].to(device=device, dtype=torch.long)
+            physical_positions = batch.get("physical_positions")
+            if physical_positions is not None:
+                physical_positions = physical_positions.to(device=device, dtype=torch.float32)
 
-    for batch in tqdm(loader, total=min(args.num_batches, len(loader)), desc="Aggregating LP usage"):
-        if n_batches >= args.num_batches:
-            break
-        features = [
-            f.to(device=device, dtype=next(cobra.parameters()).dtype) for f in batch["features"]
-        ]
-        seq_lens = batch["seq_lengths"].to(device=device, dtype=torch.long)
-        physical_positions = batch.get("physical_positions")
-        if physical_positions is not None:
-            physical_positions = physical_positions.to(device=device, dtype=torch.float32)
-
-        labels = {
-            "dataset_name": batch["dataset_name"],
-            "plane": batch["plane"],
-            "study_id": batch["study_id"],
-        }
-        stats = _view_router_stats(cobra, features, seq_lens, fm_ids, physical_positions)
-        _accumulate_router_stats(stats, labels, accum, k)
-        n_batches += 1
+            labels = {
+                "dataset_name": batch["dataset_name"],
+                "plane": batch["plane"],
+                "study_id": batch["study_id"],
+            }
+            stats = _view_router_stats(cobra, features, seq_lens, fm_ids, physical_positions)
+            _accumulate_router_stats(stats, labels, accum, k)
+            n_batches += 1
+    finally:
+        # Join worker processes and the pin_memory thread before interpreter
+        # teardown (avoids ConnectionRefusedError on early break).
+        iterator = getattr(loader, "_iterator", None)
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            shutdown()
+        loader._iterator = None
 
     if n_batches == 0:
         raise RuntimeError("No batches processed.")

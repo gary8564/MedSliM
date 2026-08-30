@@ -46,13 +46,16 @@ CURRICULUM=true
 # Keep this order fixed for router runs; it is saved as fm_id_order in checkpoints.
 # MODEL_NAMES="medimageinsight mri-core curia ark rad-dino" #"dinov2 dinov3 rad-dino medsiglip biomedclip ark mri-core medimageinsight curia"
 # MODEL_NAMES="dinov2 dinov3 rad-dino medsiglip biomedclip ark mri-core medimageinsight curia"
+# 7-FM medical pool (drop DINOv2 / DINOv3). Zero-overlap subset SSL needs size 3.
+# MODEL_NAMES="rad-dino medsiglip biomedclip ark mri-core medimageinsight curia"
 MODEL_NAMES="medimageinsight mri-core curia"
 
 # Stage feature caches to node-local NVMe ($TMPDIR → /w0/tmp/slurm_$USER.$JOBID, XFS).
 # With CACHE_IN_MEMORY=false (required under 120G/1-GPU), staging is important again:
 # DataLoader reads every batch from local NVMe avoids Lustre latency all epochs.
 # With CACHE_IN_MEMORY=true, staging is optional (one-shot Lustre → RAM vs copy + NVMe → RAM).
-FEAT_BASE="/hpcwork/rwth1833/feat_caches"
+# train.py only rewrites feat_dir prefixes starting with /hpcwork/rwth1833/feat_caches.
+FEAT_BASE="${FEAT_BASE:-/hpcwork/rwth1833/feat_caches}"
 STAGE_TO_LOCAL="${STAGE_TO_LOCAL:-true}"
 # Single job: 12–16 streams. If several pretrains stage together, use 6–8.
 STAGE_PARALLEL_JOBS="${STAGE_PARALLEL_JOBS:-12}"
@@ -115,6 +118,8 @@ if $STAGE_TO_LOCAL && [ -n "$TMPDIR" ] && [ -d "$TMPDIR" ]; then
                 else
                     run_staged "$src_train" "$dst_train"
                 fi
+            else
+                echo "WARNING: missing feature cache: $src_train"
             fi
         done
     done
@@ -126,6 +131,17 @@ if $STAGE_TO_LOCAL && [ -n "$TMPDIR" ] && [ -d "$TMPDIR" ]; then
 else
     echo "STAGE_TO_LOCAL=false or TMPDIR unavailable; reading feature caches from $FEAT_BASE."
 fi
+
+# Fail early if a required train cache is missing (after optional staging).
+for ds_subdir in "${FEAT_CACHE_SUBDIR[@]}"; do
+    for model in $MODEL_NAMES; do
+        src_train="$FEAT_BASE/$ds_subdir/$model/train"
+        if [ ! -d "$src_train" ]; then
+            echo "ERROR: missing feature cache: $src_train"
+            exit 1
+        fi
+    done
+done
 
 # Sequence encoder and pooling
 SEQUENCE_ENCODER="mamba2"   # mamba2 or transformer
@@ -148,6 +164,47 @@ SSL_FM_MODE="pair"              # pair (cross-FM baseline) | subset (FM-set rout
 # ROUTER_LOAD_BALANCE_WEIGHT=""     # leave empty for config default
 # ROUTER_Z_LOSS_WEIGHT=""           # leave empty for config default (0.0)
 # ROUTER_CONFIDENCE_WEIGHT=""       # leave empty for config default (0.0)
+
+NUM_FMS=$(echo "${MODEL_NAMES}" | wc -w)
+if [[ "${SSL_FM_MODE}" == "subset" ]]; then
+    # Zero-overlap views: need 2 * FM_SUBSET_SIZE <= NUM_FMS.
+    if [[ -z "${FM_SUBSET_SIZE:-}" ]]; then
+        echo "ERROR: SSL_FM_MODE=subset requires FM_SUBSET_SIZE."
+        exit 1
+    fi
+    if [ "${FM_SUBSET_SIZE}" -ge "${NUM_FMS}" ]; then
+        echo "ERROR: FM_SUBSET_SIZE=${FM_SUBSET_SIZE} must be < num_fms=${NUM_FMS} for router subset SSL."
+        exit 1
+    fi
+    min_possible_overlap=$(( 2 * FM_SUBSET_SIZE - NUM_FMS ))
+    if [ "${min_possible_overlap}" -lt 0 ]; then
+        min_possible_overlap=0
+    fi
+    if [[ -n "${FM_SUBSET_MAX_OVERLAP:-}" ]] && [ "${FM_SUBSET_MAX_OVERLAP}" -lt "${min_possible_overlap}" ]; then
+        echo "ERROR: overlap [${FM_SUBSET_MIN_OVERLAP:-?},${FM_SUBSET_MAX_OVERLAP}] is impossible: "\
+"minimum possible overlap=${min_possible_overlap} for size=${FM_SUBSET_SIZE}, num_fms=${NUM_FMS}."
+        exit 1
+    fi
+fi
+
+# Start mode: from-scratch | curriculum (weights only) | resume (weights + optimizer)
+if [[ -n "${RESUME_PATH:-}" && "${CURRICULUM:-false}" == true ]]; then
+    START_MODE="curriculum"
+elif [[ -n "${RESUME_PATH:-}" ]]; then
+    START_MODE="resume"
+else
+    START_MODE="from-scratch"
+fi
+
+echo "Pretrain (${START_MODE})"
+echo "  num_fms=${NUM_FMS} models=[${MODEL_NAMES}]"
+echo "  cohorts=${FEAT_CACHE_SUBDIR[*]}"
+echo "  encoder=${SEQUENCE_ENCODER} pooling=${POOLING} fm_pooling=${FM_POOLING}"
+echo "  per_fm_adapter_mode=${PER_FM_ADAPTER_MODE} ssl_fm_mode=${SSL_FM_MODE}"
+echo "  packed=${USE_PACKED} physical_pe=${PHYSICAL_PE:-false} cache_in_memory=${CACHE_IN_MEMORY}"
+if [[ -n "${RESUME_PATH:-}" ]]; then
+    echo "  resume=${RESUME_PATH}"
+fi
 
 ### Build command arguments
 EXTRA_ARGS=""
