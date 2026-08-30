@@ -4,8 +4,12 @@ COBRA Slice Attention Visualization.
 Extracts and visualizes slice-level attention weights from COBRA model to understand
 which slices contribute most to the final prediction.
 
+Bar plots (pooled and per-head) are written only for positive tear classes
+(e.g. Partial ACL Tear, Complete ACL Tear). Normal cases still contribute to
+metrics / CSV output.
+
 Usage:
-    python -m med_slim.eval.slice_attention \
+    python -m med_slim.eval.xai.slice_attention \
         --experiment-dir /path/to/experiment_output
         --num-samples 10
 """
@@ -18,7 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 
@@ -29,6 +33,14 @@ from med_slim.eval.load_cobra import (
     resolve_eval_fm_ids,
 )
 from med_slim.eval.extract_feats import get_volume_attention, get_volume_attention_per_head
+from med_slim.eval.xai.roi_utils import (
+    compute_roi_attention_metrics,
+    discover_pathology_roi_columns,
+    get_roi_slice_range,
+    is_positive_pathology_class,
+    load_roi_annotations,
+    resolve_class_label,
+)
 from med_slim.utils.viz.attention import plot_attention_profile, plot_per_head_attention_profile, compute_attention_metrics
 from med_slim.utils.label_metadata import get_dataset_metadata, get_annotation_paths_by_split, format_display_name, build_multiclass_label_names
 from med_slim.logging.setup import init_logging
@@ -37,97 +49,21 @@ init_logging()
 logger = logging.getLogger(__name__)
 
 
-def load_roi_annotations(annotations_path: str) -> Optional[pd.DataFrame]:
-    """Load ROI annotations when the CSV contains ROI columns."""
-    df = pd.read_csv(annotations_path, dtype={"ID": str})
-    if {"ID", "roiZ", "roiDepth"}.issubset(df.columns):
-        return df.set_index("ID")
-    return None
+def log_roi_summary(title: str, subset: list[Dict[str, Any]]) -> None:
+    """Log mass-in-ROI / peak-hit statistics for a sample subset."""
+    if not subset:
+        return
+    logger.info(f"--- {title} ({len(subset)} samples) ---")
+    logger.info(
+        f"  mass_in_roi: {np.mean([m['mass_in_roi'] for m in subset]):.3f} "
+        f"(random baseline: {np.mean([m['random_mass_in_roi'] for m in subset]):.3f})"
+    )
+    logger.info(
+        f"  peak_in_roi: {np.mean([m['peak_in_roi'] for m in subset]):.3f}, "
+        f"top-3: {np.mean([m['top_3_hit'] for m in subset]):.3f}, "
+        f"top-5: {np.mean([m['top_5_hit'] for m in subset]):.3f}"
+    )
 
-
-def discover_pathology_roi_columns(roi_df: Optional[pd.DataFrame]) -> list[str]:
-    """Return pathology names that have ``roiZ_{name}`` / ``roiDepth_{name}`` columns."""
-    if roi_df is None:
-        return []
-    prefixes = []
-    for col in roi_df.columns:
-        if col.startswith("roiZ_"):
-            name = col[len("roiZ_"):]
-            if f"roiDepth_{name}" in roi_df.columns:
-                prefixes.append(name)
-    return sorted(prefixes)
-
-
-def get_roi_slice_range(
-    roi_df: Optional[pd.DataFrame],
-    sample_id: str,
-    seq_len: int,
-    z_col: str = "roiZ",
-    depth_col: str = "roiDepth",
-) -> Optional[Dict[str, Any]]:
-    """Return clipped ROI slice metadata for a sample if available."""
-    if roi_df is None or sample_id not in roi_df.index:
-        return None
-
-    row = roi_df.loc[sample_id]
-    if pd.isna(row[z_col]) or pd.isna(row[depth_col]):
-        return None
-
-    roi_z = int(row[z_col])
-    roi_depth = int(row[depth_col])
-    if roi_depth <= 0:
-        return None
-
-    start = max(0, roi_z)
-    end = min(seq_len - 1, roi_z + roi_depth - 1)
-    if start > end:
-        return None
-
-    return {
-        "roi_z": roi_z,
-        "roi_depth": roi_depth,
-        "roi_start_slice": start,
-        "roi_end_slice": end,
-    }
-
-
-def compute_roi_attention_metrics(
-    attention_weights: np.ndarray,
-    roi_range: Dict[str, Any],
-    top_ks: tuple[int, ...] = (1, 3, 5),
-) -> Dict[str, Any]:
-    """Compute metrics from slice attention and ROI slice range."""
-    attn = attention_weights.astype(np.float64)
-    attn = attn / attn.sum()
-
-    start = int(roi_range["roi_start_slice"])
-    end = int(roi_range["roi_end_slice"])
-    roi_mask = np.zeros(len(attn), dtype=bool)
-    roi_mask[start:end + 1] = True
-
-    mass_in_roi = float(attn[roi_mask].sum())
-    random_mass_in_roi = float(roi_mask.mean())
-    peak_idx = int(np.argmax(attn))
-    peak_in_roi = bool(roi_mask[peak_idx])
-
-    metrics: Dict[str, Any] = {
-        "roi_z": roi_range["roi_z"],
-        "roi_depth": roi_range["roi_depth"],
-        "roi_start_slice": start,
-        "roi_end_slice": end,
-        "mass_in_roi": mass_in_roi,
-        "random_mass_in_roi": random_mass_in_roi,
-        "mass_gain_over_random": float(mass_in_roi - random_mass_in_roi),
-        "peak_in_roi": int(peak_in_roi),
-    }
-
-    ranked = np.argsort(attn)[::-1]
-    for k in top_ks:
-        effective_k = min(k, len(attn))
-        topk_hit = bool(np.any(roi_mask[ranked[:effective_k]]))
-        metrics[f"top_{k}_hit"] = int(topk_hit)
-
-    return metrics
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize COBRA slice attention weights")
@@ -153,6 +89,11 @@ def main():
     parser.add_argument("--slice-pooling", type=str, default=None, choices=["abmil", "cls"])
     parser.add_argument("--per-head", action="store_true",
                         help="Visualize per-head attention profiles (ABMIL multi-head only)")
+    parser.add_argument("--head-reduce", type=str, default="mean", choices=["mean", "min", "max"],
+                        help="How to collapse ABMIL heads into one slice profile. "
+                             "'mean' (default) averages softmaxed heads; "
+                             "'min' keeps only slices all heads agree on; "
+                             "'max' keeps the slices any head attends to.")
     parser.add_argument("--fold", type=int, default=None,
                         help="Fold number to load checkpoint from (e.g. 1 -> fold_1/ckpt/classifier.pt)")
     args = parser.parse_args()
@@ -180,26 +121,39 @@ def main():
                 )
         else:
             feat_dir = feat_cfg.get("feat_dir")
-        model_names = args.fm_model_names.split() if args.fm_model_names else feat_cfg.get("model_name", ["dinov2"])
-        if isinstance(model_names, str):
-            model_names = [model_names]
+
+        fm_id_order = exp_cfg.get("fm_id_order") or feat_cfg.get("model_name") or []
+        if isinstance(fm_id_order, str):
+            fm_id_order = [fm_id_order]
         fm_pooling = exp_cfg.get("fm_pooling", getattr(cobra_model, "fm_pooling", "avg_pool"))
+
+        # LP may evaluate a subset (e.g. MRI-trio) while config.yml still lists
+        # the pretrain 9-FM pool. Prefer eval_fm_ids + fm_id_order so K matches.
         if args.fm_model_names:
+            model_names = args.fm_model_names.split()
             eval_fm_ids = resolve_eval_fm_ids(
                 fm_pooling,
                 model_names,
-                {"feat_dataset": {"model_name": exp_cfg.get("fm_id_order")}},
+                {"feat_dataset": {"model_name": fm_id_order}},
                 None,
             )
         else:
             eval_fm_ids = exp_cfg.get("eval_fm_ids")
-            if eval_fm_ids is None:
-                eval_fm_ids = resolve_eval_fm_ids(
-                    fm_pooling,
-                    model_names,
-                    {"feat_dataset": {"model_name": exp_cfg.get("fm_id_order")}},
-                    None,
-                )
+            if eval_fm_ids is not None and fm_id_order:
+                model_names = [fm_id_order[int(i)] for i in eval_fm_ids]
+            else:
+                model_names = feat_cfg.get("model_name", ["dinov2"])
+                if isinstance(model_names, str):
+                    model_names = [model_names]
+                if eval_fm_ids is None:
+                    eval_fm_ids = resolve_eval_fm_ids(
+                        fm_pooling,
+                        model_names,
+                        {"feat_dataset": {"model_name": fm_id_order}},
+                        None,
+                    )
+        if accelerator.is_main_process:
+            logger.info(f"Eval FMs (K={len(model_names)}): {model_names}  ids={eval_fm_ids}")
         dataset_name = args.dataset_name or feat_cfg.get("dataset_name")
         if args.output_dir:
             output_dir = args.output_dir
@@ -308,6 +262,7 @@ def main():
         logger.info(f"Feature dir: {feat_dir}")
         logger.info(f"Plane: {plane}, Split: {args.split}")
         logger.info(f"Task: {task}, Target labels: {target_labels}")
+        logger.info(f"Head reduce: {args.head_reduce}")
         logger.info("=" * 60)
 
     dataset = FeatClassificationDataset(
@@ -333,9 +288,14 @@ def main():
 
     cobra_model, dataloader = accelerator.prepare(cobra_model, dataloader)
 
-    # Extract attention weights
+    # Extract attention weights (mean over softmaxed heads by default)
     attention_weights, labels, sample_ids, seq_lengths = get_volume_attention(
-        cobra_model, dataloader, accelerator, max_samples=args.num_samples, fm_ids=eval_fm_ids
+        cobra_model,
+        dataloader,
+        accelerator,
+        max_samples=args.num_samples,
+        fm_ids=eval_fm_ids,
+        head_reduce=args.head_reduce,
     )
 
     # Extract per-head attention
@@ -355,8 +315,9 @@ def main():
     fig_dir = os.path.join(output_dir, "attention_profiles")
     os.makedirs(fig_dir, exist_ok=True)
 
-    # Process each sample: plot + compute metrics
+    # Process each sample: plot (tear/positive classes only) + compute metrics
     all_metrics = []
+    n_plotted = 0
 
     for attn, label, sample_id in zip(attention_weights, labels, sample_ids):
         attn_sum = float(attn.sum())
@@ -366,26 +327,24 @@ def main():
             )
         seq_len = len(attn)
         roi_range = get_roi_slice_range(roi_df, str(sample_id), seq_len)
-
-        if task == "multilabel":
-            active = [format_display_name(target_labels[j], display_map) for j, v in enumerate(label) if v == 1]
-            class_label = " + ".join(active) if active else "Normal"
-        elif task == "multiclass" and multiclass_names:
-            class_label = multiclass_names[int(label)]
-        else:
-            class_label = format_display_name(target_labels[0], display_map) if label == 1 else "Normal"
-
-        plot_attention_profile(
-            attention_weights=attn,
-            sample_id=sample_id,
-            view_plane=plane,
-            output_dir=fig_dir,
-            ground_truth_range=(
-                (roi_range["roi_start_slice"], roi_range["roi_end_slice"])
-                if roi_range is not None else None
-            ),
-            class_label=class_label,
+        class_label = resolve_class_label(
+            task, label, target_labels, display_map, multiclass_names
         )
+        plot_sample = is_positive_pathology_class(class_label)
+
+        if plot_sample:
+            plot_attention_profile(
+                attention_weights=attn,
+                sample_id=sample_id,
+                view_plane=plane,
+                output_dir=fig_dir,
+                ground_truth_range=(
+                    (roi_range["roi_start_slice"], roi_range["roi_end_slice"])
+                    if roi_range is not None else None
+                ),
+                class_label=class_label,
+            )
+            n_plotted += 1
 
         metrics = compute_attention_metrics(attn)
         metrics['sample_id'] = sample_id
@@ -406,13 +365,19 @@ def main():
 
         all_metrics.append(metrics)
 
-    # Per-head attention visualization
+    n_skipped = len(all_metrics) - n_plotted
+    logger.info(
+        f"Saved {n_plotted} attention profiles for partial/complete tear "
+        f"(skipped {n_skipped} Normal samples)"
+    )
+
+    # Per-head attention visualization (same positive-class filter)
     if per_head_data is not None:
         ph_attn, ph_labels, ph_sample_ids, _, num_heads = per_head_data
-        logger.info(f"Plotting per-head attention for {len(ph_attn)} samples ({num_heads} heads)")
 
         per_head_dir = os.path.join(output_dir, "per_head_attention")
         os.makedirs(per_head_dir, exist_ok=True)
+        n_ph_plotted = 0
 
         for attn, label, sample_id in zip(ph_attn, ph_labels, ph_sample_ids):
             head_sums = attn.sum(axis=-1)
@@ -421,21 +386,30 @@ def main():
                     f"Per-head ABMIL attention should sum to 1 for sample '{sample_id}', got {head_sums:.6f}"
                 )
 
-            if task == "multilabel":
-                active = [format_display_name(target_labels[j], display_map) for j, v in enumerate(label) if v == 1]
-                ph_class_label = " + ".join(active) if active else "Normal"
-            elif task == "multiclass" and multiclass_names:
-                ph_class_label = multiclass_names[int(label)]
-            else:
-                ph_class_label = format_display_name(target_labels[0], display_map) if label == 1 else "Normal"
+            ph_class_label = resolve_class_label(
+                task, label, target_labels, display_map, multiclass_names
+            )
+            if not is_positive_pathology_class(ph_class_label):
+                continue
 
+            ph_roi = get_roi_slice_range(roi_df, str(sample_id), attn.shape[-1])
             plot_per_head_attention_profile(
                 attention_weights=attn,
                 sample_id=sample_id,
                 view_plane=plane,
                 output_dir=per_head_dir,
                 class_label=ph_class_label,
+                ground_truth_range=(
+                    (ph_roi["roi_start_slice"], ph_roi["roi_end_slice"])
+                    if ph_roi is not None else None
+                ),
             )
+            n_ph_plotted += 1
+
+        logger.info(
+            f"Saved {n_ph_plotted} per-head attention profiles "
+            f"({num_heads} heads; skipped {len(ph_attn) - n_ph_plotted} Normal samples)"
+        )
 
     # Save raw attention data
     stats_path = os.path.join(output_dir, "attention_stats.npz")
@@ -451,28 +425,27 @@ def main():
 
     # Aggregate statistics
     peak_positions = [m['peak_position'] / m['num_slices'] for m in all_metrics]
+    positive_metrics = [m for m in all_metrics if is_positive_pathology_class(m['class_label'])]
 
     logger.info("=" * 60)
     logger.info("Attention Statistics Summary")
     logger.info("=" * 60)
-    logger.info(f"Total samples: {len(all_metrics)}")
+    logger.info(f"Total samples: {len(all_metrics)} ({len(positive_metrics)} partial/complete tear)")
     logger.info(f"Mean relative peak position: {np.mean(peak_positions):.3f} ± {np.std(peak_positions):.3f}")
     logger.info(f"Peak attention range: [{np.min([m['peak_attention'] for m in all_metrics]):.3f}, "
                 f"{np.max([m['peak_attention'] for m in all_metrics]):.3f}]")
     roi_metrics = [m for m in all_metrics if "mass_in_roi" in m]
     if roi_metrics:
-        logger.info(f"ROI-aware samples: {len(roi_metrics)}")
-        logger.info(
-            f"Mean mass_in_roi: {np.mean([m['mass_in_roi'] for m in roi_metrics]):.3f} "
-            f"(random baseline: {np.mean([m['random_mass_in_roi'] for m in roi_metrics]):.3f})"
+        log_roi_summary("ROI (all classes)", roi_metrics)
+        log_roi_summary(
+            "ROI (partial/complete tear only)",
+            [m for m in roi_metrics if is_positive_pathology_class(m["class_label"])],
         )
-        logger.info(
-            f"Peak-in-ROI hit rate: {np.mean([m['peak_in_roi'] for m in roi_metrics]):.3f}"
-        )
-        logger.info(
-            f"Top-3 hit rate: {np.mean([m['top_3_hit'] for m in roi_metrics]):.3f}, "
-            f"Top-5 hit rate: {np.mean([m['top_5_hit'] for m in roi_metrics]):.3f}"
-        )
+        for cls_name in sorted({m["class_label"] for m in roi_metrics}):
+            log_roi_summary(
+                f"ROI ({cls_name})",
+                [m for m in roi_metrics if m["class_label"] == cls_name],
+            )
 
     # Per-pathology ROI statistics
     for pcol in pathology_roi_cols:
