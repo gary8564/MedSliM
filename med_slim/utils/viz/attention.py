@@ -1,9 +1,11 @@
 """
-Visualization utilities for attention weights in 3D medical image slice aggregation.
+Visualization utilities for slice-level explanations in 3D medical image aggregation.
 
 This module provides:
 - plot_attention_profile: Bar chart of attention weights per slice
 - plot_multiview_attention_comparison: Side-by-side comparison across view planes
+- plot_slice_occlusion_profile: Signed bar chart of leave-one-slice-out deltas
+- plot_morf_curves: MoRF insertion / deletion probability curves
 - compute_attention_metrics: Entropy, concentration, GT comparison metrics
 """
 import os
@@ -15,6 +17,24 @@ import logging
 from med_slim.logging.setup import init_logging
 init_logging()
 logger = logging.getLogger(__name__)
+
+
+def _shade_gt_region(
+    ax,
+    ground_truth_range: Optional[Tuple[int, int]],
+    *,
+    legend: bool = False,
+    legend_fontsize: Optional[int] = None,
+) -> bool:
+    """Overlay an ground-truth annotated lesion slices on a bar plot. Returns True if drawn."""
+    if ground_truth_range is None:
+        return False
+    start, end = ground_truth_range
+    ax.axvspan(start - 0.5, end + 0.5, alpha=0.2, color="green", label="GT region")
+    if legend:
+        ax.legend(loc="upper right", fontsize=legend_fontsize)
+    return True
+
 
 def plot_attention_profile(
     attention_weights: np.ndarray,
@@ -51,11 +71,7 @@ def plot_attention_profile(
     # Color bars by attention magnitude
     colors = plt.cm.Reds(attention_weights / attention_weights.max())
     bars = ax.bar(slice_indices, attention_weights, color=colors, edgecolor='darkred', linewidth=0.5)
-    
-    # Add ground truth annotations if provided
-    if ground_truth_range is not None:
-        start, end = ground_truth_range
-        ax.axvspan(start, end, alpha=0.2, color='green', label='GT region')
+    _shade_gt_region(ax, ground_truth_range, legend=True)
     
     # Styling
     ax.set_xlabel('Slice Index', fontsize=12, fontweight='bold')
@@ -66,10 +82,6 @@ def plot_attention_profile(
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.set_xlim(-0.5, num_slices - 0.5)
     ax.set_ylim(0, attention_weights.max() * 1.1)
-    
-    # Add legend if ground truth is provided
-    if ground_truth_range is not None:
-        ax.legend(loc='upper right')
     
     fig.tight_layout()
     
@@ -147,19 +159,22 @@ def plot_per_head_attention_profile(
     view_plane: str,
     output_dir: str,
     class_label: Optional[str] = None,
+    ground_truth_range: Optional[Tuple[int, int]] = None,
     fig_size: Tuple[int, int] = (14, 10),
 ) -> None:
     """
     Plot per-head ABMIL attention profiles.
-    
+
     Shows aggregated attention on top, followed by each head's individual profile.
-    
+    Optional green span marks the GT slice range (roiZ / roiDepth).
+
     Args:
         attention_weights: 2D array [num_heads, num_slices]
         sample_id: Sample identifier
         view_plane: View plane name
         output_dir: Directory to save the plot
         class_label: Optional class label
+        ground_truth_range: Optional tuple (start, end) of slice range with pathology
         fig_size: Figure size
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -175,6 +190,7 @@ def plot_per_head_attention_profile(
     avg_attn = avg_attn / avg_attn.sum()
     colors = plt.cm.Reds(avg_attn / avg_attn.max())
     axes[0].bar(slice_indices, avg_attn, color=colors, edgecolor='darkred', linewidth=0.5)
+    _shade_gt_region(axes[0], ground_truth_range, legend=True, legend_fontsize=8)
     axes[0].set_ylabel('Weight', fontsize=9)
     axes[0].set_title('Aggregated (average over heads)', fontsize=11, fontweight='bold')
     axes[0].set_xlim(-0.5, num_slices - 0.5)
@@ -185,6 +201,7 @@ def plot_per_head_attention_profile(
         cmap = plt.cm.get_cmap(head_cmaps[i % len(head_cmaps)])
         bar_colors = cmap(attn / attn.max())
         axes[i + 1].bar(slice_indices, attn, color=bar_colors, edgecolor='gray', linewidth=0.3)
+        _shade_gt_region(axes[i + 1], ground_truth_range)
         axes[i + 1].set_ylabel('Weight', fontsize=9)
         axes[i + 1].set_title(f'Head {i + 1}', fontsize=10)
         axes[i + 1].set_xlim(-0.5, num_slices - 0.5)
@@ -204,6 +221,116 @@ def plot_per_head_attention_profile(
     plt.close(fig)
 
     logger.info(f"Saved per-head attention profile to {filepath}")
+
+
+def plot_slice_occlusion_profile(
+    delta_logit: np.ndarray,
+    sample_id: Union[str, int],
+    view_plane: str,
+    output_dir: str,
+    ground_truth_range: Optional[Tuple[int, int]] = None,
+    class_label: Optional[str] = None,
+    fig_size: Tuple[int, int] = (12, 4),
+) -> None:
+    """
+    Plot leave-one-slice-out occlusion deltas as a signed bar chart.
+
+    Unlike attention weights, occlusion deltas are signed and unnormalized: a
+    positive bar means dropping that slice lowered the explained-class logit (the
+    slice supported the class), a negative bar means it argued against it. The plot
+    therefore uses a diverging colormap around zero instead of a magnitude ramp.
+
+    Args:
+        delta_logit: 1D array of per-slice deltas [num_slices]
+        sample_id: Sample identifier
+        view_plane: View plane name (axial/sagittal/coronal)
+        output_dir: Directory to save the plot
+        ground_truth_range: Optional tuple (start, end) of slice range with pathology
+        class_label: Optional class label (e.g., "Complete ACL Tear")
+        fig_size: Figure size
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    num_slices = len(delta_logit)
+    slice_indices = np.arange(num_slices)
+    limit = float(np.abs(delta_logit).max()) or 1.0
+
+    fig, ax = plt.subplots(figsize=fig_size)
+    colors = plt.cm.RdBu_r(0.5 + 0.5 * delta_logit / limit)
+    ax.bar(slice_indices, delta_logit, color=colors, edgecolor='gray', linewidth=0.5)
+    ax.axhline(0.0, color='black', linewidth=0.8)
+    _shade_gt_region(ax, ground_truth_range, legend=True)
+
+    ax.set_xlabel('Slice Index', fontsize=12, fontweight='bold')
+    ax.set_ylabel(r'$\Delta$ logit (full $-$ dropped)', fontsize=12, fontweight='bold')
+    title = f'Leave-One-Slice-Out Occlusion - {view_plane.capitalize()}'
+    if class_label:
+        title += f' ({class_label})'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_xlim(-0.5, num_slices - 0.5)
+    ax.set_ylim(-limit * 1.15, limit * 1.15)
+
+    fig.tight_layout()
+
+    filename = f'slices_occlusion_profile_{sample_id}_{view_plane}.png'
+    filepath = os.path.join(output_dir, filename)
+    fig.savefig(filepath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    logger.info(f"Saved slice occlusion profile to {filepath}")
+
+
+def plot_morf_curves(
+    curves: Dict[str, Dict[str, np.ndarray]],
+    output_dir: str,
+    mode: str,
+    filename: Optional[str] = None,
+    title: Optional[str] = None,
+    fig_size: Tuple[int, int] = (7, 5),
+) -> None:
+    """
+    Compare mean MoRF probability curves for several slice rankings.
+
+    Args:
+        curves: Mapping ranking name -> {"fractions", "probs", optional "probs_std"}
+        output_dir: Directory to save the plot
+        mode: "drop" (deletion) or "add" (insertion); sets the axis label and hint
+        filename: Output file name (defaults to ``morf_{mode}_curves.png``)
+        title: Plot title
+        fig_size: Figure size
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=fig_size)
+    for name, curve in curves.items():
+        fractions = curve["fractions"]
+        probs = curve["probs"]
+        line, = ax.plot(fractions, probs, marker='o', markersize=3, label=name)
+        if "probs_std" in curve:
+            ax.fill_between(
+                fractions,
+                probs - curve["probs_std"],
+                probs + curve["probs_std"],
+                alpha=0.15,
+                color=line.get_color(),
+            )
+
+    verb = 'dropped' if mode == 'drop' else 'kept'
+    hint = 'lower is more faithful' if mode == 'drop' else 'higher is more faithful'
+    ax.set_xlabel(f'Fraction of slices {verb} (most relevant first)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('p(true class)', fontsize=11, fontweight='bold')
+    ax.set_title(title or f'MoRF {"deletion" if mode == "drop" else "insertion"} ({hint})',
+                 fontsize=13, fontweight='bold')
+    ax.set_xlim(0.0, 1.0)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=9)
+
+    fig.tight_layout()
+    filepath = os.path.join(output_dir, filename or f'morf_{mode}_curves.png')
+    fig.savefig(filepath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    logger.info(f"Saved MoRF {mode} curves to {filepath}")
 
 
 def compute_attention_metrics(

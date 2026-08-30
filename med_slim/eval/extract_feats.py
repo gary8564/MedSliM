@@ -188,15 +188,18 @@ def get_volume_attention(
     accelerator: Accelerator,
     max_samples: Optional[int] = None,
     fm_ids: Optional[List[int]] = None,
+    head_reduce: str = "mean",
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[str], List[int]]:
     """
     Extract slice-level attention weights using pretrained COBRA model.
+    Per-head ABMIL maps are reduced across heads, then renormalized to sum to 1.
     
     Args:
         cobra_model: Pretrained COBRA model in inference mode
         dataloader: DataLoader yielding batches of slice features
         accelerator: HuggingFace Accelerator
         max_samples: Maximum number of samples to process (None = all)
+        head_reduce: How to collapse heads: `mean` (default), `min`, or `max`.
     
     Returns:
         attention_weights: List of attention arrays [num_slices] per sample
@@ -204,6 +207,9 @@ def get_volume_attention(
         sample_ids: List of sample IDs
         seq_lengths: List of sequence lengths
     """
+    if head_reduce not in ("mean", "min", "max"):
+        raise ValueError(f"head_reduce must be 'mean', 'min', or 'max', got '{head_reduce}'")
+
     cobra_model.eval()
     all_attention = []
     all_labels = []
@@ -223,9 +229,6 @@ def get_volume_attention(
                        for f in batch["features"]]
             num_regions = _num_regions_from_features(features)
             
-            # Get per-head attention and aggregate with min across heads.
-            # Min-attention is standard in medical imaging explainability
-            # as it highlights slices that ALL heads agree are important.
             attention = cobra_model(
                 features,
                 seq_lengths=seq_lengths,
@@ -235,7 +238,12 @@ def get_volume_attention(
             )
             # attention shape: [B, num_heads, max_seq_len]
             attention = _sum_region_attention_to_slices(attention, num_regions)
-            attention = attention.min(dim=1).values  # [B, max_seq_len]
+            if head_reduce == "min":
+                attention = attention.min(dim=1).values
+            elif head_reduce == "max":
+                attention = attention.max(dim=1).values
+            else:
+                attention = attention.mean(dim=1)
             attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             attention = attention.cpu().numpy()
             
