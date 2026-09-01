@@ -1,0 +1,37 @@
+# AnyMC3D: cached frozen 2D FM features + trainable task-query pooling + linear head.
+# LoRA is not implemented here: it needs pixels, not the feature cache.
+#
+#   python -m baselines.anymc3d.classifier --config baselines/anymc3d/configs/kneeMRI.yml --n-folds 3
+# Same 3-fold-on-train / official-test protocol as MedSliM linear probing.
+
+# Dataset
+dataset_name: "kneeMRI"
+feat_dir: "/hpcwork/rwth1833/feat_caches/kneeMRI/slices_raw/crop"
+annotations_dir: "/hpcwork/rwth1833/datasets/preprocessed/kneeMRI"
+plane: "sagittal"
+model_name: "mri-core"
+
+# Model (trainable: query q in R^d and the classification head)
+model:
+  embed_dim: 768  # MRI-CORE / ViT-B CLS
+  query_init_std: 0.02
+  classifier: "linear"  # AnyMC3D paper head; mlp is a non-paper option
+  classifier_hidden_dim: 512
+  classifier_dropout: 0.5
+
+# Output
+output_dir: "/hpcwork/rwth1833/experiments/anymc3d-classifier"
+
+# Training (query + head LRs from AnyMC3D appendix)
+hyperparams:
+  batch_size: 8
+  optimizer: "adamw"
+  lr: 0.001
+  weight_decay: 0.0001
+  warmup_ratio: 0.1
+  max_epochs: 100
+  num_workers: 4
+  val_split_ratio: 0.1
+  patience: 10
+  weighted_loss: false
+  cache_in_memory: true
